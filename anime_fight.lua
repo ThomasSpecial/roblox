@@ -495,8 +495,8 @@ end
 -- ===== UI (Maclib) =====
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 local Window = MacLib:Window({
-    Title = "Roll Anime to Fight! Automation",
-    Subtitle = "by Claude",
+    Title = "Roll Anime to Fight",
+    Subtitle = "by Frost",
     DragStyle = 1,
     ShowUserInfo = true,
     AcrylicBlur = false,
@@ -541,7 +541,7 @@ InfoBox3:Label({Text = "* Bypass (Luck+14 / Mutation2x / Speed10x)"})
 local InfoBox4 = Tabs.Info:Section({Side = "Right"})
 InfoBox4:Header({Text = "Social"})
 InfoBox4:Button({Name = "Copy Discord URL", Callback = function()
-    pcall(function() setclipboard("http://discord.gg/frosthub") end)
+    pcall(function() setclipboard("http://discord.gg/") end)
 end})
 InfoBox4:Button({Name = "Copy Rscripts URL", Callback = function()
     pcall(function() setclipboard("https://rscripts.net/") end)
