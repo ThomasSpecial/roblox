@@ -2,7 +2,7 @@ getgenv().__G=(getgenv().__G or 0)+1;local G=getgenv().__G
 pcall(function() if getgenv().__W then getgenv().__W:Unload() end end)
 local e=getgenv()
 local myUID=tostring(math.random(1,2^30))
-e.__tok=myUID  -- random UID; last script to start always wins
+e.__tok=myUID
 local PL=game:GetService("Players");local RS=game:GetService("ReplicatedStorage")
 local VU=game:GetService("VirtualUser");local HS=game:GetService("HttpService")
 local TSvc=game:GetService("TeleportService");local LP=PL.LocalPlayer
@@ -12,12 +12,16 @@ local GP=R:WaitForChild("GetPrestige");local PR=R:WaitForChild("PrestigeRequeste
 local RCA=R:WaitForChild("ReportClickAttack");local GBS=R:WaitForChild("GetBossState")
 local GDR=R:WaitForChild("GetDailyRewards");local CDR=R:WaitForChild("ClaimDailyReward")
 local GOR=R:WaitForChild("GetOfflineRewards");local COR=R:WaitForChild("ClaimOfflineRewards")
+local GetRunes=R:WaitForChild("GetRunes")
 local PD=require(RS.shared.Prestige.PrestigeData)
 local LV=require(RS.shared.Levels.Levels);local SH=require(RS.shared.Shared)
 local HR=require(RS.client.Heroes.HeroRender);local NW=require(RS.client.Network.Network)
 local EN=require(RS.client.Enemies.Enemies)
+local RuneData=require(RS.shared.Runes.RuneData)
+local Currency=require(RS.client.Currency.Currency)
+
 local SF="RNGHeroesAutomation/state.json"
-local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn"}
+local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt"}
 pcall(function() if not isfolder("RNGHeroesAutomation") then makefolder("RNGHeroesAutomation") end end)
 local function sv() local d={} for _,k in ipairs(SK) do d[k]=e[k] end;pcall(function() writefile(SF,HS:JSONEncode(d)) end) end
 pcall(function() local c=readfile(SF);local d=HS:JSONDecode(c);for _,k in ipairs(SK) do if d[k]~=nil and e[k]==nil then e[k]=d[k] end end end)
@@ -27,6 +31,9 @@ if e.aRec==nil then e.aRec=true end
 if e.aDly==nil then e.aDly=true end
 if e.hDmgIgn==nil then e.hDmgIgn="None" end
 if e.hSpdIgn==nil then e.hSpdIgn="None" end
+if e.aRune==nil then e.aRune=false end
+if e.aRuneAmt==nil then e.aRuneAmt=1 end
+
 -- roll speed x1000
 task.spawn(function()
     local ok,RV=pcall(function() return require(RS:WaitForChild("client"):WaitForChild("Rolling"):WaitForChild("RollingView")) end)
@@ -35,35 +42,21 @@ task.spawn(function()
     local o=e.__ORV
     RV.PlayRoll=function(c,h,sz,sp,...) local m=(type(sp)=="number"and sp>0)and sp or 1;return o(c,h,sz,m*1000,...) end
 end)
--- anti-afk / reconnect (guarded)
 if not e.__AFKh then e.__AFKh=true;LP.Idled:Connect(function() if e.aAfk then pcall(function() VU:CaptureController();VU:ClickButton2(Vector2.new()) end) end end) end
 if not e.__RH then e.__RH=true;PL.PlayerRemoving:Connect(function(p) if p==LP and e.aRec then pcall(function() TSvc:Teleport(game.PlaceId,LP) end) end end) end
--- hero god mode
 if not e.__OAD then e.__OAD=HR.ApplyLocalDamage end
 HR.ApplyLocalDamage=function(a,b,c,d,...) if e.hGod then return end;return e.__OAD(a,b,c,d,...) end
 if not e.__ONF then e.__ONF=NW.FireServer end
 NW.FireServer=function(ev,...) if e.hGod and(ev=="ReportEnemyAttack"or ev=="ReportBossAoeHit")then local a={...};a[#a]=0;return e.__ONF(ev,table.unpack(a))end;return e.__ONF(ev,...) end
--- hero infinite damage (boss-ignore aware)
 if not e.__OCA then e.__OCA=SH.Heroes.GetCombatATK end
-SH.Heroes.GetCombatATK=function(...)
-    if e.hDmg then
-        if e.hDmgIgn=="Boss" and e.__BSA then return e.__OCA(...) end
-        return 1e50
-    end
-    return e.__OCA(...)
-end
--- hero speed + click boost (boss-ignore aware)
+SH.Heroes.GetCombatATK=function(...) if e.hDmg then if e.hDmgIgn=="Boss"and e.__BSA then return e.__OCA(...) end;return 1e50 end;return e.__OCA(...) end
 if not e.__OGS then e.__OGS=SH.GetStat end
 SH.GetStat=function(n,...)
-    if e.hSpd and n=="HeroAttackSpeed" then
-        if e.hSpdIgn=="Boss" and e.__BSA then return e.__OGS(n,...) end
-        return 1000
-    end
+    if e.hSpd and n=="HeroAttackSpeed" then if e.hSpdIgn=="Boss"and e.__BSA then return e.__OGS(n,...) end;return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackDpsFraction" then return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackMaxPerSec" then return 1000 end
     return e.__OGS(n,...)
 end
--- walk speed / jump loop
 task.spawn(function()
     while e.__G==G do
         pcall(function()
@@ -75,9 +68,7 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
--- auto roll
 local function ar() pcall(function() SAR:FireServer(e.aRoll) end) end;ar()
--- KillAura: all enemies per round, 3Hz
 e.__CC=e.__CC or 0
 local function acKA()
     if not e.aClk then return end
@@ -93,7 +84,6 @@ local function acKA()
     end)
 end
 task.spawn(function() while e.__G==G do acKA();task.wait(1/3) end end)
--- Single-target: round-robin, 14Hz
 e.__CC2=e.__CC2 or 0;local ci=0
 local function acST()
     if not e.aSC then return end
@@ -104,30 +94,32 @@ local function acST()
     pcall(function() RCA:FireServer(z,sl,p) end);e.__CC2+=1
 end
 task.spawn(function() while e.__G==G do acST();task.wait(1/14) end end)
--- spots
 local function hh() return LP.Character and LP.Character:FindFirstChild("HumanoidRootPart") end
 local function c2t(cf) local p=cf.Position;local l=cf.LookVector;return{px=p.X,py=p.Y,pz=p.Z,lx=l.X,ly=l.Y,lz=l.Z} end
 local function t2c(t) if not t then return nil end;local p=Vector3.new(t.px,t.py,t.pz);local l=Vector3.new(t.lx or 0,t.ly or 0,t.lz or -1);return CFrame.new(p,p+l) end
 local function sfarm() local h=hh();if not h then return false end;e.fSpt=c2t(h.CFrame);sv();return true end
 local function sboss() local h=hh();if not h then return false end;e.bSpt=c2t(h.CFrame);sv();return true end
--- auto boss  (__BSA = boss state active, always updated regardless of aBoss toggle)
 e.__IBA=e.__IBA or false;e.__BSA=e.__BSA or false;local bStat="Waiting..."
 local function chkBoss()
     local ok,st=pcall(function() return GBS:InvokeServer() end)
-    e.__BSA=(ok and st~=nil)          -- track boss state for ignore hooks
+    e.__BSA=(ok and st~=nil)
     if not e.aBoss then bStat="Off";return end
     if not ok then bStat="Error";return end
     local a=e.__BSA
     if a and not e.__IBA then
         local h=hh();if h then e.__BRC=h.CFrame end
-        local bh=hh();if bh then local s=t2c(e.bSpt);if s then bh.CFrame=s else local wb=workspace:FindFirstChild("Worldboss");local sp=wb and wb:FindFirstChild("PlayerSpawn");if sp and sp:IsA("BasePart") then bh.CFrame=sp.CFrame*CFrame.new(0,sp.Size.Y/2+3,0) end end end
+        local bh=hh();if bh then
+            local s=t2c(e.bSpt)
+            if s then bh.CFrame=s
+            else local wb=workspace:FindFirstChild("Worldboss");local sp=wb and wb:FindFirstChild("PlayerSpawn");if sp and sp:IsA("BasePart") then bh.CFrame=sp.CFrame*CFrame.new(0,sp.Size.Y/2+3,0) end
+            end
+        end
         e.__IBA=true;bStat="Warped to boss!"
     elseif not a and e.__IBA then
         local h=hh();local ret=t2c(e.fSpt) or e.__BRC;if h and ret then h.CFrame=ret end;e.__IBA=false;bStat="Boss done."
     elseif a then bStat="In arena..."
     else bStat="Waiting..." end
 end
--- prestige + xp (combined, 1 GL call)
 local _xpLast,_xpT=nil,nil
 local function fmt(n)
     if n>=1e9 then return string.format("%.2fB",n/1e9)
@@ -150,53 +142,82 @@ local function chkAll(preCb,lvCb,xpCb,pEtaCb)
     end
     local frac=math.floor(ld.xp/ld.required*100)
     if lvCb then lvCb("Lv "..ld.level.."  |  "..fmt(ld.xp).." / "..fmt(ld.required).."  ("..frac.."%)") end
-    local now=os.clock();local remXP=ld.required-ld.xp
-    local rate=0
-    local etaStr="Rem: "..fmt(remXP).." XP"
+    local now=os.clock();local remXP=ld.required-ld.xp;local rate=0;local etaStr="Rem: "..fmt(remXP).." XP"
     if _xpLast and _xpT then
         local dt=now-_xpT
         if dt>0 and ld.xp>_xpLast then
             rate=(ld.xp-_xpLast)/dt
             local eta=rate>0 and remXP/rate or math.huge
             etaStr=etaStr.."  |  "..fmt(rate*60).."/min"
-            if eta<86400 then
-                local m=math.floor(eta/60);local s=math.floor(eta%60)
-                etaStr=etaStr.."  ETA: "..m.."m "..s.."s"
-            end
+            if eta<86400 then local m=math.floor(eta/60);local s=math.floor(eta%60);etaStr=etaStr.."  ETA: "..m.."m "..s.."s" end
         end
     end
     _xpLast=ld.xp;_xpT=now
     if xpCb then xpCb(etaStr) end
-    -- prestige ETA: sum XP across each remaining level up to prestige level
     if pEtaCb then
         if need==math.huge then pEtaCb("Prestige ETA: Max rank")
         elseif need<=ld.level then pEtaCb("Prestige ETA: ✓ Ready!")
         else
-            local tot=ld.required-ld.xp  -- XP left in current level
-            pcall(function()
-                for lv=ld.level+1,need-1 do
-                    tot=tot+(LV.RequiredXPForLevel(lv) or 0)
-                end
-            end)
+            local tot=ld.required-ld.xp
+            pcall(function() for lv=ld.level+1,need-1 do tot=tot+(LV.RequiredXPForLevel(lv) or 0) end end)
             if rate>0 then
-                local eta=tot/rate
-                local h=math.floor(eta/3600)
-                local m=math.floor((eta%3600)/60)
-                local s=math.floor(eta%60)
+                local eta=tot/rate;local h=math.floor(eta/3600);local m=math.floor((eta%3600)/60);local s=math.floor(eta%60)
                 local ts=h>0 and(h.."h "..m.."m")or(m>0 and(m.."m "..s.."s")or(s.."s"))
                 pEtaCb("Prestige ETA: "..ts.."  ("..fmt(tot).." XP left)")
-            else
-                pEtaCb("Prestige ETA: "..fmt(tot).." XP  (no rate yet)")
-            end
+            else pEtaCb("Prestige ETA: "..fmt(tot).." XP  (no rate yet)") end
         end
     end
 end
--- daily / offline
 local function chkDly() if not e.aDly then return end;pcall(function() local d=GDR:InvokeServer();if d and d.canClaim then CDR:InvokeServer() end end) end
 if not e.__ORC then e.__ORC=true;task.spawn(function() pcall(function() local d=GOR:InvokeServer();if d then COR:InvokeServer() end end) end) end
--- cache MacLib; re-runs skip HttpGet but still yield 1 frame so any
--- queued instance can start, increment __G, and overwrite __tok first
-print("[RNG] Hooks OK. Loading UI...")
+
+-- ===== Runes =====
+local runeStatus="Idle"
+local function rollRune(count)
+    local beans=Currency.Get("Beans")
+    local cost=SH.Runes.RollCost()*count
+    if beans<cost then runeStatus="Need "..cost.." Beans (have "..beans..")";return end
+    pcall(function() NW.FireServer("RollRune",count) end)
+    runeStatus="Rolled x"..count.." | Beans: "..(beans-cost)
+end
+local function rollMax()
+    local beans=Currency.Get("Beans");local cPer=SH.Runes.RollCost();local max=math.floor(beans/cPer)
+    if max<=0 then runeStatus="No Beans!";return end
+    task.spawn(function()
+        local rem=max
+        while rem>0 do
+            local b=math.min(rem,100)
+            pcall(function() NW.FireServer("RollRune",b) end)
+            rem-=b;runeStatus="Max rolling... "..rem.." left";task.wait(0.5)
+        end
+        runeStatus="Max done!"
+    end)
+end
+local function buildRuneList()
+    local lines={}
+    local beans=Currency.Get("Beans");local cPer=SH.Runes.RollCost()
+    table.insert(lines,string.format("Beans: %d | Cost: %d | Max: %d",beans,cPer,math.floor(beans/cPer)))
+    table.insert(lines,"──────────────────────")
+    local ok,data=pcall(function() return GetRunes:InvokeServer() end)
+    if not ok or not data then return table.concat(lines,"\n").."\nFailed to load" end
+    local owned={}
+    for name,rune in pairs(data.Runes or {}) do
+        local li=RuneData.Lines and RuneData.Lines[name]
+        local stat=li and li.Stat or "?"
+        local kind=li and li.Kind or "?"
+        local rar=li and li.Rarity or "?"
+        local xpN=SH.Runes.XpFor and SH.Runes.XpFor(name,rune.Level) or "?"
+        local xpStr=rune.Level>=(SH.Runes.MaxLevel or 10) and"MAX"or(tostring(rune.Xp).."/"..tostring(xpN).."xp")
+        table.insert(owned,string.format("[%s] %s Lv%d — %s %s | %s",
+            rar:sub(1,3):upper(),name,rune.Level,stat,kind,xpStr))
+    end
+    table.sort(owned)
+    for _,l in ipairs(owned) do table.insert(lines,l) end
+    return table.concat(lines,"\n")
+end
+
+-- ===== UI =====
+print("[RNG] Loading UI...")
 if not e.__LIB then
     local ok,lib=pcall(function()
         return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
@@ -205,16 +226,19 @@ if not e.__LIB then
     e.__LIB=lib
 end
 local Lib=e.__LIB
-task.wait()  -- deliberate 1-frame yield: lets queued instances start & claim token
-if e.__G~=G or e.__tok~=myUID then print("[RNG] Aborted (newer instance)") return end
+task.wait()
+if e.__G~=G or e.__tok~=myUID then print("[RNG] Aborted") return end
 pcall(function() if e.__W then e.__W:Unload() end end)
-local W=Lib:Window({Title="RNG Heroes",Subtitle="v5.11",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
+
+local W=Lib:Window({Title="RNG Heroes",Subtitle="v5.12",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
 local TG=W:TabGroup()
-local TA =TG:Tab({Name="Auto",    Image="rbxassetid://10723343321"})
-local TPr=TG:Tab({Name="Prestige",Image="rbxassetid://10734963191"})
-local TH =TG:Tab({Name="Heroes",  Image="rbxassetid://6022668955"})
-local TB =TG:Tab({Name="Boss",    Image="rbxassetid://10734975692"})
-local TM =TG:Tab({Name="Misc",    Image="rbxassetid://10723343321"})
+local TA  =TG:Tab({Name="Auto",    Image="rbxassetid://10723343321"})
+local TPr =TG:Tab({Name="Prestige",Image="rbxassetid://10734963191"})
+local TH  =TG:Tab({Name="Heroes",  Image="rbxassetid://6022668955"})
+local TB  =TG:Tab({Name="Boss",    Image="rbxassetid://10734975692"})
+local TRune=TG:Tab({Name="Runes",  Image="rbxassetid://10723343321"})
+local TM  =TG:Tab({Name="Misc",    Image="rbxassetid://10723343321"})
+
 -- Auto tab
 local AL=TA:Section({Side="Left"})
 AL:Header({Text="Roll"})
@@ -228,6 +252,7 @@ local kaLbl=AR:Label({Text="Hits: 0"})
 AR:Header({Text="Single Target  (round-robin, 14 Hz)"})
 AR:Toggle({Name="Auto Click",Default=e.aSC,Callback=function(v) e.aSC=v;sv() end},"aSC")
 local stLbl=AR:Label({Text="Hits: 0"})
+
 -- Prestige tab
 local PrL=TPr:Section({Side="Left"})
 PrL:Header({Text="Auto Prestige"})
@@ -239,6 +264,7 @@ local lvLbl=PrR:Label({Text="Lv: ..."})
 local xpLbl=PrR:Label({Text="Rem: ..."})
 PrR:Header({Text="Next Prestige ETA"})
 local pEtaLbl=PrR:Label({Text="Calculating..."})
+
 -- Heroes tab
 local HL=TH:Section({Side="Left"})
 HL:Header({Text="Defense"})
@@ -251,6 +277,7 @@ HL:Dropdown({Name="  Ignore ATK",Options={"None","Boss"},Default=e.hSpdIgn,Callb
 local HR_=TH:Section({Side="Right"})
 local heroLbl=HR_:Label({Text="HP:ok  DMG:ok  ATK:ok"})
 local bsLbl=HR_:Label({Text="Boss: -"})
+
 -- Boss tab
 local BL=TB:Section({Side="Left"})
 BL:Header({Text="Auto Boss"})
@@ -265,6 +292,35 @@ BR:Header({Text="Boss Spot"})
 local bpLbl=BR:Label({Text=e.bSpt and"✓ Saved"or"Not set"})
 BR:Button({Name="Save Boss",Callback=function() if sboss() then pcall(function() bpLbl:UpdateName("✓ Saved") end) end end})
 BR:Button({Name="TP to Boss",Callback=function() local h=hh();if h and e.bSpt then h.CFrame=t2c(e.bSpt) end end})
+
+-- Runes tab
+local RLeft=TRune:Section({Side="Left"})
+RLeft:Header({Text="Roll Runes"})
+RLeft:Button({Name="Roll x1",   Callback=function() rollRune(1) end})
+RLeft:Button({Name="Roll x10",  Callback=function() rollRune(10) end})
+RLeft:Button({Name="Roll x100", Callback=function() rollRune(100) end})
+RLeft:Button({Name="Roll Max",  Callback=function() rollMax() end})
+RLeft:Header({Text="Auto Open"})
+RLeft:Toggle({
+    Name="Auto Open Rune",Default=e.aRune,
+    Callback=function(v) e.aRune=v;sv() end,
+},"aRune")
+RLeft:Dropdown({
+    Name="Amount",Multi=false,Options={"1","10","100"},
+    Default=tostring(e.aRuneAmt or 1),
+    Callback=function(v) e.aRuneAmt=tonumber(type(v)=="table" and v[1] or v) or 1;sv() end,
+})
+local runeStatusLbl=RLeft:Label({Text="Idle"})
+local beansLbl=RLeft:Label({Text="Beans: ?"})
+
+local RRight=TRune:Section({Side="Right"})
+RRight:Header({Text="Your Runes"})
+local runeListLbl=RRight:Label({Text="Loading..."})
+RRight:Button({Name="Refresh",Callback=function()
+    pcall(function() runeListLbl:UpdateName(buildRuneList()) end)
+end})
+RRight:Label({Text="Rune Effects Reference:\nBean — BeanFind x (Rare)\nBlade — HeroDamage x (Rare)\nCrit — CritChance + (Epic)\nFortune — Luck x (Legendary)\nGreed — Gold x (Epic)\nHavoc — CritDamage + (Legendary)\nSwift — HeroAttackSpeed x (Rare)\nWisdom — XP x (Epic)"})
+
 -- Misc tab
 local MsL=TM:Section({Side="Left"})
 MsL:Header({Text="System"})
@@ -275,7 +331,33 @@ local MsR=TM:Section({Side="Right"})
 MsR:Header({Text="Player Speed"})
 MsR:Toggle({Name="Walk Speed x6  (100)",Default=e.wSpd,Callback=function(v) e.wSpd=v;sv() end},"wSpd")
 MsR:Toggle({Name="High Jump  (150)",Default=e.wJmp,Callback=function(v) e.wJmp=v;sv() end},"wJmp")
--- update loop
+
+-- ===== Update loops =====
+task.spawn(function()
+    task.wait(2)
+    pcall(function() runeListLbl:UpdateName(buildRuneList()) end)
+    while e.__G==G do
+        if e.aRune then
+            rollRune(e.aRuneAmt or 1)
+            task.wait(0.35)
+        else
+            task.wait(0.3)
+        end
+        pcall(function() runeStatusLbl:UpdateName(runeStatus) end)
+        pcall(function()
+            local b=Currency.Get("Beans");local c=SH.Runes.RollCost()
+            beansLbl:UpdateName(string.format("Beans: %d | Max: %d",b,math.floor(b/c)))
+        end)
+    end
+end)
+
+task.spawn(function()
+    while e.__G==G do
+        task.wait(15)
+        pcall(function() runeListLbl:UpdateName(buildRuneList()) end)
+    end
+end)
+
 task.spawn(function()
     while e.__G==G do
         pcall(chkBoss);pcall(chkDly)
@@ -287,7 +369,6 @@ task.spawn(function()
         pcall(function() kaLbl:UpdateName("Hits: "..e.__CC) end)
         pcall(function() stLbl:UpdateName("Hits: "..e.__CC2) end)
         pcall(function() bossLbl:UpdateName(bStat) end)
-        -- hero status (SKIP = suppressed by boss-ignore)
         local hg=e.hGod and"GOD"or"ok"
         local hd=e.hDmg and((e.hDmgIgn=="Boss"and e.__BSA)and"SKIP"or"INF")or"ok"
         local hs=e.hSpd and((e.hSpdIgn=="Boss"and e.__BSA)and"SKIP"or"x1k")or"ok"
@@ -296,6 +377,7 @@ task.spawn(function()
         task.wait(3)
     end
 end)
+
 e.__W=W
 TA:Select()
-print("[RNG] v5.11 OK")
+print("[RNG] v5.12 OK")
