@@ -17,8 +17,20 @@ local PD=require(RS.shared.Prestige.PrestigeData)
 local LV=require(RS.shared.Levels.Levels);local SH=require(RS.shared.Shared)
 local HR=require(RS.client.Heroes.HeroRender);local NW=require(RS.client.Network.Network)
 local EN=require(RS.client.Enemies.Enemies)
-local RuneData=require(RS.shared.Runes.RuneData)
 local Currency=require(RS.client.Currency.Currency)
+-- RuneData hardcoded เพราะ require ใน thread 8 callback ไม่ได้
+local RUNE_COST = 25
+local RUNE_MAX_LV = 10
+local RUNE_INFO = {
+    Bean    = {stat="BeanFind",   kind="Mul", rar="RAR"},
+    Blade   = {stat="HeroDamage", kind="Mul", rar="RAR"},
+    Crit    = {stat="CritChance", kind="Add", rar="EPI"},
+    Fortune = {stat="Luck",       kind="Mul", rar="LEG"},
+    Greed   = {stat="Gold",       kind="Mul", rar="EPI"},
+    Havoc   = {stat="CritDamage", kind="Add", rar="LEG"},
+    Swift   = {stat="HeroAtk",    kind="Mul", rar="RAR"},
+    Wisdom  = {stat="XP",         kind="Mul", rar="EPI"},
+}
 
 local SF="RNGHeroesAutomation/state.json"
 local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt"}
@@ -175,13 +187,13 @@ if not e.__ORC then e.__ORC=true;task.spawn(function() pcall(function() local d=
 local runeStatus="Idle"
 local function rollRune(count)
     local beans=Currency.Get("Beans")
-    local cost=SH.Runes.RollCost()*count
+    local cost=RUNE_COST*count
     if beans<cost then runeStatus="Need "..cost.." Beans (have "..beans..")";return end
     pcall(function() NW.FireServer("RollRune",count) end)
     runeStatus="Rolled x"..count.." | Beans: "..(beans-cost)
 end
 local function rollMax()
-    local beans=Currency.Get("Beans");local cPer=SH.Runes.RollCost();local max=math.floor(beans/cPer)
+    local beans=Currency.Get("Beans");local max=math.floor(beans/RUNE_COST)
     if max<=0 then runeStatus="No Beans!";return end
     task.spawn(function()
         local rem=max
@@ -195,21 +207,17 @@ local function rollMax()
 end
 local function buildRuneList()
     local lines={}
-    local beans=Currency.Get("Beans");local cPer=SH.Runes.RollCost()
-    table.insert(lines,string.format("Beans: %d | Cost: %d | Max: %d",beans,cPer,math.floor(beans/cPer)))
+    local beans=Currency.Get("Beans")
+    table.insert(lines,string.format("Beans: %d | Cost: %d | Max: %d",beans,RUNE_COST,math.floor(beans/RUNE_COST)))
     table.insert(lines,"──────────────────────")
     local ok,data=pcall(function() return GetRunes:InvokeServer() end)
     if not ok or not data then return table.concat(lines,"\n").."\nFailed to load" end
     local owned={}
     for name,rune in pairs(data.Runes or {}) do
-        local li=RuneData.Lines and RuneData.Lines[name]
-        local stat=li and li.Stat or "?"
-        local kind=li and li.Kind or "?"
-        local rar=li and li.Rarity or "?"
-        local xpN=SH.Runes.XpFor and SH.Runes.XpFor(name,rune.Level) or "?"
-        local xpStr=rune.Level>=(SH.Runes.MaxLevel or 10) and"MAX"or(tostring(rune.Xp).."/"..tostring(xpN).."xp")
+        local info=RUNE_INFO[name] or {stat="?",kind="?",rar="???"}
+        local xpStr=rune.Level>=RUNE_MAX_LV and"MAX"or(tostring(rune.Xp).."xp")
         table.insert(owned,string.format("[%s] %s Lv%d — %s %s | %s",
-            rar:sub(1,3):upper(),name,rune.Level,stat,kind,xpStr))
+            info.rar,name,rune.Level,info.stat,info.kind,xpStr))
     end
     table.sort(owned)
     for _,l in ipairs(owned) do table.insert(lines,l) end
@@ -345,8 +353,8 @@ task.spawn(function()
         end
         pcall(function() runeStatusLbl:UpdateName(runeStatus) end)
         pcall(function()
-            local b=Currency.Get("Beans");local c=SH.Runes.RollCost()
-            beansLbl:UpdateName(string.format("Beans: %d | Max: %d",b,math.floor(b/c)))
+            local b=Currency.Get("Beans")
+            beansLbl:UpdateName(string.format("Beans: %d | Max: %d",b,math.floor(b/RUNE_COST)))
         end)
     end
 end)
