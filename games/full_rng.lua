@@ -3,6 +3,7 @@ pcall(function() if getgenv().__W then getgenv().__W:Unload() end end)
 local e=getgenv()
 local myUID=tostring(math.random(1,2^30))
 e.__tok=myUID
+print("[RNG] Starting (gen "..G..")...")
 local PL=game:GetService("Players");local RS=game:GetService("ReplicatedStorage")
 local VU=game:GetService("VirtualUser");local HS=game:GetService("HttpService")
 local TSvc=game:GetService("TeleportService");local LP=PL.LocalPlayer
@@ -13,11 +14,24 @@ local RCA=R:WaitForChild("ReportClickAttack");local GBS=R:WaitForChild("GetBossS
 local GDR=R:WaitForChild("GetDailyRewards");local CDR=R:WaitForChild("ClaimDailyReward")
 local GOR=R:WaitForChild("GetOfflineRewards");local COR=R:WaitForChild("ClaimOfflineRewards")
 local GetRunes=R:WaitForChild("GetRunes")
-local PD=require(RS.shared.Prestige.PrestigeData)
-local LV=require(RS.shared.Levels.Levels);local SH=require(RS.shared.Shared)
-local HR=require(RS.client.Heroes.HeroRender);local NW=require(RS.client.Network.Network)
-local EN=require(RS.client.Enemies.Enemies)
-local Currency=require(RS.client.Currency.Currency)
+print("[RNG] Remotes ready, loading modules...")
+-- RS.shared.X.Y / RS.client.X.Y used to be plain dot-indexing with zero
+-- WaitForChild -- fine once everything's replicated, but a hard "attempt to
+-- index nil" if this autoexec fires before ReplicatedStorage.shared/client
+-- finish replicating on a fresh join (confirmed live: a stuck session showed
+-- __G incremented but never reached "[RNG] Loading UI...", no Infinite-yield
+-- warning either, consistent with an early dot-index error swallowed before
+-- ever printing). Bounded WaitForChild (10s) on every hop instead -- errors
+-- surface as an actual error now instead of a silent, permanent stall.
+local SharedF=RS:WaitForChild("shared",10);local ClientF=RS:WaitForChild("client",10)
+local PD=require(SharedF:WaitForChild("Prestige",10):WaitForChild("PrestigeData",10))
+local LV=require(SharedF:WaitForChild("Levels",10):WaitForChild("Levels",10))
+local SH=require(SharedF:WaitForChild("Shared",10))
+local HR=require(ClientF:WaitForChild("Heroes",10):WaitForChild("HeroRender",10))
+local NW=require(ClientF:WaitForChild("Network",10):WaitForChild("Network",10))
+local EN=require(ClientF:WaitForChild("Enemies",10):WaitForChild("Enemies",10))
+local Currency=require(ClientF:WaitForChild("Currency",10):WaitForChild("Currency",10))
+print("[RNG] Modules ready")
 -- RuneData hardcoded เพราะ require ใน thread 8 callback ไม่ได้
 local RUNE_COST = 25
 local RUNE_MAX_LV = 10
@@ -226,14 +240,19 @@ end
 
 -- ===== UI =====
 print("[RNG] Loading UI...")
-if not e.__LIB then
-    local ok,lib=pcall(function()
-        return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
-    end)
-    if not ok or not lib then print("[RNG] MacLib failed") return end
-    e.__LIB=lib
-end
+-- Used to cache e.__LIB across reloads to skip the re-fetch -- but this script
+-- Unloads the previous window (line 2) before ever touching __LIB, and a
+-- cached lib bound to an already-unloaded window is exactly the "stale lib
+-- after unload = invisible window" trap other scripts in this repo already
+-- learned to avoid. Force a fresh fetch every load instead; the HttpGet cost
+-- is a couple seconds, not worth a silent/broken window.
+local ok,lib=pcall(function()
+    return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
+end)
+if not ok or not lib then print("[RNG] MacLib failed: "..tostring(lib)) return end
+e.__LIB=lib
 local Lib=e.__LIB
+print("[RNG] MacLib loaded, building window...")
 task.wait()
 if e.__G~=G or e.__tok~=myUID then print("[RNG] Aborted") return end
 pcall(function() if e.__W then e.__W:Unload() end end)
