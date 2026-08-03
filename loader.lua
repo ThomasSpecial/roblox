@@ -3,6 +3,7 @@
 local PLACE_SCRIPTS = {
     [107653945083776] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/roll_anime.lua", -- Roll Anime to Fight!
     [108307565942574] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/full_rng.lua",   -- [NOW!!] RNG Heroes
+    [133188236593503] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/magic_loot.lua", -- Magic Loot[Beta]
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
