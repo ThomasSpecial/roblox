@@ -1,5 +1,5 @@
--- Roll Anime to Fight! Automation v2.0
--- อัพเดท: + Mutation Cursed, + Auto Claim Quest, + Battlepass=false note
+-- Roll Anime to Fight! Automation v2.1
+-- อัพเดท: + Mutation Cursed, + Auto Claim BP (tier rewards), + Auto Claim BP Quest, Misc -> Settings
 getgenv().__RAG = (getgenv().__RAG or 0) + 1
 local myGen = getgenv().__RAG
 local SESSION_START = os.clock()
@@ -22,14 +22,32 @@ local UpdateInventory = CharRemotes:WaitForChild("UpdateInventory")
 local UpgradeRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Upgrade")
 local FightStart = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Fight"):WaitForChild("Start")
 local SpinRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SpinWheel"):WaitForChild("Spin")
--- Bounded, not blocking WaitForChild: these two don't actually exist anywhere
--- under ReplicatedStorage.Remotes in this game (confirmed live via a full
--- listing of every RemoteEvent/RemoteFunction there -- no Quest namespace at
--- all). An unbounded WaitForChild on either one hung the ENTIRE script before
--- it ever reached the UI, breaking the public loadstring link for everyone.
--- Auto Claim Quest below no-ops instead of erroring when these are nil.
-local GetQuestData = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("GetQuestData", 3)
-local ClaimQuest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ClaimQuest", 3)
+
+-- Battlepass tier rewards + quests live under ReplicatedStorage.Modules.Battlepass,
+-- NOT ReplicatedStorage.Remotes (that was tried first and hangs -- there is no
+-- Quest namespace under Remotes at all). Confirmed live by reading the game's
+-- own BattlepassClient LocalScript (MainUI.Frames.Battlepass.BattlepassClient):
+--   Modules.Battlepass.Claim:FireServer(level, track)          -- track: "Free"/"Premium"
+--   Modules.Battlepass.BattlepassQuest.GetQuestData:InvokeServer() -> {Daily=[...], Weekly=[...]}
+--   Modules.Battlepass.BattlepassQuest.ClaimQuest:FireServer(category, questId)
+-- All bounded WaitForChild + nil-safe callers so a missing module in some
+-- other game/place doesn't hang the whole script the way the old guess did.
+local BattlepassModule = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Battlepass", 5)
+local BPClaim, BPQuestGetData, BPQuestClaim, BattlepassReward
+if BattlepassModule then
+    BPClaim = BattlepassModule:WaitForChild("Claim", 5)
+    local BPQuestFolder = BattlepassModule:WaitForChild("BattlepassQuest", 5)
+    if BPQuestFolder then
+        BPQuestGetData = BPQuestFolder:WaitForChild("GetQuestData", 5)
+        BPQuestClaim = BPQuestFolder:WaitForChild("ClaimQuest", 5)
+    end
+    local rewardModule = BattlepassModule:FindFirstChild("BattlepassReward")
+    if rewardModule then
+        local ok, mod = pcall(require, rewardModule)
+        if ok then BattlepassReward = mod end
+    end
+end
+
 local CharactersInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Characters"):WaitForChild("CharactersInfo"))
 local UpgradesInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("UpgradesInfo"))
 local StatsHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("StatsHandler"))
@@ -87,7 +105,7 @@ local PERSIST_KEYS = {
     "AutoFightStart", "StartAtWave", "StopAtWave", "MaxGameSpeedEnabled",
     "AutoEquipBestEnabled", "EquipFilterBy", "ReplaceWeakerSlots", "AutoSpinWheelEnabled",
     "FPSBoostEnabled", "RemoveOtherBaseEnabled", "BypassEnabled",
-    "AutoClaimQuestEnabled",
+    "AutoClaimBPEnabled", "AutoClaimBPQuestEnabled",
 }
 local function loadPersistedState()
     local ok, content = pcall(function() return readfile(SAVE_FILE) end)
@@ -134,7 +152,8 @@ if getgenv().AutoSpinWheelEnabled == nil then getgenv().AutoSpinWheelEnabled = f
 if getgenv().FPSBoostEnabled == nil then getgenv().FPSBoostEnabled = false end
 if getgenv().RemoveOtherBaseEnabled == nil then getgenv().RemoveOtherBaseEnabled = false end
 if getgenv().BypassEnabled == nil then getgenv().BypassEnabled = false end
-if getgenv().AutoClaimQuestEnabled == nil then getgenv().AutoClaimQuestEnabled = false end
+if getgenv().AutoClaimBPEnabled == nil then getgenv().AutoClaimBPEnabled = false end
+if getgenv().AutoClaimBPQuestEnabled == nil then getgenv().AutoClaimBPQuestEnabled = false end
 
 -- ===== Helpers =====
 local function getGold()
@@ -196,7 +215,8 @@ end
 -- ===== Auto Summon =====
 -- Teleport ครั้งเดียวตอนออกนอก SUMMON_RANGE studs จาก prompt แล้วค้างอยู่ตรงนั้น
 -- ไม่ teleport กลับ-ไปทุก loop -- เวอร์ชันก่อนหน้า (teleport ไปเด้งกลับทุกรอบ
--- SummonDelay) ทำให้ตัวละครกระตุก/เด้งไปมาให้เห็นชัดทุก 0.5-3s (ยืนยันจากผู้ใช้).
+-- SummonDelay) ทำให้ตัวละครกระตุก/เด้งไปมาให้เห็นชัดทุก 0.5-3s ตามที่ผู้ใช้แจ้ง
+-- ปัญหานี้เคยแก้แล้วรอบก่อน แต่หลุดกลับไปเป็นเวอร์ชันเดิมตอน sync จาก roll_anime.lua
 local SUMMON_RANGE = 8  -- studs -- ถ้าออกกว่านี้ค่อย pull กลับ
 local summonStandbyPos = nil  -- CFrame ที่ยืนอยู่หน้าแท่น
 local summonStatusText = "Idle"
@@ -286,43 +306,110 @@ if not getgenv().__RARollHooked then
     end)
 end
 
--- ===== Auto Claim Quest =====
--- GetQuestData:InvokeServer() -> {Daily=[...], Weekly=[...]}
--- quest fields: ID, Completed, Claimed, Name, Reward, Category
--- ClaimQuest:FireServer(questID) -> claim ทีละ quest
-local questStatusText = "Idle"
-local questClaimedCount = 0
+-- ===== Auto Claim Battlepass (tier rewards) =====
+-- Level is derived the same way the game's own getLevelInfo() does: walk
+-- BattlepassReward.Rewards[1..MaxLevel], each entry's .EXP is the cumulative
+-- cost to reach that level, current level = how many thresholds current Exp
+-- clears. Claim:FireServer(level, track) is fired for every level up to that
+-- on the Free track, and additionally on Premium if data.Premium.Owned is
+-- true for the current season -- the server re-validates both the level and
+-- ownership itself, so firing for an unclaimed-but-locked level is a no-op,
+-- not an error.
+local bpStatusText = "Idle"
+local bpClaimedCount = 0
 
-local function doAutoClaimQuest()
-    if not getgenv().AutoClaimQuestEnabled then questStatusText = "Idle"; return end
-    if not (GetQuestData and ClaimQuest) then
-        questStatusText = "Not available in this game"
+local function getBPLevel(exp)
+    if not BattlepassReward then return 0 end
+    exp = tonumber(exp) or 0
+    local maxLevel = tonumber(BattlepassReward.Config.MaxLevel) or 30
+    local level, cumulative = 0, 0
+    for i = 1, maxLevel do
+        local reward = BattlepassReward.Rewards[i]
+        local need = reward and (tonumber(reward.EXP) or 0) or math.huge
+        if cumulative + need > exp then break end
+        cumulative += need
+        level = i
+    end
+    return level
+end
+
+local function doAutoClaimBP()
+    if not getgenv().AutoClaimBPEnabled then bpStatusText = "Idle"; return end
+    if not (BPClaim and BattlepassReward) then
+        bpStatusText = "Not available in this game"
         return
     end
-    local ok, questData = pcall(function() return GetQuestData:InvokeServer() end)
-    if not ok or type(questData) ~= "table" then questStatusText = "Error fetching quests"; return end
+    local ok, data = pcall(function() return DataClient:get("Battlepass") end)
+    if not ok or type(data) ~= "table" then bpStatusText = "No data"; return end
+
+    local claimedMap = data.Claimed or {}
+    local freeClaimed = claimedMap.Free or {}
+    local premiumClaimed = claimedMap.Premium or {}
+    local premiumInfo = data.Premium or {}
+    local premiumOwned = premiumInfo.Owned == true
+        and tonumber(premiumInfo.Season) == (tonumber(BattlepassReward.Config.Season) or 1)
+    local level = getBPLevel(data.Exp)
 
     local claimed = 0
-    for cat, quests in pairs(questData) do
+    for i = 1, level do
+        if freeClaimed[tostring(i)] ~= true then
+            local okClaim = pcall(function() BPClaim:FireServer(i, "Free") end)
+            if okClaim then claimed += 1; bpClaimedCount += 1; task.wait(0.15) end
+        end
+        if premiumOwned and premiumClaimed[tostring(i)] ~= true then
+            local okClaim = pcall(function() BPClaim:FireServer(i, "Premium") end)
+            if okClaim then claimed += 1; bpClaimedCount += 1; task.wait(0.15) end
+        end
+    end
+
+    bpStatusText = claimed > 0
+        and ("Claimed " .. claimed .. " reward(s) | Total: " .. bpClaimedCount .. " | Level " .. level)
+        or ("Nothing to claim | Level " .. level)
+end
+
+-- ===== Auto Claim Battlepass Quest =====
+-- GetQuestData:InvokeServer() -> {Daily=[...], Weekly=[...]}, each quest has
+-- ID/Name/Progress/Requirement/Reward/Completed/Claimed. ClaimQuest:FireServer
+-- (category, questId) -- category is literally "Daily" or "Weekly", matching
+-- the QuestCategory/QuestId attributes the game's own quest-card buttons set
+-- on themselves before firing this exact same remote.
+local bpQuestStatusText = "Idle"
+local bpQuestClaimedCount = 0
+
+local function doAutoClaimBPQuest()
+    if not getgenv().AutoClaimBPQuestEnabled then bpQuestStatusText = "Idle"; return end
+    if not (BPQuestGetData and BPQuestClaim) then
+        bpQuestStatusText = "Not available in this game"
+        return
+    end
+    local ok, questData = pcall(function() return BPQuestGetData:InvokeServer() end)
+    if not ok or type(questData) ~= "table" then bpQuestStatusText = "Error fetching quests"; return end
+
+    local claimed = 0
+    for _, cat in ipairs({"Daily", "Weekly"}) do
+        local quests = questData[cat]
         if type(quests) == "table" then
             for _, q in ipairs(quests) do
-                if type(q) == "table" and q.Completed == true and q.Claimed == false and q.ID then
-                    local okClaim = pcall(function() ClaimQuest:FireServer(q.ID) end)
-                    if okClaim then
-                        claimed += 1
-                        questClaimedCount += 1
-                        task.wait(0.3)
+                if type(q) == "table" and q.ID then
+                    local progress = tonumber(q.Progress) or 0
+                    local requirement = tonumber(q.Requirement) or 1
+                    local completed = q.Completed == true or progress >= requirement
+                    if completed and q.Claimed ~= true then
+                        local okClaim = pcall(function() BPQuestClaim:FireServer(cat, q.ID) end)
+                        if okClaim then
+                            claimed += 1
+                            bpQuestClaimedCount += 1
+                            task.wait(0.3)
+                        end
                     end
                 end
             end
         end
     end
 
-    if claimed > 0 then
-        questStatusText = "Claimed " .. claimed .. " quest(s) | Total: " .. questClaimedCount
-    else
-        questStatusText = "No claimable quests"
-    end
+    bpQuestStatusText = claimed > 0
+        and ("Claimed " .. claimed .. " quest(s) | Total: " .. bpQuestClaimedCount)
+        or "No claimable quests"
 end
 
 -- ===== Auto Upgrade =====
@@ -548,7 +635,7 @@ end
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 local Window = MacLib:Window({
     Title = "Roll Anime to Fight! Automation",
-    Subtitle = "v2.0 — +Cursed +Quest",
+    Subtitle = "v2.1 — +Battlepass",
     DragStyle = 1,
     ShowUserInfo = true,
     AcrylicBlur = false,
@@ -556,13 +643,13 @@ local Window = MacLib:Window({
 
 local TabGroup = Window:TabGroup()
 local Tabs = {
-    Info    = TabGroup:Tab({Name = "Info",     Image = "rbxassetid://10723415903"}),
-    Summon  = TabGroup:Tab({Name = "Summon",   Image = "rbxassetid://10723343321"}),
-    Buy     = TabGroup:Tab({Name = "Buy",      Image = "rbxassetid://10734952273"}),
-    Fight   = TabGroup:Tab({Name = "Fight",    Image = "rbxassetid://10734975692"}),
-    Quest   = TabGroup:Tab({Name = "Quest",    Image = "rbxassetid://10747363465"}),
-    Upgrade = TabGroup:Tab({Name = "Upgrade",  Image = "rbxassetid://10747363465"}),
-    Settings= TabGroup:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
+    Info       = TabGroup:Tab({Name = "Info",       Image = "rbxassetid://10723415903"}),
+    Summon     = TabGroup:Tab({Name = "Summon",     Image = "rbxassetid://10723343321"}),
+    Buy        = TabGroup:Tab({Name = "Buy",        Image = "rbxassetid://10734952273"}),
+    Fight      = TabGroup:Tab({Name = "Fight",      Image = "rbxassetid://10734975692"}),
+    Battlepass = TabGroup:Tab({Name = "Battlepass", Image = "rbxassetid://10747363465"}),
+    Upgrade    = TabGroup:Tab({Name = "Upgrade",    Image = "rbxassetid://10747363465"}),
+    Settings   = TabGroup:Tab({Name = "Settings",   Image = "rbxassetid://10734950309"}),
 }
 
 -- ----- Info Tab -----
@@ -587,10 +674,10 @@ InfoBox3:Header({Text = "Features"})
 InfoBox3:Label({Text = "* Auto Summon (rolls)"})
 InfoBox3:Label({Text = "* Auto Buy — filter by rarity / DisplayName / Mutation\n  รวม Cursed mutation ใหม่"})
 InfoBox3:Label({Text = "* Auto Upgrade (Gold / Luck / Slot / Inventory)"})
-InfoBox3:Label({Text = "* Auto Claim Quest (Daily + Weekly)"})
+InfoBox3:Label({Text = "* Auto Claim Battlepass (tier rewards, Free+Premium)"})
+InfoBox3:Label({Text = "* Auto Claim Battlepass Quest (Daily + Weekly)"})
 InfoBox3:Label({Text = "* Anti-AFK / Auto Reconnect / Auto Save"})
 InfoBox3:Label({Text = "* Bypass (Luck+14 / Mutation2x / Speed10x)"})
-InfoBox3:Label({Text = "* Battlepass: เกมใช้ RequestGamepass remote\n  ซื้อผ่าน Robux เท่านั้น ไม่มี claim ได้จาก client"})
 
 local InfoBox4 = Tabs.Info:Section({Side = "Right"})
 InfoBox4:Header({Text = "Social"})
@@ -803,51 +890,34 @@ BypassSection:Toggle({
 BypassSection:Label({Text = "Verified client-side:\n* Luck2x + SuperLuck + UltraLuck = +14\n* Mutation2x = double mutation chance\n* FightFastForwardSpeed = 10x\nRe-sets ทุก 1s ตลอด session.\n\nCursed = event-only (Chance=0)\nไม่มี attribute ที่ bypass ได้"})
 local bypassStatusLabel = BypassSection:Label({Text = getgenv().BypassEnabled and "Running" or "Off"})
 
--- ----- Quest Tab -----
-local QuestLeft = Tabs.Quest:Section({Side = "Left"})
-QuestLeft:Header({Text = "Auto Claim Quest"})
-QuestLeft:Toggle({
-    Name = "Auto Claim Quest",
-    Default = getgenv().AutoClaimQuestEnabled,
-    Callback = function(v) getgenv().AutoClaimQuestEnabled = v; saveState() end,
-}, "AutoClaimQuestEnabled")
-QuestLeft:Label({Text = "Claim quest อัตโนมัติ (Daily + Weekly)\nที่ Completed=true และ Claimed=false\nผ่าน ClaimQuest:FireServer(questID)\nตรวจทุก 30 วินาที"})
-QuestLeft:Button({Name = "Claim Now", Callback = function()
-    task.spawn(doAutoClaimQuest)
+-- ----- Battlepass Tab -----
+local BPLeft = Tabs.Battlepass:Section({Side = "Left"})
+BPLeft:Header({Text = "Auto Claim Battlepass"})
+BPLeft:Toggle({
+    Name = "Auto Claim Battlepass",
+    Default = getgenv().AutoClaimBPEnabled,
+    Callback = function(v) getgenv().AutoClaimBPEnabled = v; saveState() end,
+}, "AutoClaimBPEnabled")
+BPLeft:Label({Text = "Claims every unlocked tier reward\n(Free track always, Premium track only\nif you own this season's pass) ผ่าน\nClaim:FireServer(level, track)\nตรวจทุก 30 วินาที"})
+BPLeft:Button({Name = "Claim Now", Callback = function()
+    task.spawn(doAutoClaimBP)
 end})
-local questStatusLabel = QuestLeft:Label({Text = "Idle"})
-local questCountLabel = QuestLeft:Label({Text = "Claimed this session: 0"})
+local bpStatusLabel = BPLeft:Label({Text = "Idle"})
 
-local QuestRight = Tabs.Quest:Section({Side = "Right"})
-QuestRight:Header({Text = "Quest Status"})
-local questListLabel = QuestRight:Label({Text = "Press 'Claim Now' to check"})
-
-QuestRight:Button({Name = "Refresh Quest List", Callback = function()
-    task.spawn(function()
-        if not GetQuestData then
-            pcall(function() questListLabel:UpdateName("Not available in this game") end)
-            return
-        end
-        local ok, qd = pcall(function() return GetQuestData:InvokeServer() end)
-        if not ok or type(qd) ~= "table" then
-            pcall(function() questListLabel:UpdateName("Error fetching quests") end)
-            return
-        end
-        local lines = {}
-        for cat, quests in pairs(qd) do
-            if type(quests) == "table" then
-                for _, q in ipairs(quests) do
-                    if type(q) == "table" and q.ID then
-                        local status = q.Claimed and "✓Claimed" or (q.Completed and "✓Done" or string.format("%.0f%%", math.min(100, ((q.Progress or 0)/(q.Requirement or 1))*100)))
-                        table.insert(lines, string.format("[%s] %s\n  %s", cat:sub(1,1), tostring(q.Name or q.ID), status))
-                    end
-                end
-            end
-        end
-        table.sort(lines)
-        pcall(function() questListLabel:UpdateName(#lines > 0 and table.concat(lines, "\n") or "No quests found") end)
-    end)
+local BPRight = Tabs.Battlepass:Section({Side = "Right"})
+BPRight:Header({Text = "Auto Claim Battlepass Quest"})
+BPRight:Toggle({
+    Name = "Auto Claim BP Quest",
+    Default = getgenv().AutoClaimBPQuestEnabled,
+    Callback = function(v) getgenv().AutoClaimBPQuestEnabled = v; saveState() end,
+}, "AutoClaimBPQuestEnabled")
+BPRight:Label({Text = "Claim quest อัตโนมัติ (Daily + Weekly)\nที่ Completed=true และ Claimed=false\nผ่าน ClaimQuest:FireServer(category, ID)\nตรวจทุก 30 วินาที"})
+BPRight:Button({Name = "Claim Now", Callback = function()
+    task.spawn(doAutoClaimBPQuest)
 end})
+local bpQuestStatusLabel = BPRight:Label({Text = "Idle"})
+
+BPLeft:Label({Text = "Note: buying the Premium pass itself still needs\nRobux via RequestGamepass -- only CLAIMING\nalready-unlocked/owned rewards is automated."})
 
 -- ----- Upgrade Tab -----
 local UpgradeSection = Tabs.Upgrade:Section({Side = "Left"})
@@ -972,12 +1042,13 @@ task.spawn(function()
     end
 end)
 
--- Auto Claim Quest loop ทุก 30 วินาที
+-- Auto Claim Battlepass + Quest loop ทุก 30 วินาที
 task.spawn(function()
     while getgenv().__RAG == myGen do
-        pcall(doAutoClaimQuest)
-        pcall(function() questStatusLabel:UpdateName(questStatusText) end)
-        pcall(function() questCountLabel:UpdateName("Claimed this session: " .. questClaimedCount) end)
+        pcall(doAutoClaimBP)
+        pcall(function() bpStatusLabel:UpdateName(bpStatusText) end)
+        pcall(doAutoClaimBPQuest)
+        pcall(function() bpQuestStatusLabel:UpdateName(bpQuestStatusText) end)
         task.wait(30)
     end
 end)
@@ -988,4 +1059,4 @@ if getgenv().BypassEnabled then toggleBypass(true) end
 
 getgenv().__RAWindow = Window
 Tabs.Info:Select()
-print("[RollAnime] v2.0 loaded — Cursed mutation + Auto Claim Quest")
+print("[RollAnime] v2.1 loaded — Cursed mutation + Auto Claim Battlepass + Battlepass Quest")
