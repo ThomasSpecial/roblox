@@ -76,7 +76,7 @@ local PERSIST_KEYS = {
     "AutoUpgradeGold", "AutoUpgradeLuck", "AutoUpgradeSlots", "AutoUpgradeInventory",
     "AutoFightStart", "StartAtWave", "StopAtWave", "MaxGameSpeedEnabled",
     "AutoEquipBestEnabled", "EquipFilterBy", "ReplaceWeakerSlots", "AutoSpinWheelEnabled",
-    "FPSBoostEnabled", "RemoveOtherBaseEnabled",
+    "FPSBoostEnabled", "RemoveOtherBaseEnabled", "BypassEnabled",
 }
 local function loadPersistedState()
     local ok, content = pcall(function() return readfile(SAVE_FILE) end)
@@ -122,6 +122,7 @@ if getgenv().ReplaceWeakerSlots == nil then getgenv().ReplaceWeakerSlots = false
 if getgenv().AutoSpinWheelEnabled == nil then getgenv().AutoSpinWheelEnabled = false end
 if getgenv().FPSBoostEnabled == nil then getgenv().FPSBoostEnabled = false end
 if getgenv().RemoveOtherBaseEnabled == nil then getgenv().RemoveOtherBaseEnabled = false end
+if getgenv().BypassEnabled == nil then getgenv().BypassEnabled = false end
 
 -- ===== Helpers =====
 local function getGold()
@@ -333,16 +334,47 @@ local function doAutoFight()
 end
 
 -- ===== Max Game Speed =====
--- FightFastForwardLevel is clamped 1-3 by the game's own FightClient and
--- cycled via FightStart:FireServer("FastForward"); there is no legitimate
--- way to exceed the native 3x cap, so this just drives the level to max.
+local SPEED_MULTIPLIER = 10
 local function ensureMaxGameSpeed()
     if not getgenv().MaxGameSpeedEnabled then return end
     local plot = getMyPlot()
     if not plot or plot:GetAttribute("FightRunning") ~= true then return end
-    local level = tonumber(LocalPlayer:GetAttribute("FightFastForwardLevel")) or 1
-    if level < 3 then
-        pcall(function() FightStart:FireServer("FastForward") end)
+    local current = tonumber(plot:GetAttribute("FightFastForwardSpeed")) or 1
+    if current ~= SPEED_MULTIPLIER then
+        plot:SetAttribute("FightFastForwardSpeed", SPEED_MULTIPLIER)
+    end
+end
+
+-- ===== Bypass =====
+-- Luck2x/SuperLuck/UltraLuck -> RandomGenerator (verified client-side)
+-- Mutation2x -> MutationInfo (verified client-side)
+-- FightFastForwardSpeed -> CustomAttackModules + AttackModules.Loader (plot attribute, no server clamp)
+getgenv().__BypassLoop = false
+local function toggleBypass(enabled)
+    if enabled then
+        if getgenv().__BypassLoop then return end
+        getgenv().BypassEnabled = true
+        getgenv().__BypassLoop = true
+        task.spawn(function()
+            while getgenv().__BypassLoop and getgenv().__RAG == myGen do
+                LocalPlayer:SetAttribute("Luck2x", true)
+                LocalPlayer:SetAttribute("SuperLuck", true)
+                LocalPlayer:SetAttribute("UltraLuck", true)
+                LocalPlayer:SetAttribute("Mutation2x", true)
+                local plot = getMyPlot()
+                if plot then plot:SetAttribute("FightFastForwardSpeed", SPEED_MULTIPLIER) end
+                task.wait(1)
+            end
+        end)
+    else
+        getgenv().__BypassLoop = false
+        getgenv().BypassEnabled = false
+        LocalPlayer:SetAttribute("Luck2x", false)
+        LocalPlayer:SetAttribute("SuperLuck", false)
+        LocalPlayer:SetAttribute("UltraLuck", false)
+        LocalPlayer:SetAttribute("Mutation2x", false)
+        local plot = getMyPlot()
+        if plot then plot:SetAttribute("FightFastForwardSpeed", 1) end
     end
 end
 
@@ -504,6 +536,7 @@ InfoBox3:Label({Text = "* Auto Summon (rolls)"})
 InfoBox3:Label({Text = "* Auto Buy (price range, keep-gold,\n  per-rarity DisplayName filters)"})
 InfoBox3:Label({Text = "* Auto Upgrade (Gold / Luck / Slot / Inventory)"})
 InfoBox3:Label({Text = "* Anti-AFK / Auto Reconnect / Auto Save"})
+InfoBox3:Label({Text = "* Bypass (Luck+14 / Mutation2x / Speed10x)"})
 
 local InfoBox4 = Tabs.Info:Section({Side = "Right"})
 InfoBox4:Header({Text = "Social"})
@@ -709,6 +742,16 @@ FightSection:Toggle({
 FightSection:Label({Text = "0 = disabled. Max Game Speed = FightFastForwardSpeed\n10x (no server clamp, verified client-side)."})
 local fightStatusLabel = FightSection:Label({Text = "Idle"})
 
+local BypassSection = Tabs.Fight:Section({Side = "Right"})
+BypassSection:Header({Text = "Bypass"})
+BypassSection:Toggle({
+    Name = "Luck+14 / Mutation2x / Speed10x",
+    Default = getgenv().BypassEnabled,
+    Callback = function(v) toggleBypass(v); saveState() end,
+}, "BypassEnabled")
+BypassSection:Label({Text = "Verified client-side:\n* Luck2x + SuperLuck + UltraLuck = +14\n* Mutation2x = double mutation chance\n* FightFastForwardSpeed = 10x\nRe-sets ทุก 1s ตลอด session."})
+local bypassStatusLabel = BypassSection:Label({Text = getgenv().BypassEnabled and "Running" or "Off"})
+
 -- ----- Upgrade Tab -----
 local UpgradeSection = Tabs.Upgrade:Section({Side = "Left"})
 UpgradeSection:Header({Text = "Auto Upgrade"})
@@ -823,8 +866,20 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while getgenv().__RAG == myGen do
+        pcall(function()
+            bypassStatusLabel:UpdateName(
+                getgenv().BypassEnabled and "Running — Luck+14 / Mutation2x / Speed10x" or "Off"
+            )
+        end)
+        task.wait(1)
+    end
+end)
+
 applyFPSBoost(getgenv().FPSBoostEnabled)
 applyRemoveOtherBase(getgenv().RemoveOtherBaseEnabled)
+if getgenv().BypassEnabled then toggleBypass(true) end
 
 getgenv().__RAWindow = Window
 Tabs.Info:Select()
