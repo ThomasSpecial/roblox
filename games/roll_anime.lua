@@ -8,6 +8,8 @@ pcall(function()
     if getgenv().__RAWindow then getgenv().__RAWindow:Unload() end
 end)
 
+print("[RollAnime] Starting (gen " .. myGen .. ")...")
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
@@ -53,7 +55,32 @@ local UpgradesInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForCh
 local StatsHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("StatsHandler"))
 local SpinWheelHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SpinWheel"):WaitForChild("SpinWheelHandler"))
 local DataClient = require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("DataService")).client
-DataClient:waitForData()
+print("[RollAnime] Remotes/modules ready, waiting for player data...")
+
+-- DataClient:waitForData() has no built-in timeout and isn't a native
+-- WaitForChild, so Roblox's own "Infinite yield possible" watchdog never
+-- fires for it -- confirmed live: a session got stuck here with zero warning
+-- in console, script never reached the UI. Racing it against a 15s timeout
+-- so the rest of the script (and the UI) still builds even if data hasn't
+-- arrived yet; the background task keeps waiting and DataClient:get(...)
+-- calls elsewhere will just see stale/empty results until it resolves.
+do
+    local dataReady = false
+    task.spawn(function()
+        DataClient:waitForData()
+        dataReady = true
+    end)
+    local waited = 0
+    while not dataReady and waited < 15 do
+        task.wait(0.25)
+        waited += 0.25
+    end
+    if dataReady then
+        print("[RollAnime] Player data ready (" .. string.format("%.1f", waited) .. "s)")
+    else
+        warn("[RollAnime] DataClient:waitForData() still not done after 15s -- continuing without blocking further; some stats may show 0/empty until it resolves")
+    end
+end
 
 local UPGRADE_KEYS = {"Gold", "Luck", "Slots", "Inventory"}
 local UPGRADE_LABELS = {Gold = "Gold", Luck = "Luck", Slots = "Slot", Inventory = "Inventory"}
@@ -632,7 +659,9 @@ if not getgenv().__RAReconnectHooked then
 end
 
 -- ===== UI (Maclib) =====
+print("[RollAnime] Loading MacLib...")
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
+print("[RollAnime] MacLib loaded, building window...")
 local Window = MacLib:Window({
     Title = "Roll Anime to Fight! Automation",
     Subtitle = "v2.1 — +Battlepass",
