@@ -194,9 +194,36 @@ local function getJoinScript()
 end
 
 -- ===== Auto Summon =====
+-- Teleport ครั้งเดียวตอนออกนอก SUMMON_RANGE studs จาก prompt แล้วค้างอยู่ตรงนั้น
+-- ไม่ teleport กลับ-ไปทุก loop -- เวอร์ชันก่อนหน้า (teleport ไปเด้งกลับทุกรอบ
+-- SummonDelay) ทำให้ตัวละครกระตุก/เด้งไปมาให้เห็นชัดทุก 0.5-3s (ยืนยันจากผู้ใช้).
+local SUMMON_RANGE = 8  -- studs -- ถ้าออกกว่านี้ค่อย pull กลับ
+local summonStandbyPos = nil  -- CFrame ที่ยืนอยู่หน้าแท่น
 local summonStatusText = "Idle"
+
+local function getSummonStandbyPos(promptPart)
+    -- ยืนด้านหน้าแท่น ห่าง 3 studs บวก 3 สูง
+    return CFrame.new(promptPart.Position + Vector3.new(0, 3, 3))
+end
+
+local function ensureNearPrompt(hrp, promptPart)
+    local dist = (hrp.Position - promptPart.Position).Magnitude
+    if dist > SUMMON_RANGE then
+        local target = getSummonStandbyPos(promptPart)
+        pcall(function() hrp.CFrame = target end)
+        summonStandbyPos = target
+        task.wait(0.15)
+        return true -- teleported
+    end
+    return false
+end
+
 local function doAutoSummon()
-    if not getgenv().AutoSummonEnabled then summonStatusText = "Idle"; return end
+    if not getgenv().AutoSummonEnabled then
+        summonStatusText = "Idle"
+        summonStandbyPos = nil
+        return
+    end
     local plot = getMyPlot()
     if not plot then summonStatusText = "Could not find your plot"; return end
     local prompt = getRollPrompt(plot)
@@ -204,15 +231,16 @@ local function doAutoSummon()
     local hrp = getHRP()
     if not hrp then return end
     local promptPart = prompt.Parent
-    local originalCFrame = hrp.CFrame
-    pcall(function() hrp.CFrame = CFrame.new(promptPart.Position + Vector3.new(0, 3, 3)) end)
-    task.wait(0.2)
+
+    -- ครั้งแรก หรือออกนอก range: pull กลับครั้งเดียว แล้วค้างอยู่
+    ensureNearPrompt(hrp, promptPart)
+
     if prompt.Enabled then
         pcall(function() fireproximityprompt(prompt) end)
         summonStatusText = "Rolled"
+    else
+        summonStatusText = "Near prompt — waiting"
     end
-    task.wait(0.3)
-    pcall(function() hrp.CFrame = originalCFrame end)
 end
 
 -- ===== Auto Buy =====
