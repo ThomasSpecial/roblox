@@ -534,7 +534,6 @@ local Tabs = {
     Fight   = TabGroup:Tab({Name = "Fight",    Image = "rbxassetid://10734975692"}),
     Quest   = TabGroup:Tab({Name = "Quest",    Image = "rbxassetid://10747363465"}),
     Upgrade = TabGroup:Tab({Name = "Upgrade",  Image = "rbxassetid://10747363465"}),
-    Misc    = TabGroup:Tab({Name = "Misc",     Image = "rbxassetid://10734963191"}),
     Settings= TabGroup:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 
@@ -841,24 +840,22 @@ for _, key in ipairs(UPGRADE_KEYS) do
 end
 UpgradeRight:Label({Text = "Buys with Gold currency (not Robux)."})
 
--- ----- Misc Tab -----
-local MiscSection = Tabs.Misc:Section({Side = "Left"})
-MiscSection:Header({Text = "Misc"})
-MiscSection:Toggle({
+-- ----- Settings Tab -----
+local SettingsSection = Tabs.Settings:Section({Side = "Left"})
+SettingsSection:Header({Text = "General"})
+SettingsSection:Toggle({
     Name = "Anti-AFK", Default = getgenv().AntiAFKEnabled,
     Callback = function(v) getgenv().AntiAFKEnabled = v; saveState() end,
 }, "AntiAFKEnabled")
-MiscSection:Toggle({
+SettingsSection:Toggle({
     Name = "Auto Reconnect", Default = getgenv().AutoReconnectEnabled,
     Callback = function(v) getgenv().AutoReconnectEnabled = v; saveState() end,
 }, "AutoReconnectEnabled")
-MiscSection:Keybind({
+SettingsSection:Keybind({
     Name = "Show/Hide UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
     Callback = function() pcall(function() Window:SetState(not Window:GetState()) end) end,
 }, "RollAnimeToggleUIKeybind")
 
--- ----- Settings Tab -----
-local SettingsSection = Tabs.Settings:Section({Side = "Left"})
 SettingsSection:Header({Text = "Auto Save"})
 SettingsSection:Label({Text = "All toggles save automatically to:\n" .. SAVE_FILE})
 local PerformanceSection = Tabs.Settings:Section({Side = "Right"})
