@@ -22,8 +22,14 @@ local UpdateInventory = CharRemotes:WaitForChild("UpdateInventory")
 local UpgradeRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Upgrade")
 local FightStart = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Fight"):WaitForChild("Start")
 local SpinRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SpinWheel"):WaitForChild("Spin")
-local GetQuestData = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("GetQuestData")
-local ClaimQuest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ClaimQuest")
+-- Bounded, not blocking WaitForChild: these two don't actually exist anywhere
+-- under ReplicatedStorage.Remotes in this game (confirmed live via a full
+-- listing of every RemoteEvent/RemoteFunction there -- no Quest namespace at
+-- all). An unbounded WaitForChild on either one hung the ENTIRE script before
+-- it ever reached the UI, breaking the public loadstring link for everyone.
+-- Auto Claim Quest below no-ops instead of erroring when these are nil.
+local GetQuestData = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("GetQuestData", 3)
+local ClaimQuest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ClaimQuest", 3)
 local CharactersInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Characters"):WaitForChild("CharactersInfo"))
 local UpgradesInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("UpgradesInfo"))
 local StatsHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("StatsHandler"))
@@ -261,6 +267,10 @@ local questClaimedCount = 0
 
 local function doAutoClaimQuest()
     if not getgenv().AutoClaimQuestEnabled then questStatusText = "Idle"; return end
+    if not (GetQuestData and ClaimQuest) then
+        questStatusText = "Not available in this game"
+        return
+    end
     local ok, questData = pcall(function() return GetQuestData:InvokeServer() end)
     if not ok or type(questData) ~= "table" then questStatusText = "Error fetching quests"; return end
 
@@ -787,6 +797,10 @@ local questListLabel = QuestRight:Label({Text = "Press 'Claim Now' to check"})
 
 QuestRight:Button({Name = "Refresh Quest List", Callback = function()
     task.spawn(function()
+        if not GetQuestData then
+            pcall(function() questListLabel:UpdateName("Not available in this game") end)
+            return
+        end
         local ok, qd = pcall(function() return GetQuestData:InvokeServer() end)
         if not ok or type(qd) ~= "table" then
             pcall(function() questListLabel:UpdateName("Error fetching quests") end)
