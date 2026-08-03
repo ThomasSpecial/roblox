@@ -1,4 +1,5 @@
--- Roll Anime to Fight! Automation
+-- Roll Anime to Fight! Automation v2.0
+-- อัพเดท: + Mutation Cursed, + Auto Claim Quest, + Battlepass=false note
 getgenv().__RAG = (getgenv().__RAG or 0) + 1
 local myGen = getgenv().__RAG
 local SESSION_START = os.clock()
@@ -21,6 +22,8 @@ local UpdateInventory = CharRemotes:WaitForChild("UpdateInventory")
 local UpgradeRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Upgrade")
 local FightStart = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Fight"):WaitForChild("Start")
 local SpinRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SpinWheel"):WaitForChild("Spin")
+local GetQuestData = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("GetQuestData")
+local ClaimQuest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ClaimQuest")
 local CharactersInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Characters"):WaitForChild("CharactersInfo"))
 local UpgradesInfo = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("UpgradesInfo"))
 local StatsHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("StatsHandler"))
@@ -31,15 +34,17 @@ DataClient:waitForData()
 local UPGRADE_KEYS = {"Gold", "Luck", "Slots", "Inventory"}
 local UPGRADE_LABELS = {Gold = "Gold", Luck = "Luck", Slots = "Slot", Inventory = "Inventory"}
 local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Mythic", "Secret", "God", "Limited"}
-local MUTATIONS = {"None", "Gold", "Diamond", "Demon", "Destroyer", "Astronaut", "Hollow", "Slayer"}
+
+-- Cursed เพิ่มเข้ามาใหม่ใน v2.0 (Chance=0, event-only, Damage=6.5x)
+local MUTATIONS = {"None", "Gold", "Diamond", "Demon", "Destroyer", "Astronaut", "Hollow", "Slayer", "Cursed"}
 
 -- ===== Character catalog =====
 local CHAR_INFO = {}
 local CHAR_BASE_STATS = {}
-local RARITY_CHARACTERS = {}       -- rarity -> {Name, Name, ...} (internal)
-local CHAR_DISPLAY_NAMES = {}      -- Name -> DisplayName
-local CHAR_NAME_FROM_DISPLAY = {}  -- DisplayName -> Name (reverse lookup)
-local RARITY_CHARACTERS_DISPLAY = {} -- rarity -> {DisplayName, ...} (sorted, for dropdown)
+local RARITY_CHARACTERS = {}
+local CHAR_DISPLAY_NAMES = {}
+local CHAR_NAME_FROM_DISPLAY = {}
+local RARITY_CHARACTERS_DISPLAY = {}
 
 for _, r in ipairs(RARITIES) do RARITY_CHARACTERS[r] = {} end
 for _, entry in pairs(CharactersInfo.Characters) do
@@ -51,7 +56,6 @@ for _, entry in pairs(CharactersInfo.Characters) do
         end
         local display = entry.DisplayName and tostring(entry.DisplayName) or entry.Name
         CHAR_DISPLAY_NAMES[entry.Name] = display
-        -- ถ้า DisplayName ซ้ำกัน fallback ไป Name จริง
         if not CHAR_NAME_FROM_DISPLAY[display] then
             CHAR_NAME_FROM_DISPLAY[display] = entry.Name
         end
@@ -77,6 +81,7 @@ local PERSIST_KEYS = {
     "AutoFightStart", "StartAtWave", "StopAtWave", "MaxGameSpeedEnabled",
     "AutoEquipBestEnabled", "EquipFilterBy", "ReplaceWeakerSlots", "AutoSpinWheelEnabled",
     "FPSBoostEnabled", "RemoveOtherBaseEnabled", "BypassEnabled",
+    "AutoClaimQuestEnabled",
 }
 local function loadPersistedState()
     local ok, content = pcall(function() return readfile(SAVE_FILE) end)
@@ -95,7 +100,7 @@ local function saveState()
 end
 
 if getgenv().AutoSummonEnabled == nil then getgenv().AutoSummonEnabled = false end
-if getgenv().SummonDelay == nil then getgenv().SummonDelay = 0.01 end
+if getgenv().SummonDelay == nil then getgenv().SummonDelay = 2.2 end
 if getgenv().AntiAFKEnabled == nil then getgenv().AntiAFKEnabled = true end
 if getgenv().AutoReconnectEnabled == nil then getgenv().AutoReconnectEnabled = true end
 if getgenv().AutoBuyEnabled == nil then getgenv().AutoBuyEnabled = false end
@@ -123,6 +128,7 @@ if getgenv().AutoSpinWheelEnabled == nil then getgenv().AutoSpinWheelEnabled = f
 if getgenv().FPSBoostEnabled == nil then getgenv().FPSBoostEnabled = false end
 if getgenv().RemoveOtherBaseEnabled == nil then getgenv().RemoveOtherBaseEnabled = false end
 if getgenv().BypassEnabled == nil then getgenv().BypassEnabled = false end
+if getgenv().AutoClaimQuestEnabled == nil then getgenv().AutoClaimQuestEnabled = false end
 
 -- ===== Helpers =====
 local function getGold()
@@ -182,35 +188,9 @@ local function getJoinScript()
 end
 
 -- ===== Auto Summon =====
--- Teleport ครั้งเดียวตอนเปิด หรือถ้าออกนอก SUMMON_RANGE studs จาก prompt
--- แล้วค้างอยู่ตรงนั้นเลย ไม่กระตุกทุก loop
-local SUMMON_RANGE = 8  -- studs -- ถ้าออกกว่านี้ค่อย pull กลับ
-local summonStandbyPos = nil  -- CFrame ที่ยืนอยู่หน้าแท่น
 local summonStatusText = "Idle"
-
-local function getSummonStandbyPos(promptPart)
-    -- ยืนด้านหน้าแท่น ห่าง 3 studs บวก 3 สูง
-    return CFrame.new(promptPart.Position + Vector3.new(0, 3, 3))
-end
-
-local function ensureNearPrompt(hrp, promptPart)
-    local dist = (hrp.Position - promptPart.Position).Magnitude
-    if dist > SUMMON_RANGE then
-        local target = getSummonStandbyPos(promptPart)
-        pcall(function() hrp.CFrame = target end)
-        summonStandbyPos = target
-        task.wait(0.15)
-        return true -- teleported
-    end
-    return false
-end
-
 local function doAutoSummon()
-    if not getgenv().AutoSummonEnabled then
-        summonStatusText = "Idle"
-        summonStandbyPos = nil
-        return
-    end
+    if not getgenv().AutoSummonEnabled then summonStatusText = "Idle"; return end
     local plot = getMyPlot()
     if not plot then summonStatusText = "Could not find your plot"; return end
     local prompt = getRollPrompt(plot)
@@ -218,20 +198,18 @@ local function doAutoSummon()
     local hrp = getHRP()
     if not hrp then return end
     local promptPart = prompt.Parent
-
-    -- ครั้งแรก หรือออกนอก range: pull กลับครั้งเดียว แล้วค้างอยู่
-    ensureNearPrompt(hrp, promptPart)
-
+    local originalCFrame = hrp.CFrame
+    pcall(function() hrp.CFrame = CFrame.new(promptPart.Position + Vector3.new(0, 3, 3)) end)
+    task.wait(0.2)
     if prompt.Enabled then
         pcall(function() fireproximityprompt(prompt) end)
         summonStatusText = "Rolled"
-    else
-        summonStatusText = "Near prompt — waiting"
     end
+    task.wait(0.3)
+    pcall(function() hrp.CFrame = originalCFrame end)
 end
 
 -- ===== Auto Buy =====
--- RarityRules.characters stores internal Name keys -- DisplayName is UI-only
 local function shouldBuy(slotData)
     if not (slotData and slotData.Name and slotData.Rarity) then return false end
     if slotData.Purchased then return false end
@@ -272,6 +250,41 @@ if not getgenv().__RARollHooked then
             if getgenv().__RABuyStatusLabel then getgenv().__RABuyStatusLabel:UpdateName(buyStatusText) end
         end)
     end)
+end
+
+-- ===== Auto Claim Quest =====
+-- GetQuestData:InvokeServer() -> {Daily=[...], Weekly=[...]}
+-- quest fields: ID, Completed, Claimed, Name, Reward, Category
+-- ClaimQuest:FireServer(questID) -> claim ทีละ quest
+local questStatusText = "Idle"
+local questClaimedCount = 0
+
+local function doAutoClaimQuest()
+    if not getgenv().AutoClaimQuestEnabled then questStatusText = "Idle"; return end
+    local ok, questData = pcall(function() return GetQuestData:InvokeServer() end)
+    if not ok or type(questData) ~= "table" then questStatusText = "Error fetching quests"; return end
+
+    local claimed = 0
+    for cat, quests in pairs(questData) do
+        if type(quests) == "table" then
+            for _, q in ipairs(quests) do
+                if type(q) == "table" and q.Completed == true and q.Claimed == false and q.ID then
+                    local okClaim = pcall(function() ClaimQuest:FireServer(q.ID) end)
+                    if okClaim then
+                        claimed += 1
+                        questClaimedCount += 1
+                        task.wait(0.3)
+                    end
+                end
+            end
+        end
+    end
+
+    if claimed > 0 then
+        questStatusText = "Claimed " .. claimed .. " quest(s) | Total: " .. questClaimedCount
+    else
+        questStatusText = "No claimable quests"
+    end
 end
 
 -- ===== Auto Upgrade =====
@@ -349,6 +362,7 @@ end
 -- Luck2x/SuperLuck/UltraLuck -> RandomGenerator (verified client-side)
 -- Mutation2x -> MutationInfo (verified client-side)
 -- FightFastForwardSpeed -> CustomAttackModules + AttackModules.Loader (plot attribute, no server clamp)
+-- Cursed mutation เป็น event-only (Chance=0 ใน MutationInfo) ไม่มี attribute ที่ set ได้
 getgenv().__BypassLoop = false
 local function toggleBypass(enabled)
     if enabled then
@@ -495,8 +509,8 @@ end
 -- ===== UI (Maclib) =====
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 local Window = MacLib:Window({
-    Title = "Roll Anime to Fight",
-    Subtitle = "by Frost",
+    Title = "Roll Anime to Fight! Automation",
+    Subtitle = "v2.0 — +Cursed +Quest",
     DragStyle = 1,
     ShowUserInfo = true,
     AcrylicBlur = false,
@@ -508,6 +522,7 @@ local Tabs = {
     Summon  = TabGroup:Tab({Name = "Summon",   Image = "rbxassetid://10723343321"}),
     Buy     = TabGroup:Tab({Name = "Buy",      Image = "rbxassetid://10734952273"}),
     Fight   = TabGroup:Tab({Name = "Fight",    Image = "rbxassetid://10734975692"}),
+    Quest   = TabGroup:Tab({Name = "Quest",    Image = "rbxassetid://10747363465"}),
     Upgrade = TabGroup:Tab({Name = "Upgrade",  Image = "rbxassetid://10747363465"}),
     Misc    = TabGroup:Tab({Name = "Misc",     Image = "rbxassetid://10734963191"}),
     Settings= TabGroup:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
@@ -533,15 +548,17 @@ end})
 local InfoBox3 = Tabs.Info:Section({Side = "Left"})
 InfoBox3:Header({Text = "Features"})
 InfoBox3:Label({Text = "* Auto Summon (rolls)"})
-InfoBox3:Label({Text = "* Auto Buy (price range, keep-gold,\n  per-rarity DisplayName filters)"})
+InfoBox3:Label({Text = "* Auto Buy — filter by rarity / DisplayName / Mutation\n  รวม Cursed mutation ใหม่"})
 InfoBox3:Label({Text = "* Auto Upgrade (Gold / Luck / Slot / Inventory)"})
+InfoBox3:Label({Text = "* Auto Claim Quest (Daily + Weekly)"})
 InfoBox3:Label({Text = "* Anti-AFK / Auto Reconnect / Auto Save"})
 InfoBox3:Label({Text = "* Bypass (Luck+14 / Mutation2x / Speed10x)"})
+InfoBox3:Label({Text = "* Battlepass: เกมใช้ RequestGamepass remote\n  ซื้อผ่าน Robux เท่านั้น ไม่มี claim ได้จาก client"})
 
 local InfoBox4 = Tabs.Info:Section({Side = "Right"})
 InfoBox4:Header({Text = "Social"})
 InfoBox4:Button({Name = "Copy Discord URL", Callback = function()
-    pcall(function() setclipboard("http://discord.gg/") end)
+    pcall(function() setclipboard("http://discord.gg/frosthub") end)
 end})
 InfoBox4:Button({Name = "Copy Rscripts URL", Callback = function()
     pcall(function() setclipboard("https://rscripts.net/") end)
@@ -555,7 +572,7 @@ SummonSection:Toggle({
     Callback = function(v) getgenv().AutoSummonEnabled = v; saveState() end,
 }, "AutoSummonEnabled")
 SummonSection:Slider({
-    Name = "Summon Delay (s)", Minimum = 0.01, Maximum = 3.0,
+    Name = "Summon Delay (s)", Minimum = 0.5, Maximum = 3.0,
     Default = getgenv().SummonDelay, Precision = 2,
     Callback = function(v) getgenv().SummonDelay = v; saveState() end,
 })
@@ -625,7 +642,7 @@ getgenv().__RABuyStatusLabel = buyStatusLabel
 
 local RaritySection = Tabs.Buy:Section({Side = "Right"})
 RaritySection:Header({Text = "Rarity Rules"})
-RaritySection:Label({Text = "Dropdown แสดงชื่อในเกมจริง (DisplayName)\nแต่ logic ใช้ internal Name -- ตรงกันแน่นอน."})
+RaritySection:Label({Text = "Dropdown แสดง DisplayName จริง\nแต่ logic ใช้ internal Name\nMutation filter รวม Cursed แล้ว"})
 
 local enabledRaritiesDefault = {}
 for _, r in ipairs(RARITIES) do
@@ -658,10 +675,7 @@ RaritySection:Dropdown({
 }, "RaritiesSelected")
 
 for _, r in ipairs(RARITIES) do
-    -- charOptions คือ DisplayName list สำหรับแสดงใน dropdown
     local charOptions = RARITY_CHARACTERS_DISPLAY[r]
-
-    -- Default: แปลง saved internal Names กลับเป็น DisplayName สำหรับ dropdown
     local charDefaultDisplay = {}
     for _, savedName in ipairs(getgenv().RarityRules[r].characters or {}) do
         table.insert(charDefaultDisplay, CHAR_DISPLAY_NAMES[savedName] or savedName)
@@ -683,7 +697,6 @@ for _, r in ipairs(RARITIES) do
             local newList = {}
             for _, displayName in ipairs(charOptions) do
                 if selectedSet[displayName] then
-                    -- reverse lookup DisplayName -> internal Name สำหรับ shouldBuy()
                     local realName = CHAR_NAME_FROM_DISPLAY[displayName] or displayName
                     table.insert(newList, realName)
                 end
@@ -695,6 +708,7 @@ for _, r in ipairs(RARITIES) do
     pcall(function() charDD:SetVisibility(getgenv().RarityRules[r].enabled) end)
     RarityCharDropdowns[r] = charDD
 
+    -- MUTATIONS list ตอนนี้รวม "Cursed" แล้ว
     local mutDD = RaritySection:Dropdown({
         Name = r .. " Mutations", Multi = true, Options = MUTATIONS,
         Default = getgenv().RarityRules[r].mutations,
@@ -749,8 +763,50 @@ BypassSection:Toggle({
     Default = getgenv().BypassEnabled,
     Callback = function(v) toggleBypass(v); saveState() end,
 }, "BypassEnabled")
-BypassSection:Label({Text = "Verified client-side:\n* Luck2x + SuperLuck + UltraLuck = +14\n* Mutation2x = double mutation chance\n* FightFastForwardSpeed = 10x\nRe-sets ทุก 1s ตลอด session."})
+BypassSection:Label({Text = "Verified client-side:\n* Luck2x + SuperLuck + UltraLuck = +14\n* Mutation2x = double mutation chance\n* FightFastForwardSpeed = 10x\nRe-sets ทุก 1s ตลอด session.\n\nCursed = event-only (Chance=0)\nไม่มี attribute ที่ bypass ได้"})
 local bypassStatusLabel = BypassSection:Label({Text = getgenv().BypassEnabled and "Running" or "Off"})
+
+-- ----- Quest Tab -----
+local QuestLeft = Tabs.Quest:Section({Side = "Left"})
+QuestLeft:Header({Text = "Auto Claim Quest"})
+QuestLeft:Toggle({
+    Name = "Auto Claim Quest",
+    Default = getgenv().AutoClaimQuestEnabled,
+    Callback = function(v) getgenv().AutoClaimQuestEnabled = v; saveState() end,
+}, "AutoClaimQuestEnabled")
+QuestLeft:Label({Text = "Claim quest อัตโนมัติ (Daily + Weekly)\nที่ Completed=true และ Claimed=false\nผ่าน ClaimQuest:FireServer(questID)\nตรวจทุก 30 วินาที"})
+QuestLeft:Button({Name = "Claim Now", Callback = function()
+    task.spawn(doAutoClaimQuest)
+end})
+local questStatusLabel = QuestLeft:Label({Text = "Idle"})
+local questCountLabel = QuestLeft:Label({Text = "Claimed this session: 0"})
+
+local QuestRight = Tabs.Quest:Section({Side = "Right"})
+QuestRight:Header({Text = "Quest Status"})
+local questListLabel = QuestRight:Label({Text = "Press 'Claim Now' to check"})
+
+QuestRight:Button({Name = "Refresh Quest List", Callback = function()
+    task.spawn(function()
+        local ok, qd = pcall(function() return GetQuestData:InvokeServer() end)
+        if not ok or type(qd) ~= "table" then
+            pcall(function() questListLabel:UpdateName("Error fetching quests") end)
+            return
+        end
+        local lines = {}
+        for cat, quests in pairs(qd) do
+            if type(quests) == "table" then
+                for _, q in ipairs(quests) do
+                    if type(q) == "table" and q.ID then
+                        local status = q.Claimed and "✓Claimed" or (q.Completed and "✓Done" or string.format("%.0f%%", math.min(100, ((q.Progress or 0)/(q.Requirement or 1))*100)))
+                        table.insert(lines, string.format("[%s] %s\n  %s", cat:sub(1,1), tostring(q.Name or q.ID), status))
+                    end
+                end
+            end
+        end
+        table.sort(lines)
+        pcall(function() questListLabel:UpdateName(#lines > 0 and table.concat(lines, "\n") or "No quests found") end)
+    end)
+end})
 
 -- ----- Upgrade Tab -----
 local UpgradeSection = Tabs.Upgrade:Section({Side = "Left"})
@@ -877,9 +933,20 @@ task.spawn(function()
     end
 end)
 
+-- Auto Claim Quest loop ทุก 30 วินาที
+task.spawn(function()
+    while getgenv().__RAG == myGen do
+        pcall(doAutoClaimQuest)
+        pcall(function() questStatusLabel:UpdateName(questStatusText) end)
+        pcall(function() questCountLabel:UpdateName("Claimed this session: " .. questClaimedCount) end)
+        task.wait(30)
+    end
+end)
+
 applyFPSBoost(getgenv().FPSBoostEnabled)
 applyRemoveOtherBase(getgenv().RemoveOtherBaseEnabled)
 if getgenv().BypassEnabled then toggleBypass(true) end
 
 getgenv().__RAWindow = Window
 Tabs.Info:Select()
+print("[RollAnime] v2.0 loaded — Cursed mutation + Auto Claim Quest")
