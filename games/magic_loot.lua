@@ -359,30 +359,32 @@ end
 --   Total bag: PlayerData.GetPlrDataByKey(LP,"Bag") entry count, cap read
 --   from the "仓库.容量" ("Warehouse Capacity") backpack UI label, e.g.
 --   "74 / 999" -- the account-wide inventory, independent of any single run.
--- Cap is read live from the HUD text instead of hardcoded, since bag size
--- is an upgradeable stat (ItemID.LimitBagSize reward) and could change.
-local function parseCap(text)
-    if type(text) ~= "string" then return 0 end
-    return tonumber(text:match("/%s*(%d+)")) or 0
+-- Cap (and now used-count too) is read live from the HUD text instead of
+-- computed ourselves, since bag size is an upgradeable stat (ItemID.Limit-
+-- BagSize reward) and could change -- and because counting raw PlayerData
+-- Bag table entries turned out to NOT match what the game calls "used"
+-- (confirmed live: 114 raw onlyID entries in the Bag table vs "67 / 999" on
+-- the actual Warehouse Capacity label -- the UI must be counting distinct
+-- item stacks, not raw entries. Trusting the label directly sidesteps that
+-- entirely instead of guessing at the aggregation rule).
+local function parseUsedCap(text)
+    if type(text) ~= "string" then return 0, 0 end
+    local usedStr, capStr = text:match("(%d+)%s*/%s*(%d+)")
+    return tonumber(usedStr) or 0, tonumber(capStr) or 0
 end
 local function getStageBagUsage()
-    local used = LocalPlayer:FindFirstChild("LimitBagUsed")
-    local usedVal = used and used.Value or 0
     local ok, label = pcall(function()
         return LocalPlayer.PlayerGui.ScreenGui.Main.ButtomLeft["临时背包容量"].Label
     end)
-    return usedVal, ok and parseCap(label.Text) or 0
+    if not ok then return 0, 0 end
+    return parseUsedCap(label.Text)
 end
 local function getTotalBagUsage()
-    local bag = PlayerData.GetPlrDataByKey(LocalPlayer, "Bag")
-    local usedVal = 0
-    if type(bag) == "table" then
-        for _ in pairs(bag) do usedVal += 1 end
-    end
     local ok, label = pcall(function()
         return LocalPlayer.PlayerGui.ScreenGui.Main.Backpack["仓库"]["容量"]:FindFirstChild("Size")
     end)
-    return usedVal, ok and parseCap(label.Text) or 0
+    if not ok then return 0, 0 end
+    return parseUsedCap(label.Text)
 end
 local function isEitherBagFull()
     local stageUsed, stageCap = getStageBagUsage()
@@ -439,6 +441,9 @@ local function doAutoStage()
     end
     if e.AutoReturnOnBagFull then
         local full, which = isEitherBagFull()
+        local su, sc = getStageBagUsage()
+        local tu, tc = getTotalBagUsage()
+        print("[MagicLoot][BagFull] stage=" .. su .. "/" .. sc .. " total=" .. tu .. "/" .. tc .. " full=" .. tostring(full))
         if full then
             fire(NetMsg.DUNGEON_RETURN_TOWN)
             lastReturnTime = os.clock()
