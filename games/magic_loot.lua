@@ -67,13 +67,57 @@ end
 -- ===== Rarity names (Xyd1-10, confirmed live from UIMgr.Gradients: 常见/
 -- 罕见/稀有/史诗/传说/神话/秘密/远古/至尊/星界) =====
 local RARITY_NAMES = {"常见", "罕见", "稀有", "史诗", "传说", "神话", "秘密", "远古", "至尊", "星界"}
+-- English side confirmed live from TranslationHelper.Language's own
+-- localizationtableConf entries for each rarity string (same table the
+-- game's own UI reads for these labels).
+local RARITY_NAMES_EN = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Ancient", "Supreme", "Astral Realm"}
 local RARITY_INDEX = {}
 for i, name in ipairs(RARITY_NAMES) do RARITY_INDEX[name] = i end
 
+-- Chinese ZhName -> English name for the 17 alchemy potions, confirmed live
+-- from TranslationHelper.Language.localizationtableConf (each grepped
+-- individually against the game's own decompiled translation table --
+-- require()'ing that module directly returns an empty table in this
+-- executor for some reason, so this is hardcoded from the verified source
+-- instead of read live).
+local POTION_NAME_EN = {
+    ["火箭术药水"] = "Fire Arrow Potion", ["手臂变细药水"] = "Long-long Arms Potion",
+    ["水球术药水"] = "Water Orb Potion", ["巨人术药水"] = "Giant Growth Potion",
+    ["陨石术药水"] = "Meteorite Potion", ["大地突起药水"] = "Earth Spike Potion",
+    ["雷电雷电药水"] = "Thunder-thunder Potion", ["冰霜三棘药水"] = "Frost Thorns Potion",
+    ["龙息术药水"] = "Dragon Breath Potion", ["花御木刺药水"] = "Wood Thorn Potion",
+    ["光辉之剑药水"] = "Radiant Sword Potion", ["水渊药水"] = "Abyssal Water Potion",
+    ["小羊药水"] = "Sheepy Potion", ["连环毒爆药水"] = "Ring Gas Potion",
+    ["火焰辣椒药水"] = "Flame Chili Potion", ["暗夜亡魂药水"] = "Night Wraith Potion",
+    ["冰莲绽放药水"] = "Lotus Blooms Potion",
+}
+
+-- ===== Auto Use Potion options =====
+-- Potions in this game split into two unrelated categories, confirmed live
+-- via CfgFind.FindCfgByID on every entry in ConfigInstance.potionConf
+-- (26 total): SkillID~=0 ones grant a combat skill on use (the 17 alchemy
+-- potions above -- precious, meant to be equipped/chosen, never auto-used),
+-- BuffID~=0 ones are plain timed buffs (only 4 of them: 2 Training, 2
+-- Lucky). Auto Use Potion only ever touches the BuffID kind -- that's the
+-- whole "Skills vs Potion (Lucks, Training)" split.
+local USE_POTION_ID_TO_LABEL = {
+    [9200101] = "Training Potion", [9200102] = "Super Training Potion",
+    [9200103] = "Lucky Potion", [9200104] = "Super Lucky Potion",
+}
+local USE_POTION_LABEL_TO_ID = {}
+local USE_POTION_OPTIONS = {}
+for id, label in pairs(USE_POTION_ID_TO_LABEL) do
+    USE_POTION_LABEL_TO_ID[label] = id
+    table.insert(USE_POTION_OPTIONS, label)
+end
+table.sort(USE_POTION_OPTIONS)
+
 -- ===== Alchemy recipe list (CfgFind.GetAlchemyRecipeList(), confirmed live --
 -- 17 recipes, each recipeId maps to a PID (the crafted potion's item id);
--- resolving PID through CfgFind.FindCfgByID gives the real potion name,
--- since the recipe's own ZhName is just a generic "配方N" placeholder) =====
+-- resolving PID through CfgFind.FindCfgByID gives the real potion name +
+-- rarity, since the recipe's own ZhName is just a generic "配方N" placeholder.
+-- Label format "Fire Arrow Potion (Common)" -- English name, rarity in
+-- parens, no id prefix -- as requested.
 local alchemyRecipeLabels = {}
 local alchemyLabelToId = {}
 local alchemyIdToLabel = {}
@@ -85,8 +129,11 @@ do
             local rid = tonumber(recipe.recipeId)
             if rid then
                 local okName, itemCfg = pcall(function() return CfgFind.FindCfgByID(recipe.PID) end)
-                local potionName = (okName and itemCfg and itemCfg.ZhName) or ("Recipe " .. rid)
-                local label = rid .. " - " .. potionName
+                local zhName = okName and itemCfg and itemCfg.ZhName
+                local potionName = (zhName and POTION_NAME_EN[zhName]) or zhName or ("Recipe " .. rid)
+                local xyd = okName and itemCfg and tonumber(itemCfg.xyd)
+                local rarityName = xyd and RARITY_NAMES_EN[xyd] or "?"
+                local label = potionName .. " (" .. rarityName .. ")"
                 table.insert(alchemyRecipeLabels, label)
                 alchemyLabelToId[label] = rid
                 alchemyIdToLabel[rid] = label
@@ -104,8 +151,8 @@ local PERSIST_KEYS = {
     "AutoTrainEnabled",
     "AutoClaimDailyEnabled",
     "AutoSellEnabled", "SellMaxPrice", "SellMaxRarity",
-    "AutoAlchemyEnabled", "AlchemyRecipeId",
-    "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull",
+    "AutoAlchemyEnabled", "AlchemyRecipeId", "AutoUsePotionEnabled", "AutoUsePotionSelected",
+    "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull", "MobHoverHeight",
     "AutoRebirthEnabled",
     "SkillNoCooldownEnabled",
     "AntiAFKEnabled", "AutoReconnectEnabled", "WalkSpeedEnabled", "WalkSpeedValue",
@@ -137,10 +184,13 @@ if e.AutoSellEnabled == nil then e.AutoSellEnabled = false end
 if e.SellMaxPrice == nil then e.SellMaxPrice = 0 end
 if e.SellMaxRarity == nil then e.SellMaxRarity = 0 end
 if e.AutoAlchemyEnabled == nil then e.AutoAlchemyEnabled = false end
+if e.AutoUsePotionEnabled == nil then e.AutoUsePotionEnabled = false end
+if e.AutoUsePotionSelected == nil then e.AutoUsePotionSelected = {} end
 if e.AlchemyRecipeId == nil then e.AlchemyRecipeId = "" end
 if e.AutoStageEnabled == nil then e.AutoStageEnabled = false end
 if e.StageTarget == nil then e.StageTarget = 0 end
 if e.AutoReturnOnBagFull == nil then e.AutoReturnOnBagFull = false end
+if e.MobHoverHeight == nil then e.MobHoverHeight = 12 end
 if e.AutoRebirthEnabled == nil then e.AutoRebirthEnabled = false end
 if e.SkillNoCooldownEnabled == nil then e.SkillNoCooldownEnabled = false end
 if e.AntiAFKEnabled == nil then e.AntiAFKEnabled = true end
@@ -197,20 +247,19 @@ end
 
 -- ===== Auto Train =====
 -- This is a LOBBY-only feature (Workspace.场景.大厅.功能.训练场 -- a Training
--- Ground crystal, not a dungeon mechanic). Confirmed live by spying asvra's
--- "dupe power" toggle in the pre-existing exploit GUI: it calls
--- NetWork.InvokeServer(NetMsg.TRAIN_MANUAL_CLICK, <table>), NOT FireServer
--- with no args like every other guess-and-check message in this game --
--- the original assumption was wrong on both call type and arg shape.
--- Table CONTENTS are still unconfirmed (only caught the fire once, while
--- the character was passing through the lobby, before it could be
--- serialized) -- needs a fresh live capture standing at the crystal.
--- Sending an empty table as the best-effort placeholder until then.
+-- Ground crystal, not a dungeon mechanic). NetWork.InvokeServer(NetMsg.
+-- TRAIN_MANUAL_CLICK, {}) confirmed live -- returns {gain=X, ok=true} with
+-- a real currency gain, but ONLY when standing at the crystal; from
+-- anywhere else it silently no-ops. Tried ~20 different extra table fields
+-- (multiplier/times/count/rate/tier/etc) looking for a click-multiplier
+-- knob -- gain never changed, so whatever x2/x4/x8/x15/x100 badge the game
+-- shows is a passive stat (Rebirth/bonus-event driven), not something this
+-- call controls -- {} is already the correct, complete argument.
 local trainStatusText = "Idle"
 local function doAutoTrain()
     if not e.AutoTrainEnabled then trainStatusText = "Idle"; return end
     local result = invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
-    trainStatusText = result ~= nil and "Sent (table arg unverified -- check for level/currency movement)" or "No response -- likely out of Training Ground range or wrong arg shape"
+    trainStatusText = (type(result) == "table" and result.gain) and ("Trained -- gained " .. result.gain) or "No response -- likely out of Training Ground range"
 end
 
 -- ===== Auto Claim Daily + Online Award =====
@@ -330,6 +379,35 @@ local function doAutoCraftAlchemy()
     alchemyStatusText = result and "Crafted + collected" or "No craft this pass (missing materials or already brewing)"
 end
 
+-- ===== Auto Use Potion =====
+-- DRINK_POTION(onlyID) confirmed live -- invoked on a real Bag entry
+-- (ItemType.Potion, tp==9), returned true and the entry was gone from the
+-- bag right after. Only drinks entries whose item id is in the selected
+-- set (Training/Lucky potions) -- the skill-granting alchemy potions are
+-- never touched even if nothing is selected. Skips equip==1 in case that
+-- ever means "actively slotted", same caution as Auto Sell.
+local usePotionStatusText = "Toggle is OFF"
+local function doAutoUsePotion()
+    if not e.AutoUsePotionEnabled then usePotionStatusText = "Toggle is OFF"; return end
+    local selected = type(e.AutoUsePotionSelected) == "table" and e.AutoUsePotionSelected or {}
+    if next(selected) == nil then usePotionStatusText = "No potion selected"; return end
+    local bag = PlayerData.GetPlrDataByKey(LocalPlayer, "Bag")
+    if type(bag) ~= "table" then usePotionStatusText = "No bag data"; return end
+    local used = 0
+    for onlyIdKey, entry in pairs(bag) do
+        if type(entry) == "table" and entry.equip ~= 1 and tostring(entry.tp) == "9" then
+            local label = USE_POTION_ID_TO_LABEL[tonumber(entry.id)]
+            local onlyID = tonumber(entry.onlyID) or tonumber(onlyIdKey)
+            if onlyID and label and selected[label] then
+                local result = invoke(NetMsg.DRINK_POTION, onlyID)
+                if result then used += 1 end
+                task.wait(0.15)
+            end
+        end
+    end
+    usePotionStatusText = used > 0 and ("Used " .. used .. " potion(s)") or "Nothing to use"
+end
+
 -- ===== Auto Stage =====
 -- LocalPlayer.DungeonAggroStage (NumberValue) tracks the current stage
 -- (confirmed live -- same value SystemDrop.client listens to for its own
@@ -337,6 +415,17 @@ end
 -- captured a real call).
 local stageStatusText = "Toggle is OFF"
 local lastReturnTime = 0
+-- Elite/boss rooms carry monsters with absurd HP pools (confirmed live:
+-- a 4-monster pack all at 400,000,001,507,328 HP each) that can legitimately
+-- take a minute-plus to clear -- that's not a bug, it's just a slow fight,
+-- but from outside it looks identical to a genuinely stuck run. Tracking
+-- how long the stage value has sat unchanged tells the two apart: if it's
+-- still climbing (however slowly) that's fine, but if it's flatlined too
+-- long, abandon and let the portal-reentry loop start a fresh, hopefully
+-- easier run instead of potentially sitting there forever.
+local STALL_ABANDON_SECONDS = 90
+local lastProgressStage = -1
+local lastProgressTime = 0
 -- 副本引导 ("Dungeon Guide") in the town's 功能 folder is a plain touch
 -- trigger, no ProximityPrompt -- confirmed live, teleporting onto it flips
 -- InDungeonChallenge to 1 and starts a fresh run at stage 1. Used both to
@@ -402,25 +491,67 @@ local function doAutoStage()
     local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
     local inDungeon = inDungeonVal and inDungeonVal.Value > 0
     if not inDungeon then
-        if os.clock() - lastReturnTime < 2 then
-            stageStatusText = "Returned to town -- re-entering shortly"
+        lastProgressStage = -1
+        lastProgressTime = 0
+        -- The user watched this live and noticed re-entry needs a beat
+        -- after returning before the server will actually accept it --
+        -- matches the touch-trigger silently not registering when hit too
+        -- soon after DUNGEON_RETURN_TOWN (the dungeon instance is probably
+        -- still tearing down server-side). Widened from 2s to 8s.
+        local REENTRY_DELAY_SECONDS = 8
+        if os.clock() - lastReturnTime < REENTRY_DELAY_SECONDS then
+            stageStatusText = "Returned to town -- waiting " ..
+                math.ceil(REENTRY_DELAY_SECONDS - (os.clock() - lastReturnTime)) .. "s before re-entering"
             return
         end
         local guide = findDungeonPortal()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if guide and hrp then
-            hrp.CFrame = CFrame.new(guide.Position)
-            stageStatusText = "Not in dungeon -- walked to the portal to (re)enter"
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if guide and hrp and hum then
+            -- An instant CFrame jump straight onto 副本引导 never registers --
+            -- confirmed live: sitting exactly on it for 60+ seconds straight,
+            -- InDungeonChallenge stayed 0 the whole time. Humanoid:MoveTo()
+            -- (real physics-driven movement into it) worked on the very
+            -- first try. The touch-trigger apparently needs genuine
+            -- movement/collision resolution, not just an overlapping CFrame.
+            hrp.Anchored = false
+            hrp.CFrame = CFrame.new(guide.Position + Vector3.new(6, 0, 0))
+            hum:MoveTo(guide.Position)
+            print("[MagicLoot][Portal] walking into portal at " .. tostring(guide.Position))
+            stageStatusText = "Not in dungeon -- walking to the portal to (re)enter"
         else
             stageStatusText = "Not in dungeon -- portal not found (not in town?)"
         end
         return
     end
 
+    do
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
+    end
+
     local stageVal = LocalPlayer:FindFirstChild("DungeonAggroStage")
     local current = stageVal and stageVal.Value or 0
     print("[MagicLoot][Stage] tick, current=" .. current .. " target=" .. target)
+
+    if current ~= lastProgressStage or lastProgressTime == 0 then
+        lastProgressStage = current
+        lastProgressTime = os.clock()
+    elseif os.clock() - lastProgressTime > STALL_ABANDON_SECONDS then
+        -- Same stage for too long -- most likely an elite/boss pack too
+        -- tanky to clear in reasonable time. Bail and let the portal loop
+        -- start a fresh run rather than potentially sitting here forever.
+        fire(NetMsg.DUNGEON_ABANDON_CHALLENGE)
+        fire(NetMsg.DUNGEON_RETURN_TOWN)
+        lastReturnTime = os.clock()
+        lastProgressStage = -1
+        lastProgressTime = 0
+        stageStatusText = "Stage " .. current .. " stalled " .. STALL_ABANDON_SECONDS .. "s+ (elite pack?) -- abandoned, restarting"
+        return
+    end
+
     if current >= target then
         -- Waiting to pick up is pointless once the bag is actually full --
         -- fireproximityprompt() can't collect anything more at that point,
@@ -451,7 +582,24 @@ local function doAutoStage()
             return
         end
     end
-    stageStatusText = "Farming -- stage " .. current .. " / target " .. target
+    local folder = workspace:FindFirstChild("LocalMonster")
+    local aliveCount, totalHpPct = 0, 0
+    if folder then
+        for _, m in ipairs(folder:GetChildren()) do
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if hum and hum.MaxHealth > 0 then
+                aliveCount += 1
+                totalHpPct += (hum.Health / hum.MaxHealth)
+            end
+        end
+    end
+    if aliveCount > 0 then
+        local avgHpPct = math.floor((totalHpPct / aliveCount) * 100)
+        stageStatusText = "Farming -- stage " .. current .. " / target " .. target ..
+            " (" .. aliveCount .. " alive, avg " .. avgHpPct .. "% HP)"
+    else
+        stageStatusText = "Farming -- stage " .. current .. " / target " .. target
+    end
 end
 
 -- Skills already auto-cast on their own, but the character doesn't walk
@@ -471,7 +619,6 @@ end
 -- itself. So if a room sits empty (cleared, or nothing spawned yet) for
 -- more than ~2s, nudge forward to the next room's battle area instead of
 -- waiting forever on a stage value that won't update until we do.
-local MOB_HOVER_HEIGHT = 12
 -- Room targeting is tracked ENTIRELY with local state, driven only by
 -- "found a monster or not" -- it never reads DungeonAggroStage to decide
 -- which room to head to. Reading the server stage for that was the bug:
@@ -485,6 +632,7 @@ local roomProgress = 1
 local emptyTicks = 0
 local lastRoomEntered = 0
 local wasInDungeon = false
+local orbitAngleDeg = 0
 
 -- Anchoring while sitting on a mob is deliberate -- re-CFraming an
 -- unanchored part every 0.3s fights gravity between ticks (falls, then
@@ -507,8 +655,11 @@ local function teleportToNearestMob()
         -- Not in a run right now (doAutoStage is walking to the portal, or
         -- just reached target and returned) -- reset unconditionally, every
         -- single tick, so nothing stale survives into the next run no
-        -- matter which tick actually catches the transition.
-        hrp.Anchored = false
+        -- matter which tick actually catches the transition. Anchoring is
+        -- NOT touched here -- doAutoStage owns it during the portal
+        -- approach (steps back anchored, then in anchored) and this loop
+        -- fighting it every 0.3s was undoing that hold before gravity-drop
+        -- had time to actually register as leaving the trigger.
         roomProgress = 1
         emptyTicks = 0
         lastRoomEntered = 0
@@ -542,7 +693,19 @@ local function teleportToNearestMob()
     if nearest then
         emptyTicks = 0
         hrp.Anchored = true
-        hrp.CFrame = CFrame.new(nearest.Position + Vector3.new(0, MOB_HOVER_HEIGHT, 0))
+        -- A fixed hover point is a stationary target -- the mob's own
+        -- attacks land on it every time, full damage, no matter how far
+        -- off the ground it sits (confirmed live: dropping the hover height
+        -- to 0-2 still took full damage, so it was never about floating vs
+        -- grounded, it's proximity/being a sitting duck). Orbiting instead
+        -- keeps the character in skill range but never still long enough
+        -- for the mob's attacks to reliably land.
+        local hoverHeight = tonumber(e.MobHoverHeight) or 12
+        local orbitRadius = 8
+        orbitAngleDeg = (orbitAngleDeg + 60) % 360
+        local rad = math.rad(orbitAngleDeg)
+        local offset = Vector3.new(math.cos(rad) * orbitRadius, hoverHeight, math.sin(rad) * orbitRadius)
+        hrp.CFrame = CFrame.new(nearest.Position + offset)
         return
     end
     hrp.Anchored = false
@@ -761,6 +924,24 @@ AlchemyLeft:Dropdown({
 AlchemyLeft:Label({Text = "Collects any finished potion, then starts the\nnext craft if materials allow. Repeats every 3s.\nCollect step (ALCHEMY_PICKUP_FINISH_POTION) is\nunverified -- watch for it live."})
 local alchemyStatusLabel = AlchemyLeft:Label({Text = "Idle"})
 
+local AlchemyRight = Tabs.Alchemy:Section({Side = "Right"})
+AlchemyRight:Header({Text = "Auto Use Potion"})
+AlchemyRight:Toggle({
+    Name = "Auto Use Potion", Default = e.AutoUsePotionEnabled,
+    Callback = function(v) e.AutoUsePotionEnabled = v; saveState() end,
+}, "AutoUsePotionEnabled")
+AlchemyRight:Dropdown({
+    Name = "Potions to Auto Use", Options = USE_POTION_OPTIONS, Multi = true,
+    Default = (function()
+        local arr = {}
+        for name in pairs(e.AutoUsePotionSelected) do table.insert(arr, name) end
+        return arr
+    end)(),
+    Callback = function(selected) e.AutoUsePotionSelected = selected or {}; saveState() end,
+}, "AutoUsePotionSelectedDropdown")
+AlchemyRight:Label({Text = "Only Training/Lucky buff potions are offered\nhere -- skill-granting alchemy potions are\nnever auto-used. Nothing selected = does\nnothing, even with the toggle on."})
+local usePotionStatusLabel = AlchemyRight:Label({Text = "Idle"})
+
 -- ----- Stage Tab -----
 local StageLeft = Tabs.Stage:Section({Side = "Left"})
 StageLeft:Header({Text = "Auto Stage"})
@@ -777,6 +958,11 @@ StageLeft:Toggle({
     Name = "Return Town on Bag Full", Default = e.AutoReturnOnBagFull,
     Callback = function(v) e.AutoReturnOnBagFull = v; saveState() end,
 }, "AutoReturnOnBagFull")
+StageLeft:Slider({
+    Name = "Mob Hover Height", Minimum = 3, Maximum = 40,
+    Default = e.MobHoverHeight, Precision = 0,
+    Callback = function(v) e.MobHoverHeight = v; saveState() end,
+}, "MobHoverHeightSlider")
 StageLeft:Label({Text = "Snaps onto the nearest live monster every 0.3s\nso skills stay in range, until DungeonAggroStage\nreaches the target -- then fires DUNGEON_RETURN_TOWN.\nWith Bag Full ON, also returns early if either the\nstage bag or the total bag hits its cap -- then loops\nback into a fresh run either way."})
 local stageStatusLabel = StageLeft:Label({Text = "Idle"})
 
@@ -876,7 +1062,7 @@ task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(doAutoTrain)
         pcall(function() trainStatusLabel:UpdateName(trainStatusText) end)
-        task.wait(0.15)
+        task.wait(0.01)
     end
 end)
 
@@ -892,6 +1078,14 @@ task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(doAutoCraftAlchemy)
         pcall(function() alchemyStatusLabel:UpdateName(alchemyStatusText) end)
+        task.wait(3)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MLG == myGen do
+        pcall(doAutoUsePotion)
+        pcall(function() usePotionStatusLabel:UpdateName(usePotionStatusText) end)
         task.wait(3)
     end
 end)
