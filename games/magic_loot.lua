@@ -51,6 +51,8 @@ local NetWork = UtilsSystem.NetWork
 local NetMsg = UtilsSystem.NetMsg
 local PlayerData = UtilsSystem.PlayerData
 local CfgFind = UtilsSystem.CfgFind
+local GetData = UtilsSystem.GetData
+local CollectionService = game:GetService("CollectionService")
 
 local function fire(msg, ...)
     local args = {...}
@@ -148,11 +150,14 @@ local SAVE_FILE = SAVE_FOLDER .. "/state.json"
 pcall(function() if not isfolder(SAVE_FOLDER) then makefolder(SAVE_FOLDER) end end)
 local PERSIST_KEYS = {
     "AutoPickupEnabled", "PickupMinPrice", "PickupRaritySet",
-    "AutoTrainEnabled",
+    "AutoTrainEnabled", "TrainZoneMode", "TrainZoneId", "TrainManualTapEnabled", "TrainTapRate",
     "AutoClaimDailyEnabled",
+    "AutoDinoRollEnabled", "DinoRollBatch", "DinoRollKeepTickets",
+    "AutoDinoQuestEnabled",
     "AutoSellEnabled", "SellMaxPrice", "SellMaxRarity",
     "AutoAlchemyEnabled", "AlchemyRecipeId", "AutoUsePotionEnabled", "AutoUsePotionSelected",
-    "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull", "MobHoverHeight",
+    "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull", "MobHoverHeight", "StageSavedPositions",
+    "AutoStageJumpEnabled", "StageJumpPick",
     "AutoRebirthEnabled",
     "SkillNoCooldownEnabled",
     "AntiAFKEnabled", "AutoReconnectEnabled", "WalkSpeedEnabled", "WalkSpeedValue",
@@ -179,7 +184,15 @@ if e.AutoPickupEnabled == nil then e.AutoPickupEnabled = false end
 if e.PickupMinPrice == nil then e.PickupMinPrice = 0 end
 if e.PickupRaritySet == nil then e.PickupRaritySet = {} end
 if e.AutoTrainEnabled == nil then e.AutoTrainEnabled = false end
+if e.TrainZoneMode == nil then e.TrainZoneMode = "Best" end
+if e.TrainZoneId == nil then e.TrainZoneId = 0 end
+if e.TrainManualTapEnabled == nil then e.TrainManualTapEnabled = true end
+if e.TrainTapRate == nil then e.TrainTapRate = 0.1 end
 if e.AutoClaimDailyEnabled == nil then e.AutoClaimDailyEnabled = false end
+if e.AutoDinoRollEnabled == nil then e.AutoDinoRollEnabled = false end
+if e.DinoRollBatch == nil then e.DinoRollBatch = 1 end
+if e.DinoRollKeepTickets == nil then e.DinoRollKeepTickets = 0 end
+if e.AutoDinoQuestEnabled == nil then e.AutoDinoQuestEnabled = false end
 if e.AutoSellEnabled == nil then e.AutoSellEnabled = false end
 if e.SellMaxPrice == nil then e.SellMaxPrice = 0 end
 if e.SellMaxRarity == nil then e.SellMaxRarity = 0 end
@@ -191,6 +204,10 @@ if e.AutoStageEnabled == nil then e.AutoStageEnabled = false end
 if e.StageTarget == nil then e.StageTarget = 0 end
 if e.AutoReturnOnBagFull == nil then e.AutoReturnOnBagFull = false end
 if e.MobHoverHeight == nil then e.MobHoverHeight = 12 end
+if e.StageSavedPositions == nil then e.StageSavedPositions = {} end
+if e.AutoStageJumpEnabled == nil then e.AutoStageJumpEnabled = true end
+-- 0 = follow Target Stage automatically, anything else = jump exactly there
+if e.StageJumpPick == nil then e.StageJumpPick = 0 end
 if e.AutoRebirthEnabled == nil then e.AutoRebirthEnabled = false end
 if e.SkillNoCooldownEnabled == nil then e.SkillNoCooldownEnabled = false end
 if e.AntiAFKEnabled == nil then e.AntiAFKEnabled = true end
@@ -245,21 +262,142 @@ local function doAutoPickup()
     pickupStatusText = fired > 0 and ("Picked up " .. fired .. " item(s) this pass") or "Nothing matching filter"
 end
 
--- ===== Auto Train =====
--- This is a LOBBY-only feature (Workspace.场景.大厅.功能.训练场 -- a Training
--- Ground crystal, not a dungeon mechanic). NetWork.InvokeServer(NetMsg.
--- TRAIN_MANUAL_CLICK, {}) confirmed live -- returns {gain=X, ok=true} with
--- a real currency gain, but ONLY when standing at the crystal; from
--- anywhere else it silently no-ops. Tried ~20 different extra table fields
--- (multiplier/times/count/rate/tier/etc) looking for a click-multiplier
--- knob -- gain never changed, so whatever x2/x4/x8/x15/x100 badge the game
--- shows is a passive stat (Rebirth/bonus-event driven), not something this
--- call controls -- {} is already the correct, complete argument.
+-- ===== Auto Train (rewritten -- the game moved training server-side) =====
+-- The old build spammed TRAIN_MANUAL_CLICK every 0.01s and called that Auto
+-- Train. That stopped paying, and not because the remote broke. Measured live,
+-- standing in zone 5:
+--     CalcTrainGain            21,000,000,000 per click
+--     idle 3s, zero clicks     +1,008,000,000,000
+--     clicking 0.01s for 3s    +1,008,000,000,000   accepted=0  rejected=26
+--     clicking 0.2s  for 3s    +1,008,000,000,000   accepted=0  rejected=10
+-- Identical to idle either way -- manual clicks contributed nothing, and the
+-- server rejected every one after the first ~13 (there's a quota, and 100
+-- calls/sec burned it instantly). What actually pays is three new ValueObjects
+-- on LocalPlayer -- InTrainGround / TrainGroundId / IsAutoTraining -- the
+-- server ticks TRAIN_AUTO_TICK on its own at roughly 336B/sec while you simply
+-- stand inside a zone. So this no longer clicks for a living: it parks you in
+-- the highest-multiplier zone you actually qualify for and makes sure you stay
+-- in it. The manual tap stays available but throttled to 1/sec, since whatever
+-- quota exists isn't worth burning at frame rate.
+--
+-- Zone table read live from CfgFind.FindTrainCfgById + GetData.CanEnterTrainGround:
+--   1=1.5x free   2=2x(Rb2)   3=4x(Rb5)   4=6x(Rb9)   5=8x(Rb12)
+--   6=10x RobuxTrain1   7=15x(Rb18)   8=25x RobuxTrain2   9=100x RobuxTrain3
 local trainStatusText = "Idle"
+local lastTrainTap = 0
+
+local function getTrainZones()
+    local zones = {}
+    for _, inst in ipairs(CollectionService:GetTagged("Train")) do
+        local okId, id = pcall(function() return GetData.GetTrainIdFromInstance(inst) end)
+        local okZone, zonePart = pcall(function() return GetData.ResolveZonePart(inst) end)
+        if okId and id and okZone and zonePart then
+            local okCfg, cfg = pcall(function() return CfgFind.FindTrainCfgById(id) end)
+            local okCan, can = pcall(function() return GetData.CanEnterTrainGround(LocalPlayer, id) end)
+            zones[id] = {
+                id = id,
+                part = zonePart,
+                add = (okCfg and cfg and tonumber(cfg.Add)) or 0,
+                rebirth = (okCfg and cfg and tonumber(cfg.Rebirth)) or 0,
+                passTag = (okCfg and cfg and cfg.OnlyTag) or "",
+                canEnter = okCan and type(can) == "table" and can.ok == true,
+                reason = okCan and type(can) == "table" and can.reason or nil,
+            }
+        end
+    end
+    return zones
+end
+
+-- Highest Add the account is actually allowed into. Reading CanEnterTrainGround
+-- rather than comparing Rebirth ourselves -- zone 6/8/9 gate on a GamePass, not
+-- a rebirth count, and the server is the one that decides either way.
+local function pickBestTrainZone(zones)
+    local best
+    for _, z in pairs(zones) do
+        if z.canEnter and (not best or z.add > best.add) then best = z end
+    end
+    return best
+end
+
+-- "Stay" is the original behaviour, kept because moving the character is not
+-- always wanted: never touches CFrame, just fires TRAIN_MANUAL_CLICK on a timer
+-- from wherever you happen to be standing. Worth knowing what it does and does
+-- not buy -- measured live in zone 5, the server's own auto-tick pays about
+-- 336B/sec for standing still, and a 3s clicking burst added nothing on top of
+-- that once the click quota was spent (the first ~13 returned ok, everything
+-- after was rejected). So Stay earns whatever the zone you are already in
+-- earns; the clicks are a bonus while the quota lasts, not the income.
+local function doStayModeTrain()
+    local rate = math.max(0.02, tonumber(e.TrainTapRate) or 0.1)
+    if (os.clock() - lastTrainTap) < rate then return end
+    lastTrainTap = os.clock()
+
+    local result = invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
+    local inGroundVal = LocalPlayer:FindFirstChild("InTrainGround")
+    local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
+    local zoneNote
+    if inGroundVal and inGroundVal.Value == true then
+        zoneNote = "in zone " .. tostring(groundIdVal and groundIdVal.Value or "?")
+    else
+        zoneNote = "outside any zone"
+    end
+
+    if type(result) == "table" and result.ok then
+        trainStatusText = string.format("Stay @%.2fs -- click ok, gain %s (%s)",
+            rate, tostring(result.gain), zoneNote)
+    else
+        trainStatusText = string.format("Stay @%.2fs -- click rejected (%s)", rate, zoneNote)
+    end
+end
+
 local function doAutoTrain()
     if not e.AutoTrainEnabled then trainStatusText = "Idle"; return end
-    local result = invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
-    trainStatusText = (type(result) == "table" and result.gain) and ("Trained -- gained " .. result.gain) or "No response -- likely out of Training Ground range"
+
+    if e.TrainZoneMode == "Stay" then return doStayModeTrain() end
+
+    local zones = getTrainZones()
+    if not next(zones) then trainStatusText = "No Train zones found -- not in the lobby?"; return end
+
+    local target
+    if e.TrainZoneMode == "Manual" and tonumber(e.TrainZoneId) and tonumber(e.TrainZoneId) > 0 then
+        target = zones[tonumber(e.TrainZoneId)]
+        if not target then trainStatusText = "Zone " .. tostring(e.TrainZoneId) .. " does not exist"; return end
+        if not target.canEnter then
+            trainStatusText = "Zone " .. target.id .. " locked (" .. tostring(target.reason) .. ") -- pick another"
+            return
+        end
+    else
+        target = pickBestTrainZone(zones)
+        if not target then trainStatusText = "No zone this account can enter"; return end
+    end
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then trainStatusText = "No character"; return end
+
+    local inGroundVal = LocalPlayer:FindFirstChild("InTrainGround")
+    local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
+    local autoVal = LocalPlayer:FindFirstChild("IsAutoTraining")
+    local inGround = inGroundVal and inGroundVal.Value == true
+    local currentId = groundIdVal and tonumber(groundIdVal.Value) or 0
+
+    -- Only move when actually out of position. Re-CFraming a player who is
+    -- already parked and earning would fight their own movement for no gain.
+    if (not inGround) or currentId ~= target.id then
+        hrp.CFrame = CFrame.new(target.part.Position + Vector3.new(0, 4, 0))
+        trainStatusText = string.format("Moving to zone %d (%.1fx)", target.id, target.add)
+        return
+    end
+
+    if e.TrainManualTapEnabled and (os.clock() - lastTrainTap) >= math.max(0.02, tonumber(e.TrainTapRate) or 0.1) then
+        lastTrainTap = os.clock()
+        invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
+    end
+
+    local magic = 0
+    pcall(function() magic = GetData.GetTotalMagicValue(LocalPlayer) or 0 end)
+    trainStatusText = string.format("Zone %d (%.1fx)  auto=%s  magic=%s",
+        target.id, target.add, tostring(autoVal and autoVal.Value), tostring(magic))
 end
 
 -- ===== Auto Claim Daily + Online Award =====
@@ -309,6 +447,129 @@ local function doAutoClaimDaily()
     end
 
     claimDailyStatusText = claimed > 0 and ("Claimed " .. claimed .. " award(s)") or "Nothing claimable"
+end
+
+-- ===== Dino Event (远古魔法复苏 / "Ancient Magic Reborn", event id 1) =====
+-- Both remotes captured live against the running server, not read off the UI:
+--   InvokeServer(EVENT_HATCH_DRAW, 1)      -> {times=1, itemIds={...}}
+--                                             ticket 1 -> 0
+--   InvokeServer(EVENT_TASK_CLAIM, onlyTag) -> true
+--                                             Completed[tag] nil -> 1
+-- The draw arg is a plain roll count (the UI offers 1 / 3 / 10), NOT a table --
+-- and the ticket is a real bag item, id 9 "活动抽奖券", separate from the Dino
+-- Coin shop currency at id 8. Free tickets drip in at TicketIntervalSec=900,
+-- capped at TicketDailyMax=3 a day, so this is a slow trickle, not a faucet.
+local EVENT_TICKET_ITEM_ID = 9
+local EVENT_COIN_ITEM_ID = 8
+
+local function countBagItem(itemId)
+    local bag = PlayerData.GetPlrDataByKey(LocalPlayer, "Bag")
+    if type(bag) ~= "table" then return 0 end
+    local total = 0
+    for _, entry in pairs(bag) do
+        if type(entry) == "table" and tonumber(entry.id) == itemId then
+            total += tonumber(entry.count) or 0
+        end
+    end
+    return total
+end
+
+local dinoRollStatusText = "Toggle is OFF"
+local function doAutoDinoRoll()
+    if not e.AutoDinoRollEnabled then dinoRollStatusText = "Toggle is OFF"; return end
+
+    local activeOk, activeCfg = pcall(function() return CfgFind.GetActiveEventCfg() end)
+    if not activeOk or type(activeCfg) ~= "table" then
+        dinoRollStatusText = "No event running right now"
+        return
+    end
+
+    local batch = tonumber(e.DinoRollBatch) or 1
+    local keep = math.max(0, tonumber(e.DinoRollKeepTickets) or 0)
+    local tickets = countBagItem(EVENT_TICKET_ITEM_ID)
+    local spendable = tickets - keep
+
+    if spendable < batch then
+        dinoRollStatusText = string.format("Tickets %d (keep %d) -- need %d for x%d", tickets, keep, batch, batch)
+        return
+    end
+
+    local result = invoke(NetMsg.EVENT_HATCH_DRAW, batch)
+    if type(result) == "table" then
+        local drawn = tonumber(result.times) or batch
+        local coins = countBagItem(EVENT_COIN_ITEM_ID)
+        dinoRollStatusText = string.format("Rolled x%d -- tickets left %d, coins %d",
+            drawn, countBagItem(EVENT_TICKET_ITEM_ID), coins)
+    else
+        -- Server said no. Almost always "not enough tickets for this batch size"
+        -- (x3/x10 each want that many), so say so instead of a bare failure.
+        dinoRollStatusText = string.format("Server refused x%d roll (had %d ticket(s))", batch, tickets)
+    end
+end
+
+-- ResetType is numeric in taskConf: 1=Timed, 2=Daily, 3=Once -- and the player
+-- side stores each under a NAMED bucket in Event.EventTask, so the two have to
+-- be mapped explicitly. Target count lives in cfg.need[1] (a table, not a
+-- number), progress in bucket.Progress[onlyTag], and bucket.Completed[onlyTag]
+-- is set to 1 once claimed. Claimable is exactly: progress >= need and not
+-- already in Completed.
+local DINO_RESET_BUCKETS = { [1] = "Timed", [2] = "Daily", [3] = "Once" }
+
+local dinoQuestStatusText = "Toggle is OFF"
+local function collectDinoTasks()
+    local rows = {}
+    local ev = PlayerData.GetPlrDataByKey(LocalPlayer, "Event")
+    local eventTask = type(ev) == "table" and ev.EventTask or nil
+    if type(eventTask) ~= "table" then return rows end
+
+    for resetType, bucketName in pairs(DINO_RESET_BUCKETS) do
+        local okList, list = pcall(function() return CfgFind.GetTaskListByResetType(resetType) end)
+        local bucket = eventTask[bucketName]
+        if okList and type(list) == "table" and type(bucket) == "table" then
+            local progressMap = type(bucket.Progress) == "table" and bucket.Progress or {}
+            local completedMap = type(bucket.Completed) == "table" and bucket.Completed or {}
+            for _, cfg in ipairs(list) do
+                local tag = cfg.onlyTag
+                if type(tag) == "string" and tag ~= "" then
+                    local need = type(cfg.need) == "table" and (tonumber(cfg.need[1]) or 0) or (tonumber(cfg.need) or 0)
+                    local progress = tonumber(progressMap[tag]) or 0
+                    local claimed = completedMap[tag] ~= nil
+                    table.insert(rows, {
+                        bucket = bucketName, tag = tag, need = need,
+                        progress = progress, claimed = claimed,
+                        canClaim = (not claimed) and need > 0 and progress >= need,
+                    })
+                end
+            end
+        end
+    end
+    return rows
+end
+
+local function doAutoDinoQuest()
+    if not e.AutoDinoQuestEnabled then dinoQuestStatusText = "Toggle is OFF"; return end
+
+    local rows = collectDinoTasks()
+    if #rows == 0 then dinoQuestStatusText = "No event task data"; return end
+
+    local claimed, pending = 0, 0
+    for _, row in ipairs(rows) do
+        if row.canClaim then
+            local result = invoke(NetMsg.EVENT_TASK_CLAIM, row.tag)
+            print("[MagicLoot][DinoQuest] " .. row.bucket .. " " .. row.tag ..
+                " (" .. row.progress .. "/" .. row.need .. ") -> " .. tostring(result))
+            if result == true then claimed += 1 end
+            task.wait(0.25)
+        elseif not row.claimed then
+            pending += 1
+        end
+    end
+
+    if claimed > 0 then
+        dinoQuestStatusText = "Claimed " .. claimed .. " task(s), " .. pending .. " still in progress"
+    else
+        dinoQuestStatusText = pending .. " task(s) in progress, nothing ready"
+    end
 end
 
 -- ===== Auto Sell =====
@@ -483,6 +744,194 @@ local function isEitherBagFull()
     return false, nil
 end
 
+-- ===== Stage Jump (the game's own teleport, added in a recent update) =====
+-- NetWork.FireServer(NetMsg.STAGE_JUMP_REQUEST, stageNumber) -- a bare number,
+-- fired not invoked (confirmed from StageJump.lua's own button handler).
+--
+-- Two separate ceilings, and the second one is the surprising one:
+--   only 5 stages are teleport targets at all -- 4, 8, 13, 18, 23 (the entries
+--   in dungeonConf carrying a TeleIcon), and
+--   jumpMax = min(CareerMaxStage + 1, broom.Dungeon)
+-- Read live right now: CareerMaxStage 21, but the equipped 海盗扫帚 has
+-- Dungeon = 13, so jumpMax is 13 -- the BROOM is the limit, not progress. Ask
+-- for stage 17 and the honest answer is "13, that's as far as this broom goes."
+-- The client shows "需要先通关该关卡才可以传送" for anything past it, so firing
+-- blind would just get silently refused.
+local TELEPORTABLE_STAGES = {4, 8, 13, 18, 23}
+
+local function getStageJumpMax()
+    local career = 0
+    local careerVal = LocalPlayer:FindFirstChild("CareerMaxStage")
+    if careerVal then career = math.floor(tonumber(careerVal.Value) or 0) end
+
+    local broomId = tonumber(PlayerData.GetPlrDataByKey(LocalPlayer, "NowBroom")) or 0
+    if broomId <= 0 then
+        local broomVal = LocalPlayer:FindFirstChild("NowBroom")
+        if broomVal then broomId = math.floor(tonumber(broomVal.Value) or 0) end
+    end
+    local broomMax = 0
+    if broomId > 0 then
+        local ok, cfg = pcall(function() return CfgFind.FindCfgByID(broomId) end)
+        if ok and type(cfg) == "table" then broomMax = math.floor(tonumber(cfg.Dungeon) or 0) end
+    end
+
+    if career <= 0 or broomMax <= 0 then return 0 end
+    return math.min(career + 1, broomMax)
+end
+
+-- Highest teleport point that is both at or below the target and inside the
+-- jump ceiling. Returns nil when even stage 4 is out of reach, or when the
+-- target is close enough that walking there is the whole job anyway.
+local function pickStageJumpTarget(target)
+    local jumpMax = getStageJumpMax()
+    if jumpMax <= 0 then return nil, "teleport locked (no broom / no clears)" end
+
+    -- An explicit pick from the dropdown wins outright -- if you asked for
+    -- stage 8 you get stage 8, even with Target Stage set to 17.
+    local forced = tonumber(e.StageJumpPick) or 0
+    if forced > 0 then
+        if forced > jumpMax then
+            return nil, string.format("stage %d is past the ceiling (%d)", forced, jumpMax)
+        end
+        return forced, string.format("jump %d (picked, ceiling %d)", forced, jumpMax)
+    end
+
+    local best
+    for _, stage in ipairs(TELEPORTABLE_STAGES) do
+        if stage <= target and stage <= jumpMax then best = stage end
+    end
+    if not best then return nil, "no teleport point at or below stage " .. target end
+    return best, string.format("jump %d (auto for target %d, ceiling %d)", best, target, jumpMax)
+end
+
+-- The jump is a broom flight, not a warp. Flight.lua bails out of its update
+-- loop the moment the character carries StageJumpAnimating, which is the tell:
+-- the server plays the jump AS a broom animation, so firing STAGE_JUMP_REQUEST
+-- while on foot gets you moved without ever running the arrival -- you land in
+-- a stage that never spawns anything. Confirmed live:
+--   InvokeServer(TOGGLE_BROOM) -> true, character JetPacking = 11000003
+-- Mount first, jump second. Dismount after landing so the orbit/anchor logic
+-- and combat behave like a normal run.
+-- TOGGLE_BROOM is a toggle, and JetPacking is written by the game's own Flight
+-- loop, not by the server. The first version of dismountBroom cleared that
+-- attribute by hand "to be tidy" -- which desynced the two sides: the client
+-- read as dismounted while the server still had us mounted, so the next
+-- TOGGLE_BROOM dismounted instead of mounting and JetPacking never came back.
+-- That is exactly what "broom refused to mount" was, three runs in a row.
+-- Proven by toggling three times and watching it go on / on / off. Nothing here
+-- touches the attribute now; DISMOUNT_BROOM is explicit and one-directional, so
+-- it is used for getting off instead of another toggle.
+-- Three separate signals, and reading only the first one is what made the jump
+-- work sometimes and time out other times. Captured across a clean cycle:
+--   after dismount   JetPacking=nil          BroomFly=false      BroomCD  -22.1s
+--   after toggle     JetPacking=11000003     BroomFly=11000003   BroomCD   +6.6s
+--   after a jump     JetPacking=11000003     BroomFly=11000003   FlightSpeed 16.5
+--   settled          JetPacking=11000003     BroomFly=11000003   FlightSpeed 42.4
+-- BroomCD lives on the PLAYER (not the character) and is a future timestamp --
+-- toggling inside that window half-mounts: JetPacking sets but BroomFly stays
+-- false, and the server drops STAGE_JUMP_REQUEST with no reply at all, which
+-- read as the 15s "landed=false" timeout. So: wait out the cooldown, confirm
+-- BroomFly and not just JetPacking, then actually get airborne before jumping.
+local function broomCooldownRemaining()
+    return (tonumber(LocalPlayer:GetAttribute("BroomCD")) or 0) - os.time()
+end
+
+local function ensureBroomMounted()
+    local char = LocalPlayer.Character
+    if not char then return false end
+
+    local function flying()
+        local c = LocalPlayer.Character
+        return c and c:GetAttribute("JetPacking") and LocalPlayer:GetAttribute("BroomFly") and true or false
+    end
+    if flying() then return true end
+
+    for attempt = 1, 2 do
+        -- Never toggle into the cooldown -- that is the half-mount.
+        local guard = 0
+        while broomCooldownRemaining() > 0 and guard < 12 do
+            task.wait(0.5)
+            guard = guard + 0.5
+        end
+
+        invoke(NetMsg.TOGGLE_BROOM)
+        for _ = 1, 25 do
+            task.wait(0.1)
+            if flying() then
+                -- Mounted is not airborne. STAGE_JUMP_REQUEST needs a broom that
+                -- is actually moving, so kick off the ground and let the flight
+                -- physics spin up before handing over.
+                local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end) end
+                for _ = 1, 20 do
+                    task.wait(0.1)
+                    local c = LocalPlayer.Character
+                    local speed = c and tonumber(c:GetAttribute("BroomFlightSpeed")) or 0
+                    if speed > 0 then return true end
+                end
+                return flying()
+            end
+        end
+        if attempt == 1 then task.wait(0.5) end
+    end
+    return false
+end
+
+local function dismountBroom()
+    local char = LocalPlayer.Character
+    if not char or not char:GetAttribute("JetPacking") then return end
+    invoke(NetMsg.DISMOUNT_BROOM)
+    for _ = 1, 15 do
+        task.wait(0.1)
+        char = LocalPlayer.Character
+        if not (char and char:GetAttribute("JetPacking")) then return end
+    end
+end
+
+-- Landing is signalled by StageJumpAnimating going set and then clearing again.
+-- Waiting on the attribute instead of a flat sleep means a slow flight still
+-- finishes before the room walker starts yanking the character around.
+local function waitForStageJumpLanding(timeoutSeconds)
+    local deadline = os.clock() + (timeoutSeconds or 12)
+    local sawAnimation = false
+    while os.clock() < deadline do
+        local char = LocalPlayer.Character
+        local animating = char and char:GetAttribute("StageJumpAnimating")
+        if animating then
+            sawAnimation = true
+        elseif sawAnimation then
+            return true
+        end
+        task.wait(0.15)
+    end
+    return sawAnimation
+end
+
+local stageJumpedThisRun = false
+local stageWasInDungeon = false
+-- The mount sequence waits on a cooldown, a toggle and then lift-off, which
+-- adds up to half a minute worst case. doAutoStage used to run all of that
+-- inline, so the whole stage loop -- status text, bag checks, everything --
+-- stopped dead for the duration and Auto Stage looked frozen the moment it was
+-- switched on. It runs on its own thread now; the loop keeps ticking and just
+-- reports what the jump thread is doing.
+local stageJumpBusy = false
+
+-- These three drive room-walking and the saved-position lookup, and they used to
+-- be declared below doAutoStage. That was survivable while only the walker
+-- touched them -- but the stage-jump branch has to reseat roomProgress after a
+-- teleport, and assigning a not-yet-declared local from up here would have made
+-- a silent global that the real local later shadows: the jump would look fine
+-- and the walker would still march off toward room 1. Declared before both users.
+local roomProgress = 1
+local emptyTicks = 0
+local lastRoomEntered = 0
+-- wasInDungeon moved up with them: the walker resets roomProgress to 1 the first
+-- tick it sees a fresh run, and it runs at 0.3s against doAutoStage's 1s. If the
+-- jump landed first, that reset would wipe roomProgress right back to 1 and send
+-- the character walking from the front anyway. The jump sets this true itself.
+local wasInDungeon = false
+
 local function doAutoStage()
     if not e.AutoStageEnabled then stageStatusText = "Toggle is OFF"; return end
     local target = tonumber(e.StageTarget) or 0
@@ -493,6 +942,12 @@ local function doAutoStage()
     if not inDungeon then
         lastProgressStage = -1
         lastProgressTime = 0
+        -- Cleared on the in-dungeon -> town transition only. Clearing it every
+        -- town tick would re-arm the jump each second, so a run with no valid
+        -- teleport target would reprint "skipped" forever and a failed mount
+        -- would retry in a tight loop instead of just taking the portal.
+        if stageWasInDungeon then stageJumpedThisRun = false end
+        stageWasInDungeon = false
         -- The user watched this live and noticed re-entry needs a beat
         -- after returning before the server will actually accept it --
         -- matches the touch-trigger silently not registering when hit too
@@ -504,6 +959,55 @@ local function doAutoStage()
                 math.ceil(REENTRY_DELAY_SECONDS - (os.clock() - lastReturnTime)) .. "s before re-entering"
             return
         end
+        -- The teleport belongs HERE, in town, not after entering. The game
+        -- refuses to mount a broom inside a dungeon ("cannot mount in dungeon"),
+        -- and the jump IS a broom flight -- so firing it from inside was asking
+        -- for the one thing that location forbids. It failed to mount four runs
+        -- straight in the dungeon and mounted first try in town, every time.
+        -- The jump flies you into the run at that stage, so it replaces the
+        -- portal walk rather than following it.
+        if stageJumpBusy then
+            -- The jump thread owns the character right now. Do nothing else --
+            -- walking to the portal mid-flight would fight it.
+            return
+        end
+
+        if e.AutoStageJumpEnabled and not stageJumpedThisRun then
+            local jumpTo, note = pickStageJumpTarget(target)
+            if jumpTo then
+                stageJumpedThisRun = true
+                stageJumpBusy = true
+                task.spawn(function()
+                    stageStatusText = "Mounting broom for stage " .. jumpTo .. "..."
+                    if not ensureBroomMounted() then
+                        print("[MagicLoot][StageJump] broom refused to mount in town -- using the portal")
+                        stageStatusText = "Broom would not mount -- walking to the portal"
+                    else
+                        fire(NetMsg.STAGE_JUMP_REQUEST, jumpTo)
+                        -- roomProgress drives room-walking and the saved-position
+                        -- lookup, so it has to follow the teleport or the next
+                        -- tick would march back toward room 1 from where we land.
+                        roomProgress = jumpTo
+                        lastRoomEntered = 0
+                        emptyTicks = 0
+                        wasInDungeon = true
+                        print("[MagicLoot][StageJump] " .. tostring(note) .. " (from town, on broom)")
+                        stageStatusText = "Flying to stage " .. jumpTo .. " (" .. tostring(note) .. ")"
+                        local landed = waitForStageJumpLanding(15)
+                        dismountBroom()
+                        print("[MagicLoot][StageJump] landed=" .. tostring(landed))
+                        if not landed then
+                            stageStatusText = "Teleport did not land -- falling back to the portal"
+                        end
+                    end
+                    stageJumpBusy = false
+                end)
+                return
+            end
+            stageJumpedThisRun = true
+            print("[MagicLoot][StageJump] skipped -- " .. tostring(note))
+        end
+
         local guide = findDungeonPortal()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -526,6 +1030,8 @@ local function doAutoStage()
         return
     end
 
+    stageWasInDungeon = true
+
     do
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -535,6 +1041,7 @@ local function doAutoStage()
     local stageVal = LocalPlayer:FindFirstChild("DungeonAggroStage")
     local current = stageVal and stageVal.Value or 0
     print("[MagicLoot][Stage] tick, current=" .. current .. " target=" .. target)
+
 
     if current ~= lastProgressStage or lastProgressTime == 0 then
         lastProgressStage = current
@@ -553,11 +1060,25 @@ local function doAutoStage()
     end
 
     if current >= target then
+        local bagFull, bagWhich = isEitherBagFull()
+        if e.AutoReturnOnBagFull then
+            -- Loop-farm the target stage instead of leaving as soon as it's
+            -- clear -- room-advancement already stops once current>=target
+            -- (see teleportToNearestMob), so this just keeps fighting
+            -- whatever keeps spawning here until the bag actually fills.
+            if bagFull then
+                fire(NetMsg.DUNGEON_RETURN_TOWN)
+                lastReturnTime = os.clock()
+                stageStatusText = "Bag full (" .. bagWhich .. ") at target stage " .. current .. " -- returned to town"
+                return
+            end
+            stageStatusText = "At target stage " .. current .. " -- farming until bag full"
+            return
+        end
         -- Waiting to pick up is pointless once the bag is actually full --
         -- fireproximityprompt() can't collect anything more at that point,
         -- so getDropItems() would never empty out and this would hang here
         -- forever ("stuck on the last stage" when the bag fills up mid-run).
-        local bagFull = isEitherBagFull()
         if e.AutoPickupEnabled and not bagFull then
             local remaining = getDropItems()
             if #remaining > 0 then
@@ -628,11 +1149,8 @@ end
 -- the new run and sent the character to a room number that no longer
 -- matched where it actually was -- looked like being stuck at stage 1
 -- forever (real stage was 1, but this code kept aiming at room 16+).
-local roomProgress = 1
-local emptyTicks = 0
-local lastRoomEntered = 0
-local wasInDungeon = false
 local orbitAngleDeg = 0
+local lastSavedStageApplied = nil
 
 -- Anchoring while sitting on a mob is deliberate -- re-CFraming an
 -- unanchored part every 0.3s fights gravity between ticks (falls, then
@@ -649,6 +1167,13 @@ local function teleportToNearestMob()
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
+    -- Hands off while the stage jump is flying. This loop anchors the root part
+    -- and re-CFrames it every 0.3s, which would drag the character straight out
+    -- of the broom animation mid-flight and land the jump nowhere.
+    if stageJumpBusy or char:GetAttribute("StageJumpAnimating") or char:GetAttribute("JetPacking") then
+        hrp.Anchored = false
+        return
+    end
     local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
     local inDungeon = inDungeonVal and inDungeonVal.Value > 0
     if not inDungeon then
@@ -664,6 +1189,7 @@ local function teleportToNearestMob()
         emptyTicks = 0
         lastRoomEntered = 0
         wasInDungeon = false
+        lastSavedStageApplied = nil
         return
     end
     if not wasInDungeon then
@@ -673,8 +1199,25 @@ local function teleportToNearestMob()
         roomProgress = 1
         emptyTicks = 0
         lastRoomEntered = 0
+        lastSavedStageApplied = nil
     end
 
+    -- A saved spot for this exact stage overrides the mob-head orbit entirely
+    -- -- some rooms have geometry where the orbit ring clips a wall or drifts
+    -- into a mob's attack cone, so once the user has manually parked
+    -- somewhere skills actually land, pin there instead. Anchored + re-CFrame
+    -- every tick, same as the mob-orbit branch below -- unanchored let combat
+    -- knockback drag the character clean off the saved spot (confirmed live:
+    -- drifted 30+ studs away within seconds when left unanchored).
+    -- Keyed off roomProgress, NOT DungeonAggroStage -- reading the server
+    -- attribute here reproduced the exact "stuck at stage 1" bug the
+    -- room-advance logic below was already fixed for: right after a fresh
+    -- re-entry DungeonAggroStage can still briefly report the PREVIOUS run's
+    -- final stage (e.g. 17), so a save for stage 17 matched immediately at
+    -- room 1 and pinned the character on an empty spot forever -- no mob in
+    -- range there, so nothing ever died, so stage 1 never advanced.
+    -- roomProgress resets to 1 on every fresh entry and only moves forward
+    -- through real local room-advancement, so it can't misfire this way.
     local nearest, nearestDist = nil, math.huge
     local folder = workspace:FindFirstChild("LocalMonster")
     if folder then
@@ -690,6 +1233,24 @@ local function teleportToNearestMob()
             end
         end
     end
+    -- A saved spot pins the character, but ONLY while the room still has
+    -- something alive in it. The first version checked this before scanning for
+    -- monsters and returned unconditionally, which meant a room with a saved
+    -- spot never reached the room-advance logic further down -- clear the room
+    -- and the character just kept sitting on its mark forever. That is exactly
+    -- "target 18, saved spots on 17 and 18, stuck on 17": room 17 was cleared,
+    -- the pin held, and nothing ever walked into room 18 to make the server
+    -- advance the stage. Empty room now falls through to the advance path.
+    local savedPos = e.StageSavedPositions[tostring(roomProgress)]
+    if savedPos and nearest then
+        emptyTicks = 0
+        hrp.Anchored = true
+        hrp.CFrame = CFrame.new(savedPos.X, savedPos.Y, savedPos.Z)
+        lastSavedStageApplied = roomProgress
+        return
+    end
+    lastSavedStageApplied = nil
+
     if nearest then
         emptyTicks = 0
         hrp.Anchored = true
@@ -834,11 +1395,29 @@ end
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 local Window = MacLib:Window({
     Title = "Magic Loot [Beta]",
-    Subtitle = "v1.0",
+    Subtitle = "v1.1 Dino",
     DragStyle = 1,
     ShowUserInfo = true,
     AcrylicBlur = false,
 })
+
+-- MacLib's Slider constructor calls updateSliderBarSize, which reads
+-- AbsoluteSize off the bar it just made. On this executor that read throws
+-- "The current thread cannot access 'Instance' (lacking capability Plugin)"
+-- from inside MacLib, and it is FATAL -- v1.1 died on the first Sell-tab slider
+-- with the Farm tab already built and nothing printed after it. Maddeningly it
+-- is order-dependent: the identical slider builds fine in isolation and the
+-- Farm tab's own slider survives, so this can't be fixed by picking a different
+-- element type. Wrapped instead -- a slider that refuses to render degrades to
+-- a read-only label and the rest of the script still loads.
+local function safeSlider(section, settings, flag)
+    local ok, result = pcall(function() return section:Slider(settings, flag) end)
+    if ok then return result end
+    return section:Label({
+        Text = settings.Name .. " = " .. tostring(settings.Default) ..
+            "\n(slider blocked -- set getgenv() value directly)"
+    })
+end
 
 local TabGroup = Window:TabGroup()
 local Tabs = {
@@ -846,6 +1425,7 @@ local Tabs = {
     Sell     = TabGroup:Tab({Name = "Sell",     Image = "rbxassetid://10734952273"}),
     Alchemy  = TabGroup:Tab({Name = "Alchemy",  Image = "rbxassetid://10747363465"}),
     Stage    = TabGroup:Tab({Name = "Stage",    Image = "rbxassetid://10734975692"}),
+    Event    = TabGroup:Tab({Name = "Event",    Image = "rbxassetid://10747363465"}),
     Claims   = TabGroup:Tab({Name = "Claims",   Image = "rbxassetid://10734963191"}),
     Skill    = TabGroup:Tab({Name = "Skill",    Image = "rbxassetid://10723415903"}),
     Settings = TabGroup:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
@@ -858,11 +1438,15 @@ FarmLeft:Toggle({
     Name = "Auto Pickup", Default = e.AutoPickupEnabled,
     Callback = function(v) e.AutoPickupEnabled = v; saveState() end,
 }, "AutoPickupEnabled")
-FarmLeft:Input({
-    Name = "Min Price (0 = any)", Placeholder = tostring(e.PickupMinPrice),
-    AcceptedCharacters = "Numeric",
-    Callback = function(t) e.PickupMinPrice = tonumber(t) or 0; saveState() end,
-}, "PickupMinPriceInput")
+-- MacLib's Input element calls a TextService size check that this executor's
+-- thread identity can't touch ("lacking capability Plugin"), and it throws at
+-- construction -- taking the whole script down before it finishes loading, with
+-- nothing printed. Every numeric Input in this file is a Slider now.
+safeSlider(FarmLeft, {
+    Name = "Min Price (0 = any)", Minimum = 0, Maximum = 50000,
+    Default = e.PickupMinPrice, Precision = 0,
+    Callback = function(v) e.PickupMinPrice = math.floor(tonumber(v) or 0); saveState() end,
+}, "PickupMinPriceSlider")
 FarmLeft:Dropdown({
     Name = "Rarity Filter (none = any)", Options = RARITY_NAMES, Multi = true,
     Default = (function()
@@ -881,7 +1465,66 @@ FarmRight:Toggle({
     Name = "Auto Train", Default = e.AutoTrainEnabled,
     Callback = function(v) e.AutoTrainEnabled = v; saveState() end,
 }, "AutoTrainEnabled")
-FarmRight:Label({Text = "UNVERIFIED: no confirmed call site found in\ngame code for TRAIN_MANUAL_CLICK -- test this\none live and tell me if it does nothing."})
+
+-- Zone labels are built from the live config so the multipliers and the lock
+-- reason are whatever the server says today, not what they were when this was
+-- written. Rebuilt on demand rather than at load, since Rebirth changes them.
+local trainZoneLabelToId = {}
+local function buildTrainZoneOptions()
+    trainZoneLabelToId = {}
+    local labels = {}
+    local zones = getTrainZones()
+    local ids = {}
+    for id in pairs(zones) do table.insert(ids, id) end
+    table.sort(ids)
+    for _, id in ipairs(ids) do
+        local z = zones[id]
+        local suffix
+        if z.canEnter then
+            suffix = "unlocked"
+        elseif z.passTag ~= "" then
+            suffix = "needs " .. z.passTag
+        else
+            suffix = "needs Rebirth " .. z.rebirth
+        end
+        local label = string.format("Zone %d  -  %.1fx  (%s)", id, z.add, suffix)
+        table.insert(labels, label)
+        trainZoneLabelToId[label] = id
+    end
+    return labels
+end
+
+FarmRight:Dropdown({
+    Name = "Zone Mode", Options = {"Stay", "Best", "Manual"}, Default = e.TrainZoneMode,
+    Callback = function(selected)
+        if selected then e.TrainZoneMode = selected; saveState() end
+    end,
+}, "TrainZoneModeDropdown")
+local trainZoneDropdown = FarmRight:Dropdown({
+    Name = "Zone (Manual mode only)", Options = buildTrainZoneOptions(), Search = true,
+    Callback = function(selected)
+        if selected and trainZoneLabelToId[selected] then
+            e.TrainZoneId = trainZoneLabelToId[selected]
+            saveState()
+        end
+    end,
+}, "TrainZoneIdDropdown")
+FarmRight:Button({Name = "Refresh Zone List", Callback = function()
+    pcall(function()
+        trainZoneDropdown:ClearOptions()
+        trainZoneDropdown:InsertOptions(buildTrainZoneOptions())
+    end)
+end})
+FarmRight:Toggle({
+    Name = "Manual Tap (Best/Manual mode)", Default = e.TrainManualTapEnabled,
+    Callback = function(v) e.TrainManualTapEnabled = v; saveState() end,
+}, "TrainManualTapEnabled")
+safeSlider(FarmRight, {
+    Name = "Tap Rate", Minimum = 0.02, Maximum = 1,
+    Default = e.TrainTapRate, Precision = 2, Suffix = "s",
+    Callback = function(v) e.TrainTapRate = tonumber(v) or 0.1; saveState() end,
+}, "TrainTapRateSlider")
+FarmRight:Label({Text = "Stay   = never moves you, just clicks (old behaviour)\nBest   = parks you in the best zone you can enter\nManual = parks you in the zone picked below\n\nTraining pays server-side now (TRAIN_AUTO_TICK):\n~336B/sec for simply standing in a zone. Measured\nlive, clicking added 0 on top of that and every\nclick past the first ~13 came back rejected."})
 local trainStatusLabel = FarmRight:Label({Text = "Idle"})
 
 -- ----- Sell Tab -----
@@ -891,16 +1534,16 @@ SellLeft:Toggle({
     Name = "Auto Sell", Default = e.AutoSellEnabled,
     Callback = function(v) e.AutoSellEnabled = v; saveState() end,
 }, "AutoSellEnabled")
-SellLeft:Input({
-    Name = "Max Price (0 = any)", Placeholder = tostring(e.SellMaxPrice),
-    AcceptedCharacters = "Numeric",
-    Callback = function(t) e.SellMaxPrice = tonumber(t) or 0; saveState() end,
-}, "SellMaxPriceInput")
-SellLeft:Input({
-    Name = "Max Rarity (0 = any)", Placeholder = tostring(e.SellMaxRarity),
-    AcceptedCharacters = "Numeric",
-    Callback = function(t) e.SellMaxRarity = tonumber(t) or 0; saveState() end,
-}, "SellMaxRarityInput")
+safeSlider(SellLeft, {
+    Name = "Max Price (0 = any)", Minimum = 0, Maximum = 50000,
+    Default = e.SellMaxPrice, Precision = 0,
+    Callback = function(v) e.SellMaxPrice = math.floor(tonumber(v) or 0); saveState() end,
+}, "SellMaxPriceSlider")
+safeSlider(SellLeft, {
+    Name = "Max Rarity (0 = any)", Minimum = 0, Maximum = 10,
+    Default = e.SellMaxRarity, Precision = 0,
+    Callback = function(v) e.SellMaxRarity = math.floor(tonumber(v) or 0); saveState() end,
+}, "SellMaxRaritySlider")
 SellLeft:Label({Text = "Sells anything AT OR BELOW both limits.\nNever touches equipped items."})
 local sellStatusLabel = SellLeft:Label({Text = "Idle"})
 
@@ -949,22 +1592,187 @@ StageLeft:Toggle({
     Name = "Auto Stage", Default = e.AutoStageEnabled,
     Callback = function(v) e.AutoStageEnabled = v; saveState(); print("[MagicLoot][Toggle] AutoStageEnabled -> " .. tostring(v)) end,
 }, "AutoStageEnabled")
-StageLeft:Input({
-    Name = "Target Stage (0 = disabled)", Placeholder = tostring(e.StageTarget),
-    AcceptedCharacters = "Numeric",
-    Callback = function(t) e.StageTarget = tonumber(t) or 0; saveState() end,
-}, "StageTargetInput")
+safeSlider(StageLeft, {
+    Name = "Target Stage (0 = disabled)", Minimum = 0, Maximum = 200,
+    Default = e.StageTarget, Precision = 0,
+    Callback = function(v) e.StageTarget = math.floor(tonumber(v) or 0); saveState() end,
+}, "StageTargetSlider")
+StageLeft:Toggle({
+    Name = "Stage Teleport (skip the walk)", Default = e.AutoStageJumpEnabled,
+    Callback = function(v) e.AutoStageJumpEnabled = v; saveState() end,
+}, "AutoStageJumpEnabled")
+-- Dropdown lists every teleport point the game has, each one labelled with
+-- whether the current broom can actually reach it, so a locked pick is obvious
+-- before it silently does nothing.
+local stageJumpLabelToId = {}
+local function buildStageJumpOptions()
+    stageJumpLabelToId = {}
+    local jumpMax = getStageJumpMax()
+    local labels = {"Auto (closest to Target Stage)"}
+    stageJumpLabelToId[labels[1]] = 0
+    for _, stage in ipairs(TELEPORTABLE_STAGES) do
+        local label = string.format("Stage %d%s", stage, stage <= jumpMax and "" or "   (locked)")
+        table.insert(labels, label)
+        stageJumpLabelToId[label] = stage
+    end
+    return labels
+end
+
+local stageJumpDropdown = StageLeft:Dropdown({
+    Name = "Teleport To", Options = buildStageJumpOptions(),
+    Default = (function()
+        local pick = tonumber(e.StageJumpPick) or 0
+        if pick <= 0 then return "Auto (closest to Target Stage)" end
+        for label, id in pairs(stageJumpLabelToId) do if id == pick then return label end end
+        return "Auto (closest to Target Stage)"
+    end)(),
+    Callback = function(selected)
+        if selected and stageJumpLabelToId[selected] then
+            e.StageJumpPick = stageJumpLabelToId[selected]
+            saveState()
+        end
+    end,
+}, "StageJumpPickDropdown")
+StageLeft:Button({Name = "Refresh Teleport List", Callback = function()
+    pcall(function()
+        stageJumpDropdown:ClearOptions()
+        stageJumpDropdown:InsertOptions(buildStageJumpOptions())
+    end)
+end})
+local stageJumpInfoLabel = StageLeft:Label({Text = "Teleport: checking..."})
 StageLeft:Toggle({
     Name = "Return Town on Bag Full", Default = e.AutoReturnOnBagFull,
     Callback = function(v) e.AutoReturnOnBagFull = v; saveState() end,
 }, "AutoReturnOnBagFull")
-StageLeft:Slider({
+safeSlider(StageLeft, {
     Name = "Mob Hover Height", Minimum = 3, Maximum = 40,
     Default = e.MobHoverHeight, Precision = 0,
     Callback = function(v) e.MobHoverHeight = v; saveState() end,
 }, "MobHoverHeightSlider")
 StageLeft:Label({Text = "Snaps onto the nearest live monster every 0.3s\nso skills stay in range, until DungeonAggroStage\nreaches the target -- then fires DUNGEON_RETURN_TOWN.\nWith Bag Full ON, also returns early if either the\nstage bag or the total bag hits its cap -- then loops\nback into a fresh run either way."})
 local stageStatusLabel = StageLeft:Label({Text = "Idle"})
+
+StageLeft:Header({Text = "Custom Farm Position"})
+-- THE bug behind "I saved a spot and it never goes there": these buttons keyed
+-- the save off DungeonAggroStage, while teleportToNearestMob looks the save up
+-- by roomProgress. Two different numbers -- DungeonAggroStage is the server's
+-- cleared-stage counter and can still report the PREVIOUS run's final value
+-- right after a re-entry, which is exactly why the reader was moved onto
+-- roomProgress in the first place. The save side was never moved with it, so
+-- the lookup could not match and the orbit ran forever. Both sides use
+-- roomProgress now.
+local savedPosStatusLabel = StageLeft:Label({Text = "No saved position for the current room"})
+local function currentRoomKey()
+    return tostring(roomProgress)
+end
+local function refreshSavedPosStatus()
+    local key = currentRoomKey()
+    local saved = e.StageSavedPositions[key]
+    if saved then
+        pcall(function() savedPosStatusLabel:UpdateName(("Room %s has a saved spot -- orbit is skipped here"):format(key)) end)
+    else
+        pcall(function() savedPosStatusLabel:UpdateName(("Room %s -- no saved spot, using mob-head orbit"):format(key)) end)
+    end
+end
+StageLeft:Button({Name = "Save Position for Current Stage", Callback = function()
+    local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (inDungeonVal and inDungeonVal.Value > 0) or not hrp then
+        pcall(function() savedPosStatusLabel:UpdateName("Can't save -- not inside a dungeon run right now") end)
+        return
+    end
+    e.StageSavedPositions[currentRoomKey()] = {X = hrp.Position.X, Y = hrp.Position.Y, Z = hrp.Position.Z}
+    saveState()
+    refreshSavedPosStatus()
+end})
+StageLeft:Button({Name = "Clear Saved Position for Current Stage", Callback = function()
+    e.StageSavedPositions[currentRoomKey()] = nil
+    saveState()
+    refreshSavedPosStatus()
+end})
+StageLeft:Button({Name = "Clear ALL Saved Positions", Callback = function()
+    -- Old saves are keyed by the wrong number and will never match. One button
+    -- to drop them rather than leaving dead entries in state.json forever.
+    e.StageSavedPositions = {}
+    saveState()
+    refreshSavedPosStatus()
+end})
+task.spawn(function()
+    while getgenv().__MLG == myGen do
+        pcall(refreshSavedPosStatus)
+        pcall(function()
+            local jumpMax = getStageJumpMax()
+            local target = tonumber(e.StageTarget) or 0
+            local reach = {}
+            for _, s in ipairs(TELEPORTABLE_STAGES) do
+                if s <= jumpMax then table.insert(reach, tostring(s)) end
+            end
+            local pick, note = pickStageJumpTarget(target)
+            stageJumpInfoLabel:UpdateName(string.format(
+                "Ceiling %d  |  reachable: %s\n%s",
+                jumpMax,
+                #reach > 0 and table.concat(reach, ", ") or "none",
+                pick and ("Will teleport to stage " .. pick .. ", walk the rest")
+                      or ("Walking from stage 1 -- " .. tostring(note))))
+        end)
+        task.wait(1)
+    end
+end)
+
+-- ----- Event Tab (Dino) -----
+local EventLeft = Tabs.Event:Section({Side = "Left"})
+EventLeft:Header({Text = "Auto Roll Dino"})
+EventLeft:Toggle({
+    Name = "Auto Roll", Default = e.AutoDinoRollEnabled,
+    Callback = function(v) e.AutoDinoRollEnabled = v; saveState() end,
+}, "AutoDinoRollEnabled")
+EventLeft:Dropdown({
+    Name = "Roll Batch", Options = {"x1", "x3", "x10"},
+    Default = "x" .. tostring(e.DinoRollBatch or 1),
+    Callback = function(selected)
+        if selected then
+            e.DinoRollBatch = tonumber((tostring(selected):gsub("x", ""))) or 1
+            saveState()
+        end
+    end,
+}, "DinoRollBatchDropdown")
+-- Slider, not an Input box. MacLib's Input runs a TextService size check that
+-- throws "lacking capability Plugin" on this executor's thread identity and
+-- takes the whole script down at load. A 0-10 slider covers the range anyway,
+-- since TicketDailyMax is 3.
+safeSlider(EventLeft, {
+    Name = "Keep Tickets (0 = spend all)", Minimum = 0, Maximum = 10,
+    Default = e.DinoRollKeepTickets, Precision = 0,
+    Callback = function(v) e.DinoRollKeepTickets = math.floor(tonumber(v) or 0); saveState() end,
+}, "DinoRollKeepTicketsSlider")
+EventLeft:Label({Text = "Free tickets drip in every 15 min, 3/day max.\nx3 and x10 each need that many tickets in hand,\nso on a free account x1 is the only one that\never fires."})
+local dinoRollStatusLabel = EventLeft:Label({Text = "Idle"})
+local dinoWalletLabel = EventLeft:Label({Text = "Tickets: ?   Dino Coins: ?"})
+
+local EventRight = Tabs.Event:Section({Side = "Right"})
+EventRight:Header({Text = "Auto Claim Quest Dino"})
+EventRight:Toggle({
+    Name = "Auto Claim Quest", Default = e.AutoDinoQuestEnabled,
+    Callback = function(v) e.AutoDinoQuestEnabled = v; saveState() end,
+}, "AutoDinoQuestEnabled")
+EventRight:Label({Text = "Sweeps Timed / Daily / Once every 20s and submits\nanything already at its target count."})
+local dinoQuestStatusLabel = EventRight:Label({Text = "Idle"})
+local dinoTaskListLabel = EventRight:Label({Text = "Loading tasks..."})
+EventRight:Button({Name = "Refresh Task List", Callback = function()
+    local rows = collectDinoTasks()
+    if #rows == 0 then
+        pcall(function() dinoTaskListLabel:UpdateName("No event task data") end)
+        return
+    end
+    local lines = {}
+    for _, row in ipairs(rows) do
+        local mark = row.claimed and "[done]" or (row.canClaim and "[READY]" or "[    ]")
+        table.insert(lines, string.format("%s %s  %d/%d", mark, row.bucket, row.progress, row.need))
+    end
+    table.sort(lines)
+    pcall(function() dinoTaskListLabel:UpdateName(table.concat(lines, "\n")) end)
+end})
 
 -- ----- Claims Tab -----
 local ClaimsLeft = Tabs.Claims:Section({Side = "Left"})
@@ -985,14 +1793,24 @@ local rebirthStatusLabel = ClaimsLeft:Label({Text = "Idle"})
 local ClaimsRight = Tabs.Claims:Section({Side = "Right"})
 ClaimsRight:Header({Text = "Redeem Codes"})
 local redeemCodesText = ""
-ClaimsRight:Input({
-    Name = "Codes (comma or space separated)", Placeholder = "CODE1, CODE2",
-    Callback = function(t) redeemCodesText = t or "" end,
-}, "RedeemCodesInput")
+-- The only Input that can't become a Slider -- it takes free text. Wrapped so a
+-- MacLib capability throw costs us the code box and nothing else, instead of
+-- killing every tab after this line.
+local redeemInputOk = pcall(function()
+    ClaimsRight:Input({
+        Name = "Codes (comma or space separated)", Placeholder = "CODE1, CODE2",
+        Callback = function(t) redeemCodesText = t or "" end,
+    }, "RedeemCodesInput")
+end)
+if not redeemInputOk then
+    ClaimsRight:Label({Text = "Code box unavailable (MacLib Input blocked on this\nthread identity). Set getgenv().MagicLootCodes = \"CODE1 CODE2\"\nand press Redeem Now."})
+end
 local redeemStatusLabel = ClaimsRight:Label({Text = "Ready"})
 ClaimsRight:Button({Name = "Redeem Now", Callback = function()
     redeemStatusLabel:UpdateName("Redeeming...")
-    doRedeemCodes(redeemCodesText, function(claimed, tried)
+    local codes = redeemCodesText
+    if codes == "" then codes = tostring(getgenv().MagicLootCodes or "") end
+    doRedeemCodes(codes, function(claimed, tried)
         pcall(function() redeemStatusLabel:UpdateName("Redeemed " .. claimed .. "/" .. tried) end)
     end)
 end})
@@ -1021,10 +1839,15 @@ SettingsLeft:Toggle({
     Name = "Auto Reconnect", Default = e.AutoReconnectEnabled,
     Callback = function(v) e.AutoReconnectEnabled = v; saveState() end,
 }, "AutoReconnectEnabled")
-SettingsLeft:Keybind({
-    Name = "Show/Hide UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
-    Callback = function() pcall(function() Window:SetState(not Window:GetState()) end) end,
-}, "MagicLootToggleUIKeybind")
+-- Same treatment as safeSlider: Keybind is another MacLib element that reaches
+-- for Instance state at construction, and one throw here would strand the
+-- Settings tab and every background loop declared after it.
+pcall(function()
+    SettingsLeft:Keybind({
+        Name = "Show/Hide UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
+        Callback = function() pcall(function() Window:SetState(not Window:GetState()) end) end,
+    }, "MagicLootToggleUIKeybind")
+end)
 SettingsLeft:Header({Text = "Auto Save"})
 SettingsLeft:Label({Text = "All toggles save automatically to:\n" .. SAVE_FILE})
 
@@ -1034,7 +1857,7 @@ SettingsRight:Toggle({
     Name = "Speed", Default = e.WalkSpeedEnabled,
     Callback = function(v) e.WalkSpeedEnabled = v; applyMovement(); saveState() end,
 }, "WalkSpeedEnabled")
-SettingsRight:Slider({
+safeSlider(SettingsRight, {
     Name = "Speed Value", Minimum = 16, Maximum = 200,
     Default = e.WalkSpeedValue, Precision = 0,
     Callback = function(v) e.WalkSpeedValue = v; applyMovement(); saveState() end,
@@ -1043,7 +1866,7 @@ SettingsRight:Toggle({
     Name = "Jump Power", Default = e.JumpPowerEnabled,
     Callback = function(v) e.JumpPowerEnabled = v; applyMovement(); saveState() end,
 }, "JumpPowerEnabled")
-SettingsRight:Slider({
+safeSlider(SettingsRight, {
     Name = "Jump Value", Minimum = 50, Maximum = 300,
     Default = e.JumpPowerValue, Precision = 0,
     Callback = function(v) e.JumpPowerValue = v; applyMovement(); saveState() end,
@@ -1062,7 +1885,35 @@ task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(doAutoTrain)
         pcall(function() trainStatusLabel:UpdateName(trainStatusText) end)
-        task.wait(0.01)
+        -- Was a flat 0.01 (100 calls/sec) which burned the click quota instantly.
+        -- Stay mode paces itself off the Tap Rate slider, so the loop has to run
+        -- at least that fast; the parking modes only need to notice when you've
+        -- been knocked out of a zone, and 0.5s is plenty for that.
+        if e.AutoTrainEnabled and e.TrainZoneMode == "Stay" then
+            task.wait(math.max(0.02, tonumber(e.TrainTapRate) or 0.1))
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MLG == myGen do
+        pcall(doAutoDinoRoll)
+        pcall(function() dinoRollStatusLabel:UpdateName(dinoRollStatusText) end)
+        pcall(function()
+            dinoWalletLabel:UpdateName(string.format("Tickets: %d   Dino Coins: %d",
+                countBagItem(EVENT_TICKET_ITEM_ID), countBagItem(EVENT_COIN_ITEM_ID)))
+        end)
+        task.wait(10)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MLG == myGen do
+        pcall(doAutoDinoQuest)
+        pcall(function() dinoQuestStatusLabel:UpdateName(dinoQuestStatusText) end)
+        task.wait(20)
     end
 end)
 
@@ -1113,7 +1964,12 @@ task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(doAutoClaimDaily)
         pcall(function() claimDailyStatusLabel:UpdateName(claimDailyStatusText) end)
-        task.wait(30)
+        -- 5s, not 30s. A tick with nothing to claim costs two PlayerData reads
+        -- and twelve IsOnlineTierClaimable checks -- all client-side, zero
+        -- remote traffic -- so polling six times as often buys a much tighter
+        -- claim latency for nothing. The remote only fires on a tier that
+        -- actually reads claimable.
+        task.wait(5)
     end
 end)
 
@@ -1129,5 +1985,12 @@ if e.SkillNoCooldownEnabled then applySkillNoCooldown(true) end
 applyMovement()
 
 getgenv().__MLWindow = Window
-Tabs.Farm:Select()
-print("[MagicLoot] v1.0 loaded")
+-- Select() runs MacLib's tab Tween, and the tween touches Instance state the
+-- same way the sliders did -- this was the final thing killing the load, one
+-- line from the end, after every tab had already been built. The tab still
+-- opens on click; only the auto-select on load is lost.
+pcall(function() Tabs.Farm:Select() end)
+-- Version string carries a load stamp on purpose. An older injected build and a
+-- freshly executed one used to print the exact same line, which is how a stale
+-- copy sat in memory looking like a broken feature. Now they can't match.
+print(string.format("[MagicLoot] v1.1 Dino loaded (gen %d, %s)", myGen, os.date("%H:%M:%S")))
