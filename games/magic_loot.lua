@@ -38,6 +38,24 @@ pcall(function()
     if getgenv().__MLWindow then getgenv().__MLWindow:Unload() end
 end)
 
+-- __MLWindow is only assigned on the last line of this file, so any run that
+-- died partway left its window on screen with nothing tracking it -- five of
+-- them piled up during one debugging session. Sweep by title instead of
+-- trusting the handle, so a crashed predecessor still gets cleaned up.
+pcall(function()
+    local host = (gethui and gethui()) or game:GetService("CoreGui")
+    for _, gui in ipairs(host:GetChildren()) do
+        if gui:IsA("ScreenGui") then
+            for _, d in ipairs(gui:GetDescendants()) do
+                if d:IsA("TextLabel") and d.Text == "Magic Loot [Beta]" then
+                    gui:Destroy()
+                    break
+                end
+            end
+        end
+    end
+end)
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
@@ -46,12 +64,47 @@ local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 
-local UtilsSystem = require(ReplicatedFirst.AllSideCode.UtilsSystem)
-local NetWork = UtilsSystem.NetWork
-local NetMsg = UtilsSystem.NetMsg
-local PlayerData = UtilsSystem.PlayerData
-local CfgFind = UtilsSystem.CfgFind
-local GetData = UtilsSystem.GetData
+-- This used to be a bare require on line one of the real work, which is exactly
+-- what made autoexec run this script three times on a fresh join. Injected that
+-- early, ReplicatedFirst.AllSideCode has not replicated yet, so the require
+-- threw "AllSideCode is not a valid member of ReplicatedFirst" -- and the
+-- autoexec wrapper counted a thrown script as a failed fetch and re-ran the
+-- whole file. Attempt two then got further and died on PlayerData still being
+-- nil (the game logs "加载业务模块失败: PlayerData" at that point -- UtilsSystem
+-- resolves before its own submodules finish loading). Each dead attempt left a
+-- window behind. Wait for the folder, then wait for the submodules to actually
+-- populate, before touching anything.
+local AllSideCode = ReplicatedFirst:WaitForChild("AllSideCode", 30)
+if not AllSideCode then
+    warn("[MagicLoot] AllSideCode never replicated -- aborting cleanly instead of erroring")
+    return
+end
+local UtilsSystem = require(AllSideCode:WaitForChild("UtilsSystem", 30))
+
+local NetWork, NetMsg, PlayerData, CfgFind, GetData
+do
+    local REQUIRED = { "NetWork", "NetMsg", "PlayerData", "CfgFind", "GetData" }
+    local deadline = os.clock() + 30
+    while os.clock() < deadline do
+        local missing
+        for _, name in ipairs(REQUIRED) do
+            if UtilsSystem[name] == nil then missing = name break end
+        end
+        if not missing then break end
+        task.wait(0.2)
+    end
+    NetWork    = UtilsSystem.NetWork
+    NetMsg     = UtilsSystem.NetMsg
+    PlayerData = UtilsSystem.PlayerData
+    CfgFind    = UtilsSystem.CfgFind
+    GetData    = UtilsSystem.GetData
+    for _, name in ipairs(REQUIRED) do
+        if UtilsSystem[name] == nil then
+            warn("[MagicLoot] UtilsSystem." .. name .. " never loaded -- aborting cleanly")
+            return
+        end
+    end
+end
 local CollectionService = game:GetService("CollectionService")
 
 local function fire(msg, ...)
