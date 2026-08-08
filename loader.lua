@@ -4,6 +4,9 @@ local PLACE_SCRIPTS = {
     [107653945083776] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/roll_anime.lua", -- Roll Anime to Fight!
     [108307565942574] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/full_rng.lua",   -- [NOW!!] RNG Heroes
     [133188236593503] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/magic_loot.lua", -- Magic Loot[Beta]
+    -- Third-party build, not ours -- points straight at the upstream repo rather
+    -- than a copy under games/, so it tracks whatever they publish.
+    [99108783264633]  = "https://raw.githubusercontent.com/kaisenlmao/loader/refs/heads/main/chiyo.lua",   -- [UPD] Build a base RNG
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
