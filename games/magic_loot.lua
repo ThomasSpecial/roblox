@@ -2,7 +2,7 @@
 -- Auto Pickup (price/rarity filter, high-to-low priority) + Auto Train +
 -- Auto Claim Daily + Auto Sell (price/rarity filter) + Auto Craft Alchemy
 -- (craft+collect loop) + Auto Stage (farm to target, return town) +
--- Auto Rebirth + Auto Redeem Code + Skill NoCooldown + Settings
+-- Auto Rebirth + Auto Redeem Code + Settings
 -- (Anti-AFK, Speed, Jump, Auto Save, Auto Reconnect)
 --
 -- This game dispatches everything through one generic channel --
@@ -12,7 +12,7 @@
 -- InvokeServer and capturing real traffic during an actual dungeon run:
 --   DROP_PICKUP(dropGuid), DUNGEON_SPAWN_STAGE(stageNum), DUNGEON_RETURN_TOWN()
 --   RELEASE_GROUP_SKILL(slot, {...}) -- 174 calls, confirms skills already
---   auto-fire on their own; this script only removes the cooldown gate.
+--   auto-fire on their own with zero manual input, so nothing here casts.
 -- CLAIM_DAILY_AWARD/SELL_MATERIAL/PLAYER_REBIRTH/REDEEM_CODE/ALCHEMY_CRAFT_RECIPE
 -- argument shapes confirmed by reading the game's own UI ModuleScripts
 -- (Login, Sell, Rebirth, SettingRowBind, Alchemy).
@@ -57,7 +57,6 @@ pcall(function()
 end)
 
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
@@ -207,12 +206,11 @@ local PERSIST_KEYS = {
     "AutoClaimDailyEnabled",
     "AutoDinoRollEnabled", "DinoRollBatch", "DinoRollKeepTickets",
     "AutoDinoQuestEnabled",
-    "AutoSellEnabled", "SellMaxPrice", "SellMaxRarity",
+    "AutoSellEnabled", "SellMaxPrice", "SellMaxRarity", "SellIgnoreIds",
     "AutoAlchemyEnabled", "AlchemyRecipeId", "AutoUsePotionEnabled", "AutoUsePotionSelected",
     "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull", "MobHoverHeight", "StageSavedPositions",
     "AutoStageJumpEnabled", "StageJumpPick",
     "AutoRebirthEnabled",
-    "SkillNoCooldownEnabled",
     "AntiAFKEnabled", "AutoReconnectEnabled", "WalkSpeedEnabled", "WalkSpeedValue",
     "JumpPowerEnabled", "JumpPowerValue",
 }
@@ -240,7 +238,12 @@ if e.AutoTrainEnabled == nil then e.AutoTrainEnabled = false end
 if e.TrainZoneMode == nil then e.TrainZoneMode = "Best" end
 if e.TrainZoneId == nil then e.TrainZoneId = 0 end
 if e.TrainManualTapEnabled == nil then e.TrainManualTapEnabled = true end
-if e.TrainTapRate == nil then e.TrainTapRate = 0.1 end
+-- Older builds let this go down to 0.02 and saved it. tapInterval() clamps at
+-- use, so a stale 0.02 was harmless but the slider still displayed it -- a number
+-- the server will not honour, sitting in the UI looking authoritative. Normalise
+-- it on load so what is saved, what is shown, and what is sent all agree.
+if e.TrainTapRate == nil then e.TrainTapRate = 0.125 end
+e.TrainTapRate = math.max(0.125, tonumber(e.TrainTapRate) or 0.125)
 if e.AutoClaimDailyEnabled == nil then e.AutoClaimDailyEnabled = false end
 if e.AutoDinoRollEnabled == nil then e.AutoDinoRollEnabled = false end
 if e.DinoRollBatch == nil then e.DinoRollBatch = 1 end
@@ -249,6 +252,7 @@ if e.AutoDinoQuestEnabled == nil then e.AutoDinoQuestEnabled = false end
 if e.AutoSellEnabled == nil then e.AutoSellEnabled = false end
 if e.SellMaxPrice == nil then e.SellMaxPrice = 0 end
 if e.SellMaxRarity == nil then e.SellMaxRarity = 0 end
+if e.SellIgnoreIds == nil then e.SellIgnoreIds = {} end
 if e.AutoAlchemyEnabled == nil then e.AutoAlchemyEnabled = false end
 if e.AutoUsePotionEnabled == nil then e.AutoUsePotionEnabled = false end
 if e.AutoUsePotionSelected == nil then e.AutoUsePotionSelected = {} end
@@ -262,7 +266,6 @@ if e.AutoStageJumpEnabled == nil then e.AutoStageJumpEnabled = true end
 -- 0 = follow Target Stage automatically, anything else = jump exactly there
 if e.StageJumpPick == nil then e.StageJumpPick = 0 end
 if e.AutoRebirthEnabled == nil then e.AutoRebirthEnabled = false end
-if e.SkillNoCooldownEnabled == nil then e.SkillNoCooldownEnabled = false end
 if e.AntiAFKEnabled == nil then e.AntiAFKEnabled = true end
 if e.AutoReconnectEnabled == nil then e.AutoReconnectEnabled = true end
 if e.WalkSpeedEnabled == nil then e.WalkSpeedEnabled = false end
@@ -323,21 +326,102 @@ end
 --     idle 3s, zero clicks     +1,008,000,000,000
 --     clicking 0.01s for 3s    +1,008,000,000,000   accepted=0  rejected=26
 --     clicking 0.2s  for 3s    +1,008,000,000,000   accepted=0  rejected=10
--- Identical to idle either way -- manual clicks contributed nothing, and the
--- server rejected every one after the first ~13 (there's a quota, and 100
--- calls/sec burned it instantly). What actually pays is three new ValueObjects
--- on LocalPlayer -- InTrainGround / TrainGroundId / IsAutoTraining -- the
--- server ticks TRAIN_AUTO_TICK on its own at roughly 336B/sec while you simply
--- stand inside a zone. So this no longer clicks for a living: it parks you in
--- the highest-multiplier zone you actually qualify for and makes sure you stay
--- in it. The manual tap stays available but throttled to 1/sec, since whatever
--- quota exists isn't worth burning at frame rate.
+-- Identical to idle either way. That was read as "there is a click quota and we
+-- burned it", which was WRONG, and the wrong diagnosis is what left Manual Tap
+-- looking broken ever since: it was left switched on inside the very mode that
+-- makes it impossible.
 --
--- Zone table read live from CfgFind.FindTrainCfgById + GetData.CanEnterTrainGround:
+-- Re-measured properly, A/B, in and out of a zone. The rule is not a quota:
+--   INSIDE a zone   idle 6s  +4,032,000,000,000
+--                   click 6s +4,032,000,000,000   accepted=0   rejected=11
+--   OUTSIDE a zone  idle 6s  +0
+--                   click 6s +462,000,000,000     accepted=11  rejected=0
+-- The server REJECTS every manual click while TRAIN_AUTO_TICK is already paying
+-- you. Manual tapping is not throttled, it is mutually exclusive with standing
+-- in a zone. Best/Manual mode parks you in a zone, so the tap could never land
+-- there -- not once, ever. That is the whole bug.
+--
+-- Outside a zone the tap does pay, at 42B per accepted click, with a real
+-- ceiling near 8 accepted/sec measured across three rates:
+--   0.20s  22 accepted   0 rejected   154B/sec
+--   0.05s  45 accepted   1 rejected   315B/sec
+--   0.01s  47 accepted  18 rejected   329B/sec
+-- So anything faster than ~0.125s buys nothing but rejections. TAP_MIN_INTERVAL
+-- clamps to that instead of letting the slider ask for 0.02s and get 18 refusals
+-- for every 47 hits.
+--
+-- Which means tapping is worth about a 4x zone (330B/sec against zone 5's
+-- measured 672B/sec). It beats zones 1-3, loses to 4 and up. The zone table:
 --   1=1.5x free   2=2x(Rb2)   3=4x(Rb5)   4=6x(Rb9)   5=8x(Rb12)
 --   6=10x RobuxTrain1   7=15x(Rb18)   8=25x RobuxTrain2   9=100x RobuxTrain3
+-- so on an account that can reach zone 4+, parking out-earns tapping; on a fresh
+-- account that can only reach zone 1, tapping is more than 2x better. The panel
+-- prints both numbers live so the call is visible instead of assumed -- but the
+-- choice stays the user's, because Manual Tap also means "do not move me", and
+-- that is worth something no rate comparison can express.
+--
 local trainStatusText = "Idle"
+local trainPlanText = "Comparing zone vs tap..."
 local lastTrainTap = 0
+local lastTrainPlanRefresh = 0
+-- Rolling counters so the panel can prove the tap is landing instead of the user
+-- having to trust that it is.
+local tapAccepted, tapRejected = 0, 0
+
+-- ~8 accepted/sec is the server's real ceiling; below this interval every extra
+-- call comes back rejected.
+local TAP_MIN_INTERVAL = 0.125
+-- 42B per accepted click x 8/sec, measured.
+local TAP_RATE_PER_SEC = 42000000000 * 8
+-- Zone 5 (8x) measured at 672B/sec, so one multiplier point is worth 84B/sec.
+local ZONE_RATE_PER_MULTIPLIER = 84000000000
+
+local function tapInterval()
+    return math.max(TAP_MIN_INTERVAL, tonumber(e.TrainTapRate) or TAP_MIN_INTERVAL)
+end
+
+local function inTrainZone()
+    local inGroundVal = LocalPlayer:FindFirstChild("InTrainGround")
+    return inGroundVal and inGroundVal.Value == true
+end
+
+-- What the zone the character happens to be standing in pays, whether or not
+-- this script put them there.
+local function trainZoneRateHere()
+    local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
+    local id = groundIdVal and tonumber(groundIdVal.Value) or 0
+    if id <= 0 then return 0 end
+    local ok, cfg = pcall(function() return CfgFind.FindTrainCfgById(id) end)
+    local add = (ok and cfg and tonumber(cfg.Add)) or 0
+    return add * ZONE_RATE_PER_MULTIPLIER
+end
+
+-- One tap, but only where a tap can possibly be accepted. Inside a zone the
+-- server refuses every one of these, so firing there is pure noise on the wire.
+local function tryTrainTap()
+    if not e.TrainManualTapEnabled then return false, "tap off" end
+    if inTrainZone() then return false, "in zone -- server rejects taps here" end
+    -- This is the ONLY pacer. The loop below used to also task.wait(tapInterval())
+    -- and then this line re-checked the same interval -- two throttles on one
+    -- number, so any iteration whose sleep came back a hair early was thrown away
+    -- and the next one paid the full wait again. That halved the real rate:
+    -- 203B/sec measured against a 330B/sec ceiling. The loop now ticks on a short
+    -- fixed slice and this gate keeps the actual spacing honest.
+    if (os.clock() - lastTrainTap) < tapInterval() then return false, nil end
+    lastTrainTap = os.clock()
+    local result = invoke(NetMsg.TRAIN_MANUAL_CLICK)
+    if type(result) == "table" and result.ok then
+        tapAccepted += 1
+        return true, nil
+    end
+    tapRejected += 1
+    return false, nil
+end
+
+local function formatRate(perSec)
+    if perSec >= 1e12 then return string.format("%.1fT/s", perSec / 1e12) end
+    return string.format("%.0fB/s", perSec / 1e9)
+end
 
 local function getTrainZones()
     local zones = {}
@@ -372,41 +456,47 @@ local function pickBestTrainZone(zones)
     return best
 end
 
--- "Stay" is the original behaviour, kept because moving the character is not
--- always wanted: never touches CFrame, just fires TRAIN_MANUAL_CLICK on a timer
--- from wherever you happen to be standing. Worth knowing what it does and does
--- not buy -- measured live in zone 5, the server's own auto-tick pays about
--- 336B/sec for standing still, and a 3s clicking burst added nothing on top of
--- that once the click quota was spent (the first ~13 returned ok, everything
--- after was rejected). So Stay earns whatever the zone you are already in
--- earns; the clicks are a bonus while the quota lasts, not the income.
-local function doStayModeTrain()
-    local rate = math.max(0.02, tonumber(e.TrainTapRate) or 0.1)
-    if (os.clock() - lastTrainTap) < rate then return end
-    lastTrainTap = os.clock()
+-- Zone income vs tap income, both from measured constants, so the panel can say
+-- which one this account should actually be doing instead of leaving the user to
+-- work it out from a multiplier.
+-- Printed whether or not Manual Tap is on, because the whole question the user
+-- actually has is "am I leaving money on the table by not warping?" -- and the
+-- answer flips with rebirth count, so a fixed sentence in a label would go stale.
+local function refreshTrainPlan()
+    local zones = getTrainZones()
+    if not next(zones) then trainPlanText = "No zones in range (not in the lobby)"; return end
+    local best = pickBestTrainZone(zones)
+    local zoneRate = best and (best.add * ZONE_RATE_PER_MULTIPLIER) or 0
+    trainPlanText = string.format("Tap in place %s  |  best zone %s = %s  ->  %s pays more",
+        formatRate(TAP_RATE_PER_SEC),
+        best and tostring(best.id) or "-", formatRate(zoneRate),
+        zoneRate > TAP_RATE_PER_SEC and ("zone " .. tostring(best.id)) or "tapping")
+end
 
-    local result = invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
-    local inGroundVal = LocalPlayer:FindFirstChild("InTrainGround")
-    local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
-    local zoneNote
-    if inGroundVal and inGroundVal.Value == true then
-        zoneNote = "in zone " .. tostring(groundIdVal and groundIdVal.Value or "?")
-    else
-        zoneNote = "outside any zone"
+-- Manual Tap is train-in-place: it NEVER touches CFrame. That is the point of it
+-- -- ordinary training from wherever you are standing, no teleport to a zone.
+-- It is also the only arrangement where a tap can be accepted at all, since the
+-- server refuses manual clicks whenever it is already auto-ticking you inside a
+-- zone. So the toggle overrides Zone Mode outright rather than combining with it.
+local function doTapInPlaceTrain()
+    if inTrainZone() then
+        local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
+        trainStatusText = string.format(
+            "Standing in zone %s -- earning %s passively (taps are refused inside a zone)",
+            tostring(groundIdVal and groundIdVal.Value or "?"), formatRate(trainZoneRateHere()))
+        return
     end
-
-    if type(result) == "table" and result.ok then
-        trainStatusText = string.format("Stay @%.2fs -- click ok, gain %s (%s)",
-            rate, tostring(result.gain), zoneNote)
-    else
-        trainStatusText = string.format("Stay @%.2fs -- click rejected (%s)", rate, zoneNote)
-    end
+    tryTrainTap()
+    trainStatusText = string.format("Tapping in place @%.3fs -- ok %d / rejected %d  (~%s)",
+        tapInterval(), tapAccepted, tapRejected, formatRate(TAP_RATE_PER_SEC))
 end
 
 local function doAutoTrain()
     if not e.AutoTrainEnabled then trainStatusText = "Idle"; return end
 
-    if e.TrainZoneMode == "Stay" then return doStayModeTrain() end
+    -- Manual Tap wins outright over Zone Mode. It means "train normally, right
+    -- here" -- nothing below this line runs, so the character is never moved.
+    if e.TrainManualTapEnabled then return doTapInPlaceTrain() end
 
     local zones = getTrainZones()
     if not next(zones) then trainStatusText = "No Train zones found -- not in the lobby?"; return end
@@ -421,36 +511,34 @@ local function doAutoTrain()
         end
     else
         target = pickBestTrainZone(zones)
-        if not target then trainStatusText = "No zone this account can enter"; return end
+        if not target then
+            trainStatusText = "No zone this account can enter -- switch on Manual Tap"
+            return
+        end
     end
 
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then trainStatusText = "No character"; return end
 
-    local inGroundVal = LocalPlayer:FindFirstChild("InTrainGround")
     local groundIdVal = LocalPlayer:FindFirstChild("TrainGroundId")
     local autoVal = LocalPlayer:FindFirstChild("IsAutoTraining")
-    local inGround = inGroundVal and inGroundVal.Value == true
     local currentId = groundIdVal and tonumber(groundIdVal.Value) or 0
 
     -- Only move when actually out of position. Re-CFraming a player who is
     -- already parked and earning would fight their own movement for no gain.
-    if (not inGround) or currentId ~= target.id then
+    if (not inTrainZone()) or currentId ~= target.id then
         hrp.CFrame = CFrame.new(target.part.Position + Vector3.new(0, 4, 0))
         trainStatusText = string.format("Moving to zone %d (%.1fx)", target.id, target.add)
         return
     end
 
-    if e.TrainManualTapEnabled and (os.clock() - lastTrainTap) >= math.max(0.02, tonumber(e.TrainTapRate) or 0.1) then
-        lastTrainTap = os.clock()
-        invoke(NetMsg.TRAIN_MANUAL_CLICK, {})
-    end
-
-    local magic = 0
-    pcall(function() magic = GetData.GetTotalMagicValue(LocalPlayer) or 0 end)
-    trainStatusText = string.format("Zone %d (%.1fx)  auto=%s  magic=%s",
-        target.id, target.add, tostring(autoVal and autoVal.Value), tostring(magic))
+    -- No tap here on purpose. The server refuses every manual click while it is
+    -- already auto-ticking you, so the old call in this branch was 2 rejected
+    -- remotes a second forever -- the whole reason Manual Tap read as broken.
+    trainStatusText = string.format("Zone %d (%.1fx) -- earning %s  auto=%s",
+        target.id, target.add, formatRate(target.add * ZONE_RATE_PER_MULTIPLIER),
+        tostring(autoVal and autoVal.Value))
 end
 
 -- ===== Auto Claim Daily + Online Award =====
@@ -637,6 +725,72 @@ end
 -- mixes several item types (tp 0/2/6/9/13 all seen live) and this remote
 -- only accepts tp==2 (materials), so that's the required filter, not just a
 -- nice-to-have.
+--
+-- ===== Sell ignore list =====
+-- 48 materials, read live from materialConf. Only materials are listed because
+-- SELL_MATERIAL only ever sees tp==2 -- offering the whole item table would put
+-- hundreds of rows in the dropdown that this feature can never act on.
+--
+-- English names come from TranslationHelper.TranslateByKey(ZhName), resolved
+-- live. The potion table further up is hardcoded because require()'ing the
+-- translation module returns an empty table in this executor -- but
+-- TranslateByKey is a different door into the same data and it does work:
+-- GetLocaleId() reads "en-us" and CheckTranslateByKey confirms a real entry for
+-- all 48 before any of this is trusted. Anything that somehow has no translation
+-- keeps its ZhName rather than vanishing from the list.
+--
+-- Sorted by rarity ascending, then by value -- junk first, which is the order
+-- someone scanning for "what am I about to lose" actually reads in.
+local sellIgnoreLabels = {}
+local sellLabelToId = {}
+local sellIdToLabel = {}
+do
+    local translate
+    do
+        local ok, TH = pcall(function() return UtilsSystem.TranslationHelper end)
+        if ok and type(TH) == "table" and type(TH.TranslateByKey) == "function" then
+            translate = TH.TranslateByKey
+        end
+    end
+    local okConf, conf = pcall(function() return CfgFind.GetCfgByName("materialConf") end)
+    if okConf and type(conf) == "table" then
+        local rows = {}
+        for id, cfg in pairs(conf) do
+            local numericId = tonumber(id)
+            if numericId and type(cfg) == "table" then
+                local name = cfg.ZhName
+                if translate then
+                    local okName, translated = pcall(translate, cfg.ZhName)
+                    if okName and type(translated) == "string" and translated ~= "" then
+                        name = translated
+                    end
+                end
+                table.insert(rows, {
+                    id = numericId,
+                    name = name or ("Material " .. numericId),
+                    xyd = tonumber(cfg.xyd) or 0,
+                    gold = tonumber(cfg.GoldValue) or 0,
+                })
+            end
+        end
+        table.sort(rows, function(a, b)
+            if a.xyd ~= b.xyd then return a.xyd < b.xyd end
+            if a.gold ~= b.gold then return a.gold < b.gold end
+            return a.id < b.id
+        end)
+        for _, row in ipairs(rows) do
+            local label = row.name .. " (" .. (RARITY_NAMES_EN[row.xyd] or ("Rarity " .. row.xyd)) .. ")"
+            -- Two materials sharing a name AND a rarity would collide on the
+            -- label key and one would silently become un-ignorable. None do
+            -- today; disambiguate by id if that ever changes.
+            if sellLabelToId[label] then label = label .. " #" .. row.id end
+            table.insert(sellIgnoreLabels, label)
+            sellLabelToId[label] = row.id
+            sellIdToLabel[row.id] = label
+        end
+    end
+end
+
 local sellStatusText = "Toggle is OFF"
 local function doAutoSell()
     if not e.AutoSellEnabled then sellStatusText = "Toggle is OFF"; return end
@@ -644,9 +798,19 @@ local function doAutoSell()
     if type(bag) ~= "table" then sellStatusText = "No bag data"; return end
     local maxPrice = tonumber(e.SellMaxPrice) or 0
     local maxRarity = tonumber(e.SellMaxRarity) or 0
+    -- Keyed by item id, not by the dropdown's label. Labels are translated at
+    -- load, so a language change would silently orphan every saved entry and the
+    -- ignore list would quietly start selling the things it was protecting. Ids
+    -- do not move.
+    local ignoreIds = type(e.SellIgnoreIds) == "table" and e.SellIgnoreIds or {}
+    local ignoredCount = 0
+    for _, entry in pairs(bag) do
+        if type(entry) == "table" and ignoreIds[tostring(entry.id)] then ignoredCount += 1 end
+    end
     local ids = {}
     for onlyIdKey, entry in pairs(bag) do
-        if type(entry) == "table" and entry.equip ~= 1 and tostring(entry.tp) == "2" then
+        if type(entry) == "table" and entry.equip ~= 1 and tostring(entry.tp) == "2"
+            and not ignoreIds[tostring(entry.id)] then
             local ok, cfg = pcall(function() return CfgFind.FindCfgByID(entry.id) end)
             if ok and cfg then
                 -- Material configs carry GoldValue, not Price -- confirmed
@@ -665,13 +829,18 @@ local function doAutoSell()
             end
         end
     end
-    print("[MagicLoot][Sell] checked, bag entries matching filter: " .. #ids)
+    -- The kept count is worth printing even when nothing sells. "Nothing matching
+    -- filter" alone cannot tell you whether the price limit is too tight or the
+    -- ignore list is swallowing the bag.
+    local keptNote = ignoredCount > 0 and ("  (" .. ignoredCount .. " kept)") or ""
+    print("[MagicLoot][Sell] checked, matching filter: " .. #ids .. ", ignored: " .. ignoredCount)
     if #ids > 0 then
         local result = invoke(NetMsg.SELL_MATERIAL, {onlyIDList = ids})
         print("[MagicLoot][Sell] invoked with " .. #ids .. " id(s) -> result=" .. tostring(result))
-        sellStatusText = result and ("Sold " .. #ids .. " item(s)") or ("Tried " .. #ids .. " item(s), server did not confirm")
+        sellStatusText = (result and ("Sold " .. #ids .. " item(s)")
+            or ("Tried " .. #ids .. " item(s), server did not confirm")) .. keptNote
     else
-        sellStatusText = "Nothing matching filter"
+        sellStatusText = "Nothing matching filter" .. keptNote
     end
 end
 
@@ -752,6 +921,46 @@ local function findDungeonPortal()
     local funcs = lobby and lobby:FindFirstChild("功能")
     local guideFolder = funcs and funcs:FindFirstChild("副本引导")
     return guideFolder and guideFolder:FindFirstChild("副本引导")
+end
+
+-- Which room the character is PHYSICALLY standing in, by nearest room centre.
+--
+-- roomProgress was the wrong thing to key saved spots off, and here is why it
+-- read as "the button is stuck on Room 1": roomProgress is the WALKER's cursor,
+-- and the walker only runs while Auto Stage is ON. Farm a dungeon by hand with
+-- the toggle off and roomProgress never leaves 1 no matter how far in you get.
+-- Even with it on, a manual walk or a stage jump moves the body without moving
+-- the cursor. DungeonAggroStage is no good either -- that was the original bug,
+-- it still reports the PREVIOUS run's final value right after a re-entry.
+--
+-- Position is the one signal that can't be stale. workspace.场景 holds 27
+-- numbered rooms, each with its own 战斗区域 volume, and they sit far enough
+-- apart that "nearest centre" is unambiguous: measured live standing in room 5,
+-- nearest was 39.4 studs and the runner-up 70.9. Both the save side and the
+-- orbit-skip lookup read this now, so they can never disagree about which room
+-- a spot belongs to.
+local function currentPhysicalRoom()
+    -- The 27 rooms exist in workspace even while standing in town, so without
+    -- this gate the button would confidently name a room the character is
+    -- nowhere near. InDungeonChallenge reads 0 in town and the live stage
+    -- number inside a run (measured 5 while standing in room 5).
+    local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
+    if not (inDungeonVal and inDungeonVal.Value > 0) then return nil end
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local scene = workspace:FindFirstChild("场景")
+    if not hrp or not scene then return nil end
+    local bestNum, bestDist
+    for _, room in ipairs(scene:GetChildren()) do
+        local num = tonumber(room.Name)
+        if num then
+            local mark = room:FindFirstChild("战斗区域") or room:FindFirstChild("Root")
+            if mark and mark:IsA("BasePart") then
+                local dist = (mark.Position - hrp.Position).Magnitude
+                if not bestDist or dist < bestDist then bestNum, bestDist = num, dist end
+            end
+        end
+    end
+    return bestNum
 end
 
 -- Two separate bags, confirmed live -- don't conflate them:
@@ -1262,15 +1471,13 @@ local function teleportToNearestMob()
     -- every tick, same as the mob-orbit branch below -- unanchored let combat
     -- knockback drag the character clean off the saved spot (confirmed live:
     -- drifted 30+ studs away within seconds when left unanchored).
-    -- Keyed off roomProgress, NOT DungeonAggroStage -- reading the server
-    -- attribute here reproduced the exact "stuck at stage 1" bug the
-    -- room-advance logic below was already fixed for: right after a fresh
-    -- re-entry DungeonAggroStage can still briefly report the PREVIOUS run's
-    -- final stage (e.g. 17), so a save for stage 17 matched immediately at
-    -- room 1 and pinned the character on an empty spot forever -- no mob in
-    -- range there, so nothing ever died, so stage 1 never advanced.
-    -- roomProgress resets to 1 on every fresh entry and only moves forward
-    -- through real local room-advancement, so it can't misfire this way.
+    -- Keyed off currentPhysicalRoom(), NOT DungeonAggroStage and no longer
+    -- roomProgress either. DungeonAggroStage was the original bug: right after a
+    -- fresh re-entry it still reports the PREVIOUS run's final stage, so a save
+    -- for stage 17 matched at room 1 and pinned the character on an empty spot
+    -- forever. roomProgress fixed that but introduced its own gap -- it is the
+    -- walker's cursor, so it only tracks the body while Auto Stage drives it.
+    -- Where the character actually stands answers the question for both.
     local nearest, nearestDist = nil, math.huge
     local folder = workspace:FindFirstChild("LocalMonster")
     if folder then
@@ -1294,7 +1501,7 @@ local function teleportToNearestMob()
     -- "target 18, saved spots on 17 and 18, stuck on 17": room 17 was cleared,
     -- the pin held, and nothing ever walked into room 18 to make the server
     -- advance the stage. Empty room now falls through to the advance path.
-    local savedPos = e.StageSavedPositions[tostring(roomProgress)]
+    local savedPos = e.StageSavedPositions[tostring(currentPhysicalRoom() or roomProgress)]
     if savedPos and nearest then
         emptyTicks = 0
         hrp.Anchored = true
@@ -1388,28 +1595,6 @@ local function doRedeemCodes(codesText, onDone)
     end)
 end
 
--- ===== Skill NoCooldown =====
--- GroupSkillClient.isCooldownActiveByTimestamp is the exact gate
--- PlayerSkillInput checks before allowing a skill to fire again -- skills
--- already auto-cast on their own (confirmed live: 174 RELEASE_GROUP_SKILL
--- calls with zero manual input), this just removes the wait between casts.
-local __origIsCooldownActive = nil
-local function applySkillNoCooldown(enabled)
-    local ok, GroupSkillClient = pcall(function()
-        return require(ReplicatedStorage.ClientSideCode.SystemSkill.GroupSkill.GroupSkillClient)
-    end)
-    if not ok then return false end
-    if enabled then
-        if not __origIsCooldownActive then
-            __origIsCooldownActive = GroupSkillClient.isCooldownActiveByTimestamp
-        end
-        GroupSkillClient.isCooldownActiveByTimestamp = function() return false end
-    elseif __origIsCooldownActive then
-        GroupSkillClient.isCooldownActiveByTimestamp = __origIsCooldownActive
-    end
-    return true
-end
-
 -- ===== Settings: movement =====
 local function applyMovement()
     local char = LocalPlayer.Character
@@ -1448,7 +1633,7 @@ end
 local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
 local Window = MacLib:Window({
     Title = "Magic Loot [Beta]",
-    Subtitle = "v1.1 Dino",
+    Subtitle = "v1.2 Clean",
     DragStyle = 1,
     ShowUserInfo = true,
     AcrylicBlur = false,
@@ -1480,7 +1665,6 @@ local Tabs = {
     Stage    = TabGroup:Tab({Name = "Stage",    Image = "rbxassetid://10734975692"}),
     Event    = TabGroup:Tab({Name = "Event",    Image = "rbxassetid://10747363465"}),
     Claims   = TabGroup:Tab({Name = "Claims",   Image = "rbxassetid://10734963191"}),
-    Skill    = TabGroup:Tab({Name = "Skill",    Image = "rbxassetid://10723415903"}),
     Settings = TabGroup:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 
@@ -1509,7 +1693,6 @@ FarmLeft:Dropdown({
     end)(),
     Callback = function(selected) e.PickupRaritySet = selected or {}; saveState() end,
 }, "PickupRarityDropdown")
-FarmLeft:Label({Text = "Picks highest-price items first, skips anything\nbelow Min Price / outside the selected Rarity set."})
 local pickupStatusLabel = FarmLeft:Label({Text = "Idle"})
 
 local FarmRight = Tabs.Farm:Section({Side = "Right"})
@@ -1547,8 +1730,14 @@ local function buildTrainZoneOptions()
     return labels
 end
 
+-- "Stay" used to live here and meant "don't move me". Manual Tap is that option
+-- now, and having both was the trap -- Stay + Manual Tap read as two settings for
+-- one behaviour while Best/Manual + Manual Tap was a combination that could never
+-- work. A saved "Stay" from an older build maps onto Best.
+if e.TrainZoneMode == "Stay" then e.TrainZoneMode = "Best" end
 FarmRight:Dropdown({
-    Name = "Zone Mode", Options = {"Stay", "Best", "Manual"}, Default = e.TrainZoneMode,
+    Name = "Zone Mode (ignored while Manual Tap is on)", Options = {"Best", "Manual"},
+    Default = e.TrainZoneMode,
     Callback = function(selected)
         if selected then e.TrainZoneMode = selected; saveState() end
     end,
@@ -1569,15 +1758,23 @@ FarmRight:Button({Name = "Refresh Zone List", Callback = function()
     end)
 end})
 FarmRight:Toggle({
-    Name = "Manual Tap (Best/Manual mode)", Default = e.TrainManualTapEnabled,
+    Name = "Manual Tap (train here, no teleport)", Default = e.TrainManualTapEnabled,
     Callback = function(v) e.TrainManualTapEnabled = v; saveState() end,
 }, "TrainManualTapEnabled")
+-- Floor is 0.125, not 0.02. The server accepts ~8 taps/sec and refuses the rest,
+-- so the old 0.02 minimum only ever bought rejections -- 18 of them per 47 hits,
+-- measured. Letting the slider ask for something the server will not give is how
+-- a working feature reads as broken.
 safeSlider(FarmRight, {
-    Name = "Tap Rate", Minimum = 0.02, Maximum = 1,
-    Default = e.TrainTapRate, Precision = 2, Suffix = "s",
-    Callback = function(v) e.TrainTapRate = tonumber(v) or 0.1; saveState() end,
+    Name = "Tap Rate", Minimum = 0.125, Maximum = 1,
+    Default = math.max(0.125, tonumber(e.TrainTapRate) or 0.125), Precision = 3, Suffix = "s",
+    Callback = function(v) e.TrainTapRate = math.max(0.125, tonumber(v) or 0.125); saveState() end,
 }, "TrainTapRateSlider")
-FarmRight:Label({Text = "Stay   = never moves you, just clicks (old behaviour)\nBest   = parks you in the best zone you can enter\nManual = parks you in the zone picked below\n\nTraining pays server-side now (TRAIN_AUTO_TICK):\n~336B/sec for simply standing in a zone. Measured\nlive, clicking added 0 on top of that and every\nclick past the first ~13 came back rejected."})
+local trainPlanLabel = FarmRight:Label({Text = "Comparing zone vs tap..."})
+-- Manual Tap ON  = train where you stand, no teleport, ~330B/sec from taps.
+-- Manual Tap OFF = Best parks you in the highest zone you can enter, Manual
+-- parks you in the one picked above. Income there is the server's own
+-- TRAIN_AUTO_TICK and taps are refused, so the two never mix.
 local trainStatusLabel = FarmRight:Label({Text = "Idle"})
 
 -- ----- Sell Tab -----
@@ -1597,7 +1794,31 @@ safeSlider(SellLeft, {
     Default = e.SellMaxRarity, Precision = 0,
     Callback = function(v) e.SellMaxRarity = math.floor(tonumber(v) or 0); saveState() end,
 }, "SellMaxRaritySlider")
-SellLeft:Label({Text = "Sells anything AT OR BELOW both limits.\nNever touches equipped items."})
+-- Search = true because 48 rows is past the point of scrolling for one of them.
+SellLeft:Dropdown({
+    Name = "Never Sell (ignore list)", Options = sellIgnoreLabels, Multi = true, Search = true,
+    Default = (function()
+        local arr = {}
+        for idKey in pairs(e.SellIgnoreIds) do
+            local label = sellIdToLabel[tonumber(idKey)]
+            if label then table.insert(arr, label) end
+        end
+        return arr
+    end)(),
+    -- Stored as ids. The dropdown speaks labels, the sell filter speaks ids, and
+    -- this is the one place that converts -- so a label that changes with the
+    -- game's language never reaches state.json.
+    Callback = function(selected)
+        local ids = {}
+        for label in pairs(selected or {}) do
+            local id = sellLabelToId[label]
+            if id then ids[tostring(id)] = true end
+        end
+        e.SellIgnoreIds = ids
+        saveState()
+    end,
+}, "SellIgnoreDropdown")
+-- Sells at or below BOTH limits, never touches equipped items or the list above.
 local sellStatusLabel = SellLeft:Label({Text = "Idle"})
 
 -- ----- Alchemy Tab -----
@@ -1617,7 +1838,6 @@ AlchemyLeft:Dropdown({
         end
     end,
 }, "AlchemyRecipeDropdown")
-AlchemyLeft:Label({Text = "Collects any finished potion, then starts the\nnext craft if materials allow. Repeats every 3s.\nCollect step (ALCHEMY_PICKUP_FINISH_POTION) is\nunverified -- watch for it live."})
 local alchemyStatusLabel = AlchemyLeft:Label({Text = "Idle"})
 
 local AlchemyRight = Tabs.Alchemy:Section({Side = "Right"})
@@ -1635,7 +1855,8 @@ AlchemyRight:Dropdown({
     end)(),
     Callback = function(selected) e.AutoUsePotionSelected = selected or {}; saveState() end,
 }, "AutoUsePotionSelectedDropdown")
-AlchemyRight:Label({Text = "Only Training/Lucky buff potions are offered\nhere -- skill-granting alchemy potions are\nnever auto-used. Nothing selected = does\nnothing, even with the toggle on."})
+-- Only Training/Lucky buff potions are listed -- the skill-granting alchemy
+-- potions are never auto-used. Nothing selected means this does nothing.
 local usePotionStatusLabel = AlchemyRight:Label({Text = "Idle"})
 
 -- ----- Stage Tab -----
@@ -1702,72 +1923,102 @@ safeSlider(StageLeft, {
     Default = e.MobHoverHeight, Precision = 0,
     Callback = function(v) e.MobHoverHeight = v; saveState() end,
 }, "MobHoverHeightSlider")
-StageLeft:Label({Text = "Snaps onto the nearest live monster every 0.3s\nso skills stay in range, until DungeonAggroStage\nreaches the target -- then fires DUNGEON_RETURN_TOWN.\nWith Bag Full ON, also returns early if either the\nstage bag or the total bag hits its cap -- then loops\nback into a fresh run either way."})
+-- Snaps onto the nearest live monster every 0.3s so skills stay in range, until
+-- DungeonAggroStage reaches the target -- then DUNGEON_RETURN_TOWN. With Bag
+-- Full ON it also returns early when either bag caps, then loops back in.
 local stageStatusLabel = StageLeft:Label({Text = "Idle"})
 
 StageLeft:Header({Text = "Custom Farm Position"})
--- THE bug behind "I saved a spot and it never goes there": these buttons keyed
--- the save off DungeonAggroStage, while teleportToNearestMob looks the save up
--- by roomProgress. Two different numbers -- DungeonAggroStage is the server's
--- cleared-stage counter and can still report the PREVIOUS run's final value
--- right after a re-entry, which is exactly why the reader was moved onto
--- roomProgress in the first place. The save side was never moved with it, so
--- the lookup could not match and the orbit ran forever. Both sides use
--- roomProgress now.
-local savedPosStatusLabel = StageLeft:Label({Text = "No saved position for the current room"})
+-- Three buttons became one. The old set was "Save for Current Stage" / "Clear
+-- for Current Stage" / "Clear ALL", and picking between the first two meant
+-- already knowing whether this room had a save -- which the label only told you
+-- if you went and read it first. One button that reads the state itself and
+-- flips it removes that whole step: stand where you want, press, done. Press
+-- again on the same room to undo it.
+--
+-- Saves are keyed by roomProgress, NOT DungeonAggroStage. Those are two
+-- different numbers: DungeonAggroStage is the server's cleared-stage counter
+-- and can still report the PREVIOUS run's final value right after a re-entry,
+-- so a save made against it never matched on the read side and the orbit ran
+-- forever. roomProgress resets to 1 on every fresh entry and only moves through
+-- real local room advancement, so both sides agree.
+local savedPosStatusLabel = StageLeft:Label({Text = "Saved rooms: none"})
+-- Physical position first, walker cursor only as a fallback for when the
+-- character has no room to be nearest to (standing in town).
 local function currentRoomKey()
-    return tostring(roomProgress)
+    return tostring(currentPhysicalRoom() or roomProgress)
 end
+-- The button's own name is the instruction. Reading "Clear Saved Spot (Room 7)"
+-- tells you this room is already saved without looking anywhere else.
+local savePosButton
+-- The status line repaints on a 1s tick, so a rejection message written straight
+-- into it survives less than a second and reads as the button doing nothing at
+-- all. Hold the line for 3s instead and let the tick skip it until then.
+local savedPosHintUntil = 0
 local function refreshSavedPosStatus()
     local key = currentRoomKey()
-    local saved = e.StageSavedPositions[key]
-    if saved then
-        pcall(function() savedPosStatusLabel:UpdateName(("Room %s has a saved spot -- orbit is skipped here"):format(key)) end)
-    else
-        pcall(function() savedPosStatusLabel:UpdateName(("Room %s -- no saved spot, using mob-head orbit"):format(key)) end)
+    local saved = e.StageSavedPositions[key] ~= nil
+    pcall(function()
+        savePosButton:UpdateName(saved
+            and ("Clear Saved Spot (Room " .. key .. ")")
+            or  ("Save This Spot (Room " .. key .. ")"))
+    end)
+    if os.clock() < savedPosHintUntil then return end
+
+    -- Keys are stringified room numbers, so a plain sort would order them
+    -- 1, 10, 17, 2. Sort the numbers as numbers.
+    local rooms = {}
+    for roomKey in pairs(e.StageSavedPositions) do
+        table.insert(rooms, tonumber(roomKey) or 0)
     end
+    table.sort(rooms)
+    pcall(function()
+        savedPosStatusLabel:UpdateName(#rooms > 0
+            and ("Saved rooms: " .. table.concat(rooms, ", "))
+            or  "Saved rooms: none")
+    end)
 end
-StageLeft:Button({Name = "Save Position for Current Stage", Callback = function()
-    local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not (inDungeonVal and inDungeonVal.Value > 0) or not hrp then
-        pcall(function() savedPosStatusLabel:UpdateName("Can't save -- not inside a dungeon run right now") end)
+local function savedPosHint(text)
+    savedPosHintUntil = os.clock() + 3
+    pcall(function() savedPosStatusLabel:UpdateName(text) end)
+end
+savePosButton = StageLeft:Button({Name = "Save This Spot", Callback = function()
+    local key = currentRoomKey()
+    if e.StageSavedPositions[key] then
+        e.StageSavedPositions[key] = nil
+        saveState()
+        savedPosHintUntil = 0
+        refreshSavedPosStatus()
         return
     end
-    e.StageSavedPositions[currentRoomKey()] = {X = hrp.Position.X, Y = hrp.Position.Y, Z = hrp.Position.Z}
+    local inDungeonVal = LocalPlayer:FindFirstChild("InDungeonChallenge")
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not (inDungeonVal and inDungeonVal.Value > 0) or not hrp then
+        savedPosHint("Get inside a run first, then press this")
+        return
+    end
+    e.StageSavedPositions[key] = {X = hrp.Position.X, Y = hrp.Position.Y, Z = hrp.Position.Z}
     saveState()
-    refreshSavedPosStatus()
+    savedPosHint("Saved room " .. key .. " -- orbit skipped here")
 end})
-StageLeft:Button({Name = "Clear Saved Position for Current Stage", Callback = function()
-    e.StageSavedPositions[currentRoomKey()] = nil
-    saveState()
-    refreshSavedPosStatus()
-end})
-StageLeft:Button({Name = "Clear ALL Saved Positions", Callback = function()
-    -- Old saves are keyed by the wrong number and will never match. One button
-    -- to drop them rather than leaving dead entries in state.json forever.
+StageLeft:Button({Name = "Clear All Saved Spots", Callback = function()
     e.StageSavedPositions = {}
     saveState()
+    savedPosHintUntil = 0
     refreshSavedPosStatus()
 end})
 task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(refreshSavedPosStatus)
         pcall(function()
+            -- Was two lines: a "reachable: 4, 8, 13" list plus a verdict. The
+            -- list was redundant -- the ceiling already implies it, and the
+            -- dropdown marks locked entries itself. Verdict only now.
             local jumpMax = getStageJumpMax()
-            local target = tonumber(e.StageTarget) or 0
-            local reach = {}
-            for _, s in ipairs(TELEPORTABLE_STAGES) do
-                if s <= jumpMax then table.insert(reach, tostring(s)) end
-            end
-            local pick, note = pickStageJumpTarget(target)
-            stageJumpInfoLabel:UpdateName(string.format(
-                "Ceiling %d  |  reachable: %s\n%s",
-                jumpMax,
-                #reach > 0 and table.concat(reach, ", ") or "none",
-                pick and ("Will teleport to stage " .. pick .. ", walk the rest")
-                      or ("Walking from stage 1 -- " .. tostring(note))))
+            local pick, note = pickStageJumpTarget(tonumber(e.StageTarget) or 0)
+            stageJumpInfoLabel:UpdateName(pick
+                and string.format("Teleport to %d, walk from there (ceiling %d)", pick, jumpMax)
+                or  string.format("Walking from 1 -- %s", tostring(note)))
         end)
         task.wait(1)
     end
@@ -1799,7 +2050,8 @@ safeSlider(EventLeft, {
     Default = e.DinoRollKeepTickets, Precision = 0,
     Callback = function(v) e.DinoRollKeepTickets = math.floor(tonumber(v) or 0); saveState() end,
 }, "DinoRollKeepTicketsSlider")
-EventLeft:Label({Text = "Free tickets drip in every 15 min, 3/day max.\nx3 and x10 each need that many tickets in hand,\nso on a free account x1 is the only one that\never fires."})
+-- Free tickets drip in every 15 min, 3/day max, and x3/x10 each need that many
+-- in hand -- so on a free account x1 is the only batch that ever fires.
 local dinoRollStatusLabel = EventLeft:Label({Text = "Idle"})
 local dinoWalletLabel = EventLeft:Label({Text = "Tickets: ?   Dino Coins: ?"})
 
@@ -1809,7 +2061,7 @@ EventRight:Toggle({
     Name = "Auto Claim Quest", Default = e.AutoDinoQuestEnabled,
     Callback = function(v) e.AutoDinoQuestEnabled = v; saveState() end,
 }, "AutoDinoQuestEnabled")
-EventRight:Label({Text = "Sweeps Timed / Daily / Once every 20s and submits\nanything already at its target count."})
+-- Sweeps Timed / Daily / Once every 20s, submits anything already at target.
 local dinoQuestStatusLabel = EventRight:Label({Text = "Idle"})
 local dinoTaskListLabel = EventRight:Label({Text = "Loading tasks..."})
 EventRight:Button({Name = "Refresh Task List", Callback = function()
@@ -1856,7 +2108,7 @@ local redeemInputOk = pcall(function()
     }, "RedeemCodesInput")
 end)
 if not redeemInputOk then
-    ClaimsRight:Label({Text = "Code box unavailable (MacLib Input blocked on this\nthread identity). Set getgenv().MagicLootCodes = \"CODE1 CODE2\"\nand press Redeem Now."})
+    ClaimsRight:Label({Text = "Box blocked -- set getgenv().MagicLootCodes instead"})
 end
 local redeemStatusLabel = ClaimsRight:Label({Text = "Ready"})
 ClaimsRight:Button({Name = "Redeem Now", Callback = function()
@@ -1867,19 +2119,6 @@ ClaimsRight:Button({Name = "Redeem Now", Callback = function()
         pcall(function() redeemStatusLabel:UpdateName("Redeemed " .. claimed .. "/" .. tried) end)
     end)
 end})
-
--- ----- Skill Tab -----
-local SkillLeft = Tabs.Skill:Section({Side = "Left"})
-SkillLeft:Header({Text = "Skill NoCooldown"})
-SkillLeft:Toggle({
-    Name = "Skill NoCooldown", Default = e.SkillNoCooldownEnabled,
-    Callback = function(v)
-        e.SkillNoCooldownEnabled = v
-        applySkillNoCooldown(v)
-        saveState()
-    end,
-}, "SkillNoCooldownEnabled")
-SkillLeft:Label({Text = "Skills already auto-cast on their own.\nThis removes the per-skill cooldown gate\nso they fire back-to-back instead of waiting."})
 
 -- ----- Settings Tab -----
 local SettingsLeft = Tabs.Settings:Section({Side = "Left"})
@@ -1902,7 +2141,7 @@ pcall(function()
     }, "MagicLootToggleUIKeybind")
 end)
 SettingsLeft:Header({Text = "Auto Save"})
-SettingsLeft:Label({Text = "All toggles save automatically to:\n" .. SAVE_FILE})
+SettingsLeft:Label({Text = "Auto-saved to " .. SAVE_FILE})
 
 local SettingsRight = Tabs.Settings:Section({Side = "Right"})
 SettingsRight:Header({Text = "Movement"})
@@ -1937,13 +2176,22 @@ end)
 task.spawn(function()
     while getgenv().__MLG == myGen do
         pcall(doAutoTrain)
+        -- refreshTrainPlan walks all 9 tagged zones and pcalls CanEnterTrainGround
+        -- on each -- 27 calls. Running that on the tap cadence cost more than the
+        -- taps did: measured 196B/sec against a 330B/sec ceiling, because the scan
+        -- ate the interval. It only changes on rebirth, so once a second is plenty.
+        if os.clock() - lastTrainPlanRefresh >= 1 then
+            lastTrainPlanRefresh = os.clock()
+            pcall(refreshTrainPlan)
+            pcall(function() trainPlanLabel:UpdateName(trainPlanText) end)
+        end
         pcall(function() trainStatusLabel:UpdateName(trainStatusText) end)
-        -- Was a flat 0.01 (100 calls/sec) which burned the click quota instantly.
-        -- Stay mode paces itself off the Tap Rate slider, so the loop has to run
-        -- at least that fast; the parking modes only need to notice when you've
-        -- been knocked out of a zone, and 0.5s is plenty for that.
-        if e.AutoTrainEnabled and e.TrainZoneMode == "Stay" then
-            task.wait(math.max(0.02, tonumber(e.TrainTapRate) or 0.1))
+        -- A flat 0.5s loop capped taps at 2/sec against a server that accepts 8 --
+        -- that was the second half of "Manual Tap doesn't work". Tick on a slice
+        -- well under the tap interval and let tryTrainTap's own gate set the real
+        -- spacing; parking needs none of that pace and still idles at 0.5s.
+        if e.AutoTrainEnabled and e.TrainManualTapEnabled and not inTrainZone() then
+            task.wait(0.03)
         else
             task.wait(0.5)
         end
@@ -2034,8 +2282,14 @@ task.spawn(function()
     end
 end)
 
-if e.SkillNoCooldownEnabled then applySkillNoCooldown(true) end
 applyMovement()
+
+-- state.json was only ever written from a UI callback, so any value that reached
+-- getgenv another way -- the TrainTapRate normalisation above, or a setting
+-- carried in from a previous run -- lived in memory and died on rejoin, quietly
+-- reverting to whatever the file still said. One save at the end of load makes
+-- the file agree with what is actually on screen.
+saveState()
 
 getgenv().__MLWindow = Window
 -- Select() runs MacLib's tab Tween, and the tween touches Instance state the
@@ -2046,4 +2300,4 @@ pcall(function() Tabs.Farm:Select() end)
 -- Version string carries a load stamp on purpose. An older injected build and a
 -- freshly executed one used to print the exact same line, which is how a stale
 -- copy sat in memory looking like a broken feature. Now they can't match.
-print(string.format("[MagicLoot] v1.1 Dino loaded (gen %d, %s)", myGen, os.date("%H:%M:%S")))
+print(string.format("[MagicLoot] v1.2 Clean loaded (gen %d, %s)", myGen, os.date("%H:%M:%S")))
