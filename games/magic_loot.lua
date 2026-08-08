@@ -206,7 +206,7 @@ local PERSIST_KEYS = {
     "AutoClaimDailyEnabled",
     "AutoDinoRollEnabled", "DinoRollBatch", "DinoRollKeepTickets",
     "AutoDinoQuestEnabled",
-    "AutoSellEnabled", "SellMaxPrice", "SellMaxRarity", "SellIgnoreIds",
+    "AutoSellEnabled", "SellIgnoreIds",
     "AutoAlchemyEnabled", "AlchemyRecipeId", "AutoUsePotionEnabled", "AutoUsePotionSelected",
     "AutoStageEnabled", "StageTarget", "AutoReturnOnBagFull", "MobHoverHeight", "StageSavedPositions",
     "AutoStageJumpEnabled", "StageJumpPick",
@@ -230,9 +230,44 @@ local function saveState()
     pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(data)) end)
 end
 
+-- ===== Short amounts (1k / 150m / 1.5b / 1t) =====
+-- Drop values in this game span 8 to 6,950,000,000 -- read live off the whole
+-- materialConf table. Typing that range digit by digit is how you end up filtering
+-- at 195000000 when you meant 1950000000, and the old Min Price control could not
+-- express it at all: it was a slider capped at 50000, so every threshold above
+-- fifty thousand was simply unreachable while the items ran to seven billion.
+local AMOUNT_SUFFIX = {k = 1e3, m = 1e6, b = 1e9, t = 1e12}
+
+local function parseAmount(value)
+    if type(value) == "number" then return math.max(0, math.floor(value)) end
+    local text = tostring(value or ""):gsub("[%s,]", ""):lower()
+    if text == "" then return 0 end
+    local numberPart, suffix = text:match("^(%d*%.?%d+)([kmbt]?)$")
+    if not numberPart then return nil end
+    local amount = tonumber(numberPart)
+    if not amount then return nil end
+    return math.floor(amount * (AMOUNT_SUFFIX[suffix] or 1))
+end
+
+local function formatAmount(amount)
+    amount = tonumber(amount) or 0
+    -- Descending so the largest fitting unit wins; 1e12 first or 1t prints as 1000b.
+    for _, unit in ipairs({{1e12, "t"}, {1e9, "b"}, {1e6, "m"}, {1e3, "k"}}) do
+        if amount >= unit[1] then
+            local scaled = amount / unit[1]
+            -- %.15g rather than a fixed precision: 1.5b keeps its half, 2b does
+            -- not become "2.0b", and nothing prints in exponent form.
+            return string.format("%.15g", math.floor(scaled * 100 + 0.5) / 100) .. unit[2]
+        end
+    end
+    return tostring(math.floor(amount))
+end
+
 local e = getgenv()
 if e.AutoPickupEnabled == nil then e.AutoPickupEnabled = false end
-if e.PickupMinPrice == nil then e.PickupMinPrice = 0 end
+-- Accepts a raw number or a short string either way, so setting
+-- getgenv().PickupMinPrice = "150m" by hand works exactly like picking it.
+e.PickupMinPrice = parseAmount(e.PickupMinPrice) or 0
 if e.PickupRaritySet == nil then e.PickupRaritySet = {} end
 if e.AutoTrainEnabled == nil then e.AutoTrainEnabled = false end
 if e.TrainZoneMode == nil then e.TrainZoneMode = "Best" end
@@ -250,8 +285,6 @@ if e.DinoRollBatch == nil then e.DinoRollBatch = 1 end
 if e.DinoRollKeepTickets == nil then e.DinoRollKeepTickets = 0 end
 if e.AutoDinoQuestEnabled == nil then e.AutoDinoQuestEnabled = false end
 if e.AutoSellEnabled == nil then e.AutoSellEnabled = false end
-if e.SellMaxPrice == nil then e.SellMaxPrice = 0 end
-if e.SellMaxRarity == nil then e.SellMaxRarity = 0 end
 if e.SellIgnoreIds == nil then e.SellIgnoreIds = {} end
 if e.AutoAlchemyEnabled == nil then e.AutoAlchemyEnabled = false end
 if e.AutoUsePotionEnabled == nil then e.AutoUsePotionEnabled = false end
@@ -278,6 +311,11 @@ if e.JumpPowerValue == nil then e.JumpPowerValue = 50 end
 -- (confirmed live via Model:SetAttribute in SystemDrop.client) -- no need to
 -- read any internal Lua state for the filter/sort itself.
 local pickupStatusText = "Idle"
+-- The pickup loop repaints this status every 0.15s. A message written from the
+-- Min Price box would be gone before it could be read, so the loop holds off
+-- while a hint is fresh. Declared here, not down in the UI, because doAutoPickup
+-- closes over it and a later `local` would leave this reading a stray global.
+local pickupPriceHintUntil = 0
 local function getDropItems()
     local items = {}
     local dropsClient = workspace:FindFirstChild("DropsClient")
@@ -296,11 +334,16 @@ local function getDropItems()
     return items
 end
 local function doAutoPickup()
+    -- A hint from the Min Price box owns the status line for three seconds.
+    if os.clock() < pickupPriceHintUntil then return end
     if not e.AutoPickupEnabled then pickupStatusText = "Idle"; return end
     local items = getDropItems()
     -- price high -> low priority, exactly as requested
     table.sort(items, function(a, b) return a.gold > b.gold end)
-    local minPrice = tonumber(e.PickupMinPrice) or 0
+    -- parseAmount, not tonumber -- a hand-set getgenv().PickupMinPrice = "150m"
+    -- would read as nil through tonumber and silently collapse the filter to 0,
+    -- picking up everything while the panel still claimed a threshold.
+    local minPrice = parseAmount(e.PickupMinPrice) or 0
     local raritySet = type(e.PickupRaritySet) == "table" and e.PickupRaritySet or {}
     local anyRaritySelected = next(raritySet) ~= nil
     local fired = 0
@@ -315,7 +358,12 @@ local function doAutoPickup()
             end
         end
     end
-    pickupStatusText = fired > 0 and ("Picked up " .. fired .. " item(s) this pass") or "Nothing matching filter"
+    -- Threshold echoed back in the same shorthand it was picked in, so a filter
+    -- that is quietly rejecting everything shows its own reason.
+    local threshold = minPrice > 0 and ("min " .. formatAmount(minPrice)) or "any price"
+    pickupStatusText = fired > 0
+        and ("Picked up " .. fired .. " item(s) -- " .. threshold)
+        or (#items .. " drop(s) on ground, none above " .. threshold)
 end
 
 -- ===== Auto Train (rewritten -- the game moved training server-side) =====
@@ -492,7 +540,16 @@ local function doTapInPlaceTrain()
 end
 
 local function doAutoTrain()
-    if not e.AutoTrainEnabled then trainStatusText = "Idle"; return end
+    if not e.AutoTrainEnabled then
+        -- Manual Tap overrides Zone Mode, which makes it read like the main
+        -- switch -- but Auto Train still gates the whole loop, so a panel showing
+        -- "Manual Tap: on" over a bare "Idle" looks like a broken tap rather than
+        -- a switch that was never thrown. Name the actual blocker.
+        trainStatusText = e.TrainManualTapEnabled
+            and "Auto Train is OFF -- Manual Tap cannot fire until you switch it on"
+            or "Idle"
+        return
+    end
 
     -- Manual Tap wins outright over Zone Mode. It means "train normally, right
     -- here" -- nothing below this line runs, so the character is never moved.
@@ -726,6 +783,14 @@ end
 -- only accepts tp==2 (materials), so that's the required filter, not just a
 -- nice-to-have.
 --
+-- A LOCKED entry poisons the batch exactly the same way, and that one cost a
+-- real "Tried 32 item(s), server did not confirm": 9 of those 32 carried
+-- lock==1 (the padlock in the game's own backpack UI, BAG_LOCK_ITEMS) and took
+-- the other 23 down with them. Proven at zero risk by sending a batch of one
+-- locked item -- returned false, item still in the bag afterwards. So lock is
+-- filtered alongside equip, and because the lock is set in the game's own UI it
+-- doubles as an ignore list the player can drive without this panel.
+--
 -- ===== Sell ignore list =====
 -- 48 materials, read live from materialConf. Only materials are listed because
 -- SELL_MATERIAL only ever sees tp==2 -- offering the whole item table would put
@@ -796,51 +861,39 @@ local function doAutoSell()
     if not e.AutoSellEnabled then sellStatusText = "Toggle is OFF"; return end
     local bag = PlayerData.GetPlrDataByKey(LocalPlayer, "Bag")
     if type(bag) ~= "table" then sellStatusText = "No bag data"; return end
-    local maxPrice = tonumber(e.SellMaxPrice) or 0
-    local maxRarity = tonumber(e.SellMaxRarity) or 0
     -- Keyed by item id, not by the dropdown's label. Labels are translated at
     -- load, so a language change would silently orphan every saved entry and the
     -- ignore list would quietly start selling the things it was protecting. Ids
     -- do not move.
     local ignoreIds = type(e.SellIgnoreIds) == "table" and e.SellIgnoreIds or {}
-    local ignoredCount = 0
-    for _, entry in pairs(bag) do
-        if type(entry) == "table" and ignoreIds[tostring(entry.id)] then ignoredCount += 1 end
-    end
     local ids = {}
+    local ignoredCount, lockedCount = 0, 0
     for onlyIdKey, entry in pairs(bag) do
-        if type(entry) == "table" and entry.equip ~= 1 and tostring(entry.tp) == "2"
-            and not ignoreIds[tostring(entry.id)] then
-            local ok, cfg = pcall(function() return CfgFind.FindCfgByID(entry.id) end)
-            if ok and cfg then
-                -- Material configs carry GoldValue, not Price -- confirmed
-                -- live via ConfigInstance.materialConf field list and a
-                -- direct CfgFind.FindCfgByID probe (no "Price" key exists
-                -- on a material entry at all, so this always read nil -> 0
-                -- before, silently passing every price filter instead of
-                -- actually filtering).
-                local price = tonumber(cfg.GoldValue) or 0
-                local xyd = tonumber(cfg.xyd) or 0
-                local passPrice = maxPrice <= 0 or price <= maxPrice
-                local passRarity = maxRarity <= 0 or xyd <= maxRarity
-                if passPrice and passRarity then
-                    table.insert(ids, tonumber(entry.onlyID) or tonumber(onlyIdKey))
-                end
+        if type(entry) == "table" and entry.equip ~= 1 and tostring(entry.tp) == "2" then
+            if tonumber(entry.lock) == 1 then
+                lockedCount += 1
+            elseif ignoreIds[tostring(entry.id)] then
+                ignoredCount += 1
+            else
+                table.insert(ids, tonumber(entry.onlyID) or tonumber(onlyIdKey))
             end
         end
     end
-    -- The kept count is worth printing even when nothing sells. "Nothing matching
-    -- filter" alone cannot tell you whether the price limit is too tight or the
-    -- ignore list is swallowing the bag.
-    local keptNote = ignoredCount > 0 and ("  (" .. ignoredCount .. " kept)") or ""
-    print("[MagicLoot][Sell] checked, matching filter: " .. #ids .. ", ignored: " .. ignoredCount)
+    -- Both counts get reported. Without them "Nothing matching filter" cannot
+    -- tell the ignore list apart from a bag full of padlocks, and the padlocks
+    -- are the ones that used to fail the whole batch silently.
+    local keptParts = {}
+    if #ids == 0 or ignoredCount > 0 then table.insert(keptParts, ignoredCount .. " on ignore list") end
+    if lockedCount > 0 then table.insert(keptParts, lockedCount .. " locked") end
+    local keptNote = #keptParts > 0 and ("  (kept: " .. table.concat(keptParts, ", ") .. ")") or ""
+    print("[MagicLoot][Sell] sellable " .. #ids .. ", ignored " .. ignoredCount .. ", locked " .. lockedCount)
     if #ids > 0 then
         local result = invoke(NetMsg.SELL_MATERIAL, {onlyIDList = ids})
         print("[MagicLoot][Sell] invoked with " .. #ids .. " id(s) -> result=" .. tostring(result))
         sellStatusText = (result and ("Sold " .. #ids .. " item(s)")
-            or ("Tried " .. #ids .. " item(s), server did not confirm")) .. keptNote
+            or ("Server refused " .. #ids .. " item(s)")) .. keptNote
     else
-        sellStatusText = "Nothing matching filter" .. keptNote
+        sellStatusText = "Nothing to sell" .. keptNote
     end
 end
 
@@ -1657,6 +1710,20 @@ local function safeSlider(section, settings, flag)
     })
 end
 
+-- Input was written off in this file as fatally broken on this executor. It is
+-- not, and that was worth re-testing rather than inheriting: built a throwaway
+-- MacLib window, added an Input, called Tab:Select() -- constructed clean and
+-- rendered a real InputBox. The original diagnosis was almost certainly a
+-- misread of the slider crash, which IS real and does throw. Same guard shape as
+-- safeSlider regardless, since one executor behaving is not all of them.
+local function safeInput(section, settings, flag)
+    local ok, result = pcall(function() return section:Input(settings, flag) end)
+    if ok and result then return result end
+    return section:Label({
+        Text = settings.Name .. "\n(input blocked -- set the getgenv() value directly)"
+    })
+end
+
 local TabGroup = Window:TabGroup()
 local Tabs = {
     Farm     = TabGroup:Tab({Name = "Farm",     Image = "rbxassetid://10723343321"}),
@@ -1675,15 +1742,45 @@ FarmLeft:Toggle({
     Name = "Auto Pickup", Default = e.AutoPickupEnabled,
     Callback = function(v) e.AutoPickupEnabled = v; saveState() end,
 }, "AutoPickupEnabled")
--- MacLib's Input element calls a TextService size check that this executor's
--- thread identity can't touch ("lacking capability Plugin"), and it throws at
--- construction -- taking the whole script down before it finishes loading, with
--- nothing printed. Every numeric Input in this file is a Slider now.
-safeSlider(FarmLeft, {
-    Name = "Min Price (0 = any)", Minimum = 0, Maximum = 50000,
-    Default = e.PickupMinPrice, Precision = 0,
-    Callback = function(v) e.PickupMinPrice = math.floor(tonumber(v) or 0); saveState() end,
-}, "PickupMinPriceSlider")
+-- Numeric entry here is an Input again. The old note claiming Input throws
+-- "lacking capability Plugin" on this executor was tested and is wrong -- see
+-- safeInput. The Slider crash it was confused with is real and still guarded.
+-- Free text, not a ladder of preset rows. A dropdown could only ever offer the
+-- values someone guessed in advance, and the range here is 8 to 6,950,000,000 --
+-- any fixed list is either too coarse to aim with or too long to scroll.
+--
+-- AcceptedCharacters is a live filter MacLib runs on every keystroke, so the
+-- box physically cannot hold a letter that means nothing here. What survives it
+-- still goes through parseAmount, which rejects the shapes that pass the
+-- character filter but are not numbers -- "1.5.2", "kk", "5m3".
+FarmLeft:Label({Text = "Min Price -- type 0, 1k, 150m, 1.5b, 1t"})
+safeInput(FarmLeft, {
+    Name = "Min Price",
+    Placeholder = "0 / 1k / 150m / 1.5b",
+    Default = (e.PickupMinPrice or 0) > 0 and formatAmount(e.PickupMinPrice) or "",
+    AcceptedCharacters = function(text)
+        return (tostring(text):gsub("[^%d%.kmbtKMBT]", ""))
+    end,
+    -- Fires on FocusLost, not per keystroke, so a half-typed "15" on the way to
+    -- "150m" never briefly becomes the live threshold.
+    Callback = function(text)
+        local amount = parseAmount(text)
+        if amount then
+            e.PickupMinPrice = amount
+            saveState()
+            pickupPriceHintUntil = os.clock() + 3
+            pickupStatusText = "Min Price set to " .. (amount > 0 and formatAmount(amount) or "any price")
+        else
+            -- MacLib exposes no setter for the box text, so a rejected entry
+            -- stays visible while the real threshold does not change. Saying so
+            -- is the only thing that stops that reading as "it took my value".
+            pickupPriceHintUntil = os.clock() + 3
+            pickupStatusText = "Could not read \"" .. tostring(text) ..
+                "\" -- still " .. (parseAmount(e.PickupMinPrice) > 0
+                    and formatAmount(e.PickupMinPrice) or "any price")
+        end
+    end,
+}, "PickupMinPriceInput")
 FarmLeft:Dropdown({
     Name = "Rarity Filter (none = any)", Options = RARITY_NAMES, Multi = true,
     Default = (function()
@@ -1784,16 +1881,11 @@ SellLeft:Toggle({
     Name = "Auto Sell", Default = e.AutoSellEnabled,
     Callback = function(v) e.AutoSellEnabled = v; saveState() end,
 }, "AutoSellEnabled")
-safeSlider(SellLeft, {
-    Name = "Max Price (0 = any)", Minimum = 0, Maximum = 50000,
-    Default = e.SellMaxPrice, Precision = 0,
-    Callback = function(v) e.SellMaxPrice = math.floor(tonumber(v) or 0); saveState() end,
-}, "SellMaxPriceSlider")
-safeSlider(SellLeft, {
-    Name = "Max Rarity (0 = any)", Minimum = 0, Maximum = 10,
-    Default = e.SellMaxRarity, Precision = 0,
-    Callback = function(v) e.SellMaxRarity = math.floor(tonumber(v) or 0); saveState() end,
-}, "SellMaxRaritySlider")
+-- Max Price and Max Rarity sliders lived here. Both are gone: they were a blunt
+-- way of saying "keep the good stuff", and the ignore list says it exactly --
+-- by item, by name, with the rarity printed. Two controls that could contradict
+-- each other became one that cannot.
+--
 -- Search = true because 48 rows is past the point of scrolling for one of them.
 SellLeft:Dropdown({
     Name = "Never Sell (ignore list)", Options = sellIgnoreLabels, Multi = true, Search = true,
@@ -2098,18 +2190,10 @@ local rebirthStatusLabel = ClaimsLeft:Label({Text = "Idle"})
 local ClaimsRight = Tabs.Claims:Section({Side = "Right"})
 ClaimsRight:Header({Text = "Redeem Codes"})
 local redeemCodesText = ""
--- The only Input that can't become a Slider -- it takes free text. Wrapped so a
--- MacLib capability throw costs us the code box and nothing else, instead of
--- killing every tab after this line.
-local redeemInputOk = pcall(function()
-    ClaimsRight:Input({
-        Name = "Codes (comma or space separated)", Placeholder = "CODE1, CODE2",
-        Callback = function(t) redeemCodesText = t or "" end,
-    }, "RedeemCodesInput")
-end)
-if not redeemInputOk then
-    ClaimsRight:Label({Text = "Box blocked -- set getgenv().MagicLootCodes instead"})
-end
+safeInput(ClaimsRight, {
+    Name = "Codes", Placeholder = "CODE1, CODE2",
+    Callback = function(t) redeemCodesText = t or "" end,
+}, "RedeemCodesInput")
 local redeemStatusLabel = ClaimsRight:Label({Text = "Ready"})
 ClaimsRight:Button({Name = "Redeem Now", Callback = function()
     redeemStatusLabel:UpdateName("Redeeming...")
