@@ -7,6 +7,10 @@ local PLACE_SCRIPTS = {
     -- Third-party build, not ours -- points straight at the upstream repo rather
     -- than a copy under games/, so it tracks whatever they publish.
     [99108783264633]  = "https://raw.githubusercontent.com/kaisenlmao/loader/refs/heads/main/chiyo.lua",   -- [UPD] Build a base RNG
+    -- Ouroboros ships its own loader that dispatches on game.CreatorId across 135
+    -- games, so this entry hands off to a second dispatcher rather than to a
+    -- script. Verified live: CreatorId 180466034 resolves to growchickenfighter.lua.
+    [94640181989498]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Grow a Chicken Fighter
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
