@@ -47,7 +47,24 @@ local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
 local TeleportService = game:GetService("TeleportService")
+
+-- Same autoexec race that silently killed magic_loot: Players.LocalPlayer is nil
+-- for the first moments of a join, and capturing that nil poisons every use of it
+-- for the whole run. It fails late and confusingly -- the script starts, bumps its
+-- generation counter, then dies on the first unguarded LocalPlayer index with no
+-- window ever appearing.
 local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    local deadline = os.clock() + 30
+    repeat
+        task.wait(0.1)
+        LocalPlayer = Players.LocalPlayer
+    until LocalPlayer or os.clock() > deadline
+end
+if not LocalPlayer then
+    warn("[CutGrass] Players.LocalPlayer never arrived -- aborting cleanly")
+    return
+end
 
 getgenv().__CGA = (getgenv().__CGA or 0) + 1
 local myGen = getgenv().__CGA

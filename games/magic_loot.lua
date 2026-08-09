@@ -61,7 +61,29 @@ local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
+
+-- Players.LocalPlayer is nil for the first moments of a join, and autoexec fires
+-- inside that window. Reading it straight into a local captured that nil for the
+-- whole run: every LocalPlayer use downstream sat inside a pcall and no-oped
+-- quietly, right up to the one that did not --
+--     [AutoExec] loader.lua executed but errored:
+--     :1663: attempt to index nil with 'CharacterAdded'
+-- which is why the script incremented __MLG (so it clearly ran) yet never
+-- reached the last line that assigns __MLWindow, and no window ever appeared.
+-- Waiting here is the difference between "autoexec is broken" and "autoexec was
+-- 200ms early".
 local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    local deadline = os.clock() + 30
+    repeat
+        task.wait(0.1)
+        LocalPlayer = Players.LocalPlayer
+    until LocalPlayer or os.clock() > deadline
+end
+if not LocalPlayer then
+    warn("[MagicLoot] Players.LocalPlayer never arrived -- aborting cleanly")
+    return
+end
 
 -- This used to be a bare require on line one of the real work, which is exactly
 -- what made autoexec run this script three times on a fresh join. Injected that
