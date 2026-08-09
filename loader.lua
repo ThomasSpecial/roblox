@@ -11,6 +11,9 @@ local PLACE_SCRIPTS = {
     -- games, so this entry hands off to a second dispatcher rather than to a
     -- script. Verified live: CreatorId 180466034 resolves to growchickenfighter.lua.
     [94640181989498]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Grow a Chicken Fighter
+    -- Ouroboros also covers this place, so registering ours here is a choice, not
+    -- a gap being filled -- whichever URL sits on this line is the one that loads.
+    [90086669327265]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/cutgrass.lua",  -- +1 Cut Grass Adventure
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
