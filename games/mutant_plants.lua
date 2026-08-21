@@ -343,6 +343,10 @@ local function doAutoEquip()
         return
     end
 
+    local function scoreUnit(cfg, card)
+        return (cfg.rarity or 0) * 1000 + (cfg.MaterialRarity or 0) * 10 + (card and card.star or 0)
+    end
+
     local handShowSize = PlayConfig.handShowSize or 6
     local candidates = {}
     for i = 1, handShowSize do
@@ -351,44 +355,64 @@ local function doAutoEquip()
         if card and card.typeId == 1 then
             local cfg = PlayConfig.allUnit[card.cfgId]
             if cfg then
-                table.insert(candidates, {
-                    handIndex = i,
-                    score = (cfg.rarity or 0) * 1000 + (cfg.MaterialRarity or 0) * 10 + (card.star or 0),
-                })
+                table.insert(candidates, { handIndex = i, score = scoreUnit(cfg, card) })
             end
         end
     end
     if #candidates == 0 then equipStatusText = "No units in hand"; return end
     table.sort(candidates, function(a, b) return a.score > b.score end)
 
-    local claimedSlots = {}
-    local placed = 0
-    for _, cand in ipairs(candidates) do
-        local slot
-        for j = 1, 14 do
-            -- serverData.sceneUnit, NOT playData.sceneUnit -- confirmed live
-            -- that playData.sceneUnit is a VarValue wrapper object (AddSet/
-            -- Set/SetAll methods, no numeric keys), so indexing it with [j]
-            -- always returned nil and this loop thought every slot was
-            -- permanently empty. serverData.sceneUnit is the real plain
-            -- array (0 = empty, confirmed live: {538,...,0} for 14 slots) --
-            -- 0 is truthy in Lua, so this checks == 0, not just falsy.
+    -- serverData.sceneUnit, NOT playData.sceneUnit -- confirmed live that
+    -- playData.sceneUnit is a VarValue wrapper object (AddSet/Set/SetAll
+    -- methods, no numeric keys). serverData.sceneUnit is the real plain
+    -- array (0 = empty). Placing a hand card into an OCCUPIED slot silently
+    -- replaces whatever was there -- confirmed live: slot 3 held "Chomper"
+    -- (mat1/star2), a plain BusinessToId("放置_单位", 3) with a hand unit
+    -- selected swapped it straight to "Venom-Flytrap" (mat4/star3), no
+    -- separate unequip call needed, and the bumped Chomper card reappeared
+    -- back in pd.hand at the vacated index. So the fix isn't a new remote --
+    -- it's scoring occupied slots too instead of skipping them.
+    local slots = {}
+    for j = 1, 14 do
+        local unlocked = true
+        pcall(function() unlocked = sd.sceneUnitChunkUnlock and sd.sceneUnitChunkUnlock[j] == true end)
+        if unlocked then
             local occupied = sd.sceneUnit and sd.sceneUnit[j]
-            if not claimedSlots[j] and (not occupied or occupied == 0) then
-                local unlocked = true
-                pcall(function() unlocked = sd.sceneUnitChunkUnlock and sd.sceneUnitChunkUnlock[j] == true end)
-                if unlocked then slot = j; break end
+            local slotScore = -1
+            if occupied and occupied ~= 0 then
+                local placedCard = pd.allCard[occupied]
+                local placedCfg = placedCard and PlayConfig.allUnit[placedCard.cfgId]
+                if placedCfg then slotScore = scoreUnit(placedCfg, placedCard) end
             end
+            table.insert(slots, { slot = j, score = slotScore })
         end
-        if not slot then break end
-        claimedSlots[slot] = true
+    end
+    if #slots == 0 then equipStatusText = "No unlocked slots"; return end
+    table.sort(slots, function(a, b) return a.score < b.score end) -- worst slot first
+
+    local placed, replaced = 0, 0
+    local slotIdx = 1
+    for _, cand in ipairs(candidates) do
+        if slotIdx > #slots then break end
+        local target = slots[slotIdx]
+        -- slots ascending + candidates descending: once the best remaining
+        -- hand card can't beat the worst remaining slot, none of the rest
+        -- can either -- stop instead of scanning the whole board.
+        if cand.score <= target.score then break end
         pcall(function() OnClientGameEvent:SelectHandUnit(cand.handIndex) end)
         task.wait(0.1)
-        pcall(function() OnClientGameEvent:BusinessToId("放置_单位", slot) end)
-        placed += 1
+        pcall(function() OnClientGameEvent:BusinessToId("放置_单位", target.slot) end)
         task.wait(0.15)
+        placed += 1
+        if target.score >= 0 then replaced += 1 end
+        slotIdx += 1
     end
-    equipStatusText = placed > 0 and ("Placed " .. placed .. " unit(s)") or "Board full"
+
+    if placed == 0 then
+        equipStatusText = "Board already optimal"
+    else
+        equipStatusText = string.format("Placed %d unit(s) (%d replaced weaker)", placed, replaced)
+    end
 end
 
 -- ==========================================================================
@@ -1794,7 +1818,7 @@ task.spawn(function()
         pcall(function() fruitStatusLabel:UpdateName(fruitStatusText) end)
         pcall(doAutoBuyItem)
         pcall(function() itemStatusLabel:UpdateName(itemStatusText) end)
-        task.wait(5)
+        task.wait(1)
     end
 end)
 
