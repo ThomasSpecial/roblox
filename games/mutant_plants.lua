@@ -982,12 +982,40 @@ LocalPlayer.Idled:Connect(function()
     end
 end)
 
+-- game:BindToClose is SERVER-ONLY -- tried it, threw immediately on the
+-- client ("BindToClose can only be called on the server."), unguarded, and
+-- took the whole script down before the window could even build. Confirmed
+-- live, do not reintroduce it here.
+--
+-- PlayerRemoving is a server-replicated "a player left the roster" signal,
+-- so on a genuinely dead connection there's no live socket left for the
+-- server to tell this client anything through it -- it will not fire for
+-- every real drop. LocalPlayer.AncestryChanged is added alongside it as a
+-- second, purely-local signal: it fires whenever the LocalPlayer instance's
+-- position in the DataModel tree changes, including the client's own
+-- teardown when it gives up on a dead connection -- that part of the
+-- teardown is local instance-tree bookkeeping, not something that needs a
+-- live server round-trip to happen. Between the two this catches more real
+-- disconnects than either alone, but neither is a hard guarantee: if the
+-- connection dies badly enough that the client's Lua VM stops running
+-- entirely before any teardown, no script (ours or anyone else's) gets a
+-- chance to react -- that is a Roblox engine limit, not something fixable
+-- from here.
 if not getgenv().__MPReconnectHooked then
     getgenv().__MPReconnectHooked = true
-    Players.PlayerRemoving:Connect(function(player)
-        if player == LocalPlayer and getgenv().AutoReconnectEnabled then
+    local reconnectFired = false
+    local function tryReconnect()
+        if reconnectFired then return end
+        reconnectFired = true
+        if getgenv().AutoReconnectEnabled then
             pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
         end
+    end
+    Players.PlayerRemoving:Connect(function(player)
+        if player == LocalPlayer then tryReconnect() end
+    end)
+    LocalPlayer.AncestryChanged:Connect(function(_, parent)
+        if parent ~= Players then tryReconnect() end
     end)
 end
 
