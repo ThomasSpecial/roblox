@@ -156,6 +156,7 @@ local PERSIST_KEYS = {
     "AutoEquipEnabled",
     "AutoDeleteEnabled", "DeleteRarityIds", "DeletePlantsByRarity",
     "AutoCraftEnabled", "CraftRecipeId", "CraftBatchSize",
+    "AutoBuyFruitEnabled", "BuyFruitNames", "AutoBuyItemEnabled", "BuyItemNames",
     "AutoStartWaveEnabled", "AutoStopWaveEnabled", "WaveStopTarget",
     "AutoUpgradeEnabled", "UpgradeStatIds", "UpgradeMaxLevelByStat",
     "AutoRebirthEnabled",
@@ -193,6 +194,10 @@ if e.DeleteRarityIds == nil then e.DeleteRarityIds = {} end
 if e.DeletePlantsByRarity == nil then e.DeletePlantsByRarity = {} end
 if e.AutoCraftEnabled == nil then e.AutoCraftEnabled = false end
 if e.CraftBatchSize == nil then e.CraftBatchSize = 1 end
+if e.AutoBuyFruitEnabled == nil then e.AutoBuyFruitEnabled = false end
+if e.BuyFruitNames == nil then e.BuyFruitNames = {} end
+if e.AutoBuyItemEnabled == nil then e.AutoBuyItemEnabled = false end
+if e.BuyItemNames == nil then e.BuyItemNames = {} end
 if e.AutoStartWaveEnabled == nil then e.AutoStartWaveEnabled = false end
 if e.AutoStopWaveEnabled == nil then e.AutoStopWaveEnabled = false end
 if e.WaveStopTarget == nil then e.WaveStopTarget = 0 end
@@ -522,6 +527,73 @@ local function doAutoCraft()
     local batch = math.max(1, tonumber(e.CraftBatchSize) or 1)
     pcall(function() OnClientGameEvent:BusinessToIdSize("开始制作", recipeId, batch) end)
     craftStatusText = "Started " .. (CRAFT_RECIPE_LABEL_BY_ID[recipeId] or ("recipe " .. recipeId)) .. " x" .. batch
+end
+
+-- ==========================================================================
+-- 3d) Auto Buy Fruit / Auto Buy Item -- both the "Fruit Shop" (道具商店,
+-- confirmed live: PlayConfig.allUseItem ids 1-6, useType==1, all named
+-- "*-Fruit") and the "Item Shop" (道具商店_手雷, confirmed live: ids 7-11,
+-- useType==2, all named "*-Grenade") are separate UI panels but call the
+-- exact same remote: OnClientGameEvent:Buy_Backpack_Item("道具", id)
+-- (confirmed call site, both UseItemStore.ui_Item_buyBut1_OnClick and
+-- UseItemStore_Grenade's own copy of the same handler). Stock is shared:
+-- playData.allUseItemStoreSize[id] (confirmed live, plain array 1-30,
+-- 0 = sold out until the periodic restock) -- both features skip an id
+-- with no stock left instead of firing a call that can't succeed.
+-- Empty selection = buy any in-stock id from that shop, same "empty = any"
+-- convention as Roll/Delete.
+-- ==========================================================================
+local FRUIT_IDS, GRENADE_IDS = { 1, 2, 3, 4, 5, 6 }, { 7, 8, 9, 10, 11 }
+
+local function buildShopOptions(ids)
+    local options, idByName = {}, {}
+    for _, id in ipairs(ids) do
+        local cfg = PlayConfig.allUseItem[id]
+        if cfg then
+            table.insert(options, cfg.name)
+            idByName[cfg.name] = id
+        end
+    end
+    return options, idByName
+end
+local FRUIT_OPTIONS, FRUIT_ID_BY_NAME = buildShopOptions(FRUIT_IDS)
+local ITEM_OPTIONS, ITEM_ID_BY_NAME = buildShopOptions(GRENADE_IDS)
+
+local fruitStatusText = "Toggle is OFF"
+local itemStatusText = "Toggle is OFF"
+
+local function doAutoBuyShop(enabled, selectedNames, idByName, allIds)
+    if not enabled then return "Toggle is OFF" end
+    local data = getData()
+    if not data then return "No data" end
+    local stock = data.playData.allUseItemStoreSize
+    if type(stock) ~= "table" then return "No stock data" end
+
+    local nameSet = nil
+    if type(selectedNames) == "table" and #selectedNames > 0 then
+        nameSet = {}
+        for _, n in ipairs(selectedNames) do
+            local id = idByName[n]
+            if id then nameSet[id] = true end
+        end
+    end
+
+    local bought = 0
+    for _, id in ipairs(allIds) do
+        if (not nameSet or nameSet[id]) and (tonumber(stock[id]) or 0) > 0 then
+            pcall(function() OnClientGameEvent:Buy_Backpack_Item("道具", id) end)
+            bought += 1
+        end
+    end
+    return bought > 0 and ("Bought " .. bought .. " item(s)") or "Nothing in stock right now"
+end
+
+local function doAutoBuyFruit()
+    fruitStatusText = doAutoBuyShop(e.AutoBuyFruitEnabled, e.BuyFruitNames, FRUIT_ID_BY_NAME, FRUIT_IDS)
+end
+
+local function doAutoBuyItem()
+    itemStatusText = doAutoBuyShop(e.AutoBuyItemEnabled, e.BuyItemNames, ITEM_ID_BY_NAME, GRENADE_IDS)
 end
 
 -- ==========================================================================
@@ -1117,6 +1189,7 @@ local Tabs = {
     Farm     = TabGroup:Tab({ Name = "Farm",     Image = "rbxassetid://10734886202" }), -- lucide-map
     Wave     = TabGroup:Tab({ Name = "Wave",     Image = "rbxassetid://10723415903" }), -- reused across roll_anime/anime_fight/new.lua, zap (10723397078) didn't render
     Upgrade  = TabGroup:Tab({ Name = "Upgrade",  Image = "rbxassetid://10734963191" }), -- lucide-sliders-horizontal
+    Shop     = TabGroup:Tab({ Name = "Shop",     Image = "rbxassetid://10734952273" }), -- lucide-shopping-bag
     Boss     = TabGroup:Tab({ Name = "Boss",     Image = "rbxassetid://10734975692" }), -- lucide-swords
     Claims   = TabGroup:Tab({ Name = "Claims",   Image = "rbxassetid://10723396402" }), -- lucide-gift
     Settings = TabGroup:Tab({ Name = "Settings", Image = "rbxassetid://10734950309" }), -- lucide-settings
@@ -1332,7 +1405,9 @@ local deleteRarityDD = FarmRight:Dropdown({
 for _, rarityId in ipairs(RARITY_IDS_ORDERED) do
     local rarityName = RARITY_NAME_BY_ID[rarityId]
     local key = "r" .. rarityId
-    FarmRight:Header({ Text = rarityName })
+    -- No separate Header here -- the Dropdown's own Name already says
+    -- "{rarity} Plant", a header repeating just the rarity name above it
+    -- was pure duplication.
     local pdd = FarmRight:Dropdown({
         Name = rarityName .. " Plant (empty = any)", Options = currentPlantOptions(rarityId), Multi = true, IgnoreConfig = true,
         Callback = function(selectedSet)
@@ -1449,6 +1524,49 @@ UpgradeRight:Toggle({
     Callback = function(v) e.AutoUpgradeEnabled = v; saveState() end,
 }, "AutoUpgradeEnabled")
 local upgradeStatusLabel = UpgradeRight:Label({ Text = "Idle" })
+
+-- ----- Shop Tab -----
+local ShopLeft = Tabs.Shop:Section({ Side = "Left" })
+ShopLeft:Header({ Text = "Auto Buy Fruit" })
+ShopLeft:Toggle({
+    Name = "Auto Buy Fruit", Default = e.AutoBuyFruitEnabled,
+    Callback = function(v) e.AutoBuyFruitEnabled = v; saveState() end,
+}, "AutoBuyFruitEnabled")
+local fruitDD = ShopLeft:Dropdown({
+    Name = "Fruit (empty = any in stock)", Options = FRUIT_OPTIONS, Multi = true, IgnoreConfig = true,
+    Callback = function(selectedSet)
+        local list = {}
+        if type(selectedSet) == "table" then
+            for name, isOn in pairs(selectedSet) do if isOn then table.insert(list, name) end end
+        end
+        e.BuyFruitNames = list
+        saveState()
+    end,
+}, "BuyFruitDropdown")
+if #e.BuyFruitNames > 0 then pcall(function() fruitDD:UpdateSelection(e.BuyFruitNames) end) end
+ShopLeft:Label({ Text = "Fruit Shop (道具商店) -- buys with Gems while stock lasts, refills on the shop's own restock timer" })
+local fruitStatusLabel = ShopLeft:Label({ Text = "Idle" })
+
+local ShopRight = Tabs.Shop:Section({ Side = "Right" })
+ShopRight:Header({ Text = "Auto Buy Item" })
+ShopRight:Toggle({
+    Name = "Auto Buy Item", Default = e.AutoBuyItemEnabled,
+    Callback = function(v) e.AutoBuyItemEnabled = v; saveState() end,
+}, "AutoBuyItemEnabled")
+local itemDD = ShopRight:Dropdown({
+    Name = "Item (empty = any in stock)", Options = ITEM_OPTIONS, Multi = true, IgnoreConfig = true,
+    Callback = function(selectedSet)
+        local list = {}
+        if type(selectedSet) == "table" then
+            for name, isOn in pairs(selectedSet) do if isOn then table.insert(list, name) end end
+        end
+        e.BuyItemNames = list
+        saveState()
+    end,
+}, "BuyItemDropdown")
+if #e.BuyItemNames > 0 then pcall(function() itemDD:UpdateSelection(e.BuyItemNames) end) end
+ShopRight:Label({ Text = "Item Shop (道具商店_手雷) -- same restock timer as the Fruit Shop, separate stock" })
+local itemStatusLabel = ShopRight:Label({ Text = "Idle" })
 
 -- ----- Boss Tab -----
 local BossLeft = Tabs.Boss:Section({ Side = "Left" })
@@ -1667,6 +1785,16 @@ task.spawn(function()
         pcall(doAutoCraft)
         pcall(function() craftStatusLabel:UpdateName(craftStatusText) end)
         task.wait(3)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MPG == myGen do
+        pcall(doAutoBuyFruit)
+        pcall(function() fruitStatusLabel:UpdateName(fruitStatusText) end)
+        pcall(doAutoBuyItem)
+        pcall(function() itemStatusLabel:UpdateName(itemStatusText) end)
+        task.wait(5)
     end
 end)
 
