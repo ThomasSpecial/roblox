@@ -14,6 +14,7 @@ local PLACE_SCRIPTS = {
     -- Ouroboros also covers this place, so registering ours here is a choice, not
     -- a gap being filled -- whichever URL sits on this line is the one that loads.
     [90086669327265]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/cutgrass.lua",  -- +1 Cut Grass Adventure
+    [105954652742326] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/mutant_plants.lua", -- Mutant Plants: Base Defense[World Boss]
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
