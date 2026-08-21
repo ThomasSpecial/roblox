@@ -541,12 +541,30 @@ local function currentWave()
     return (w and w.Value) or 0
 end
 
+-- playData.MainState (confirmed live: plain string, not VarValue-wrapped)
+-- is the real signal upUIs itself uses -- server sets it to "比赛" (battle)
+-- on its own OnServerGameEvent.StartGp confirmation and "自由" (free) on
+-- EndGp. The old version fired StartGp blind every 4s regardless of this,
+-- which is exactly what the real button does NOT do (StartBut_OnClick
+-- no-ops if a match is already running) -- reported live as "doesn't work
+-- after rejoin", most likely a rejoin-timing window where this fired before
+-- something was ready and then had no way to show that in the status text.
+-- Checking MainState directly fixes both: only fires when genuinely idle,
+-- and the status line now says which state it actually saw instead of a
+-- blind "keeping match started" guess.
+local function matchIsRunning(data)
+    local pd = data and data.playData
+    return pd and pd.MainState == "比赛"
+end
+
 local function doAutoWave()
     if not e.AutoStartWaveEnabled and not e.AutoStopWaveEnabled then
         waveStatusText = "Idle"
         return
     end
     local wave = currentWave()
+    local data = getData()
+    local running = matchIsRunning(data)
 
     if e.AutoStopWaveEnabled and tonumber(e.WaveStopTarget) and tonumber(e.WaveStopTarget) > 0
         and wave >= tonumber(e.WaveStopTarget) then
@@ -558,11 +576,13 @@ local function doAutoWave()
         return
     end
 
-    if e.AutoStartWaveEnabled and os.clock() - lastStartGpFire > 4 then
+    if e.AutoStartWaveEnabled and not running and os.clock() - lastStartGpFire > 4 then
         pcall(function() OnClientGameEvent:StartGp() end)
         lastStartGpFire = os.clock()
+        waveStatusText = "Wave " .. wave .. " -- MainState idle, requesting start"
+        return
     end
-    waveStatusText = "Wave " .. wave .. (e.AutoStartWaveEnabled and " -- keeping match started" or "")
+    waveStatusText = "Wave " .. wave .. (e.AutoStartWaveEnabled and (running and " -- match running" or " -- waiting to retry start") or "")
 end
 
 -- ==========================================================================
@@ -924,16 +944,49 @@ unitsFolder = unitsFolder and unitsFolder:FindFirstChild("业务")
 unitsFolder = unitsFolder and unitsFolder:FindFirstChild("单位")
 local HIDE_OTHER_BASES_RADIUS = 80
 
-local hiddenBaseParts = {}
+-- hiddenInstances tracks every non-BasePart thing touched (name/DPS labels,
+-- particles, trails) so the exact prior state comes back on restore instead
+-- of guessing a default. BaseParts don't need this -- LocalTransparencyModifier
+-- has its own always-correct "off" value (0), no original to remember.
+local hiddenParts = {}
+local hiddenInstances = {}
+
 local function setModelHidden(model, hidden)
     for _, d in ipairs(model:GetDescendants()) do
         if d:IsA("BasePart") then
             if hidden then
-                if hiddenBaseParts[d] == nil then hiddenBaseParts[d] = true end
+                hiddenParts[d] = true
                 d.LocalTransparencyModifier = 1
-            elseif hiddenBaseParts[d] then
+            elseif hiddenParts[d] then
                 d.LocalTransparencyModifier = 0
-                hiddenBaseParts[d] = nil
+                hiddenParts[d] = nil
+            end
+        elseif d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") or d:IsA("Smoke") or d:IsA("Fire") then
+            if hidden then
+                if hiddenInstances[d] == nil then hiddenInstances[d] = d.Enabled end
+                d.Enabled = false
+            elseif hiddenInstances[d] ~= nil then
+                d.Enabled = hiddenInstances[d]
+                hiddenInstances[d] = nil
+            end
+        elseif d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+            -- the name/DPS/rarity labels floating over a placed unit --
+            -- these are GUIs, not BaseParts, LocalTransparencyModifier does
+            -- nothing to them.
+            if hidden then
+                if hiddenInstances[d] == nil then hiddenInstances[d] = d.Enabled end
+                d.Enabled = false
+            elseif hiddenInstances[d] ~= nil then
+                d.Enabled = hiddenInstances[d]
+                hiddenInstances[d] = nil
+            end
+        elseif d:IsA("Decal") or d:IsA("Texture") then
+            if hidden then
+                if hiddenInstances[d] == nil then hiddenInstances[d] = d.Transparency end
+                d.Transparency = 1
+            elseif hiddenInstances[d] ~= nil then
+                d.Transparency = hiddenInstances[d]
+                hiddenInstances[d] = nil
             end
         end
     end
@@ -966,10 +1019,21 @@ local function applyHideOtherBases(enabled)
         end
     end
     if not enabled then
-        for part in pairs(hiddenBaseParts) do
+        for part in pairs(hiddenParts) do
             pcall(function() if part.Parent then part.LocalTransparencyModifier = 0 end end)
         end
-        table.clear(hiddenBaseParts)
+        table.clear(hiddenParts)
+        for inst, original in pairs(hiddenInstances) do
+            pcall(function()
+                if not inst.Parent then return end
+                if inst:IsA("Decal") or inst:IsA("Texture") then
+                    inst.Transparency = original
+                else
+                    inst.Enabled = original
+                end
+            end)
+        end
+        table.clear(hiddenInstances)
     end
 end
 
@@ -1268,7 +1332,7 @@ local deleteRarityDD = FarmRight:Dropdown({
 for _, rarityId in ipairs(RARITY_IDS_ORDERED) do
     local rarityName = RARITY_NAME_BY_ID[rarityId]
     local key = "r" .. rarityId
-    FarmRight:Header({ Text = "Delete: " .. rarityName })
+    FarmRight:Header({ Text = rarityName })
     local pdd = FarmRight:Dropdown({
         Name = rarityName .. " Plant (empty = any)", Options = currentPlantOptions(rarityId), Multi = true, IgnoreConfig = true,
         Callback = function(selectedSet)
