@@ -1292,7 +1292,33 @@ if not getgenv().__MPReconnectHooked then
     LocalPlayer.AncestryChanged:Connect(function(_, parent)
         if parent ~= Players then tryReconnect() end
     end)
+    -- Third trigger, confirmed necessary live: watched all 3 accounts sit on
+    -- the native "Disconnected -- Error Code 277" dialog with Auto Reconnect
+    -- doing nothing, because that failure mode is the engine's own transport
+    -- dying underneath an otherwise-intact DataModel -- LocalPlayer.Parent
+    -- never left Players, so neither hook above ever fired. Confirmed a
+    -- plain TeleportService:Teleport() call still works from inside that
+    -- state (tested live on all 3), so this just needs to notice the dialog
+    -- and fire the same tryReconnect. CoreGui is small enough that a full
+    -- GetDescendants() scan every 5s is negligible.
+    getgenv().__MPTryReconnect = tryReconnect
 end
+
+task.spawn(function()
+    while getgenv().__MPG == myGen do
+        task.wait(5)
+        if getgenv().AutoReconnectEnabled and getgenv().__MPTryReconnect then
+            pcall(function()
+                for _, inst in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+                    if inst:IsA("TextLabel") and inst.Text == "Disconnected" then
+                        getgenv().__MPTryReconnect()
+                        return
+                    end
+                end
+            end)
+        end
+    end
+end)
 
 -- ==========================================================================
 -- UI
