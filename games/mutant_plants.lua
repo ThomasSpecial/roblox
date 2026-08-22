@@ -326,6 +326,29 @@ local function doAutoRoll()
     local pool = data and data.serverData and data.serverData.rollUnitPool
     if type(pool) ~= "table" then rollStatusText = "No roll pool data"; return end
 
+    -- The GAME'S OWN native auto-roll (serverData.aotuRollOpen) runs on its
+    -- own server-driven timer -- confirmed live via RNG_单位_c.
+    -- CheckAutoRollOnce(): whenever it's on, it independently fires
+    -- OnClientGameEvent:AutoBusiness("RNG_单位") (a DIFFERENT remote than
+    -- the Business("RNG_单位") this script uses) and
+    -- AutoBuy_Backpack_Item against its OWN filter
+    -- (aotuRollUnitRarity/aotuRollUnitMaterialRarity), completely outside
+    -- this loop's control. Confirmed live root cause of a stray Common-
+    -- rarity unit landing in hand despite RollRarityIds only containing
+    -- Secret: the buy loop below fires AutoBuy_Backpack_Item by SLOT INDEX,
+    -- not by unit id -- if the native system re-rolls that same slot in the
+    -- gap between this script validating its contents and the buy landing,
+    -- the purchase can resolve against whatever the native roll just swapped
+    -- in instead of what was actually checked. Toggling it off here (once,
+    -- only when it's actually on -- Business("自动抽取单位_是否开启") is a
+    -- flip, not an explicit on/off) removes the race categorically instead
+    -- of trying to out-time it.
+    if data.serverData.aotuRollOpen then
+        pcall(function() OnClientGameEvent:Business("自动抽取单位_是否开启") end)
+        rollStatusText = "Native Auto Roll was ON -- turned it off (it was racing this script's buys)"
+        return
+    end
+
     -- Firing while the lock is still set gets silently REJECTED server-side
     -- -- confirmed live by instrumented testing: pool never changes, the
     -- roll just never happened, and the old 1.5s poll below burned its
