@@ -326,9 +326,19 @@ local function doAutoRoll()
     local pool = data and data.serverData and data.serverData.rollUnitPool
     if type(pool) ~= "table" then rollStatusText = "No roll pool data"; return end
 
-    -- Wait for the game's own animation lock to clear before firing --
-    -- 3s ceiling in case it ever gets stuck, so this can't hang forever.
-    local lockDeadline = os.clock() + 3
+    -- Firing while the lock is still set gets silently REJECTED server-side
+    -- -- confirmed live by instrumented testing: pool never changes, the
+    -- roll just never happened, and the old 1.5s poll below burned its
+    -- entire timeout waiting on a result that was never coming. The old 3s
+    -- ceiling on this wait existed "in case it gets stuck," but real timing
+    -- data (7 consecutive rolls, same account) showed the lock consistently
+    -- holds for ~2.0-2.03s -- close enough to that 3s ceiling that a slow
+    -- tick could clip it, fire into a still-active lock, and produce exactly
+    -- the "rolls twice then stalls" pattern reported. No ceiling now (just
+    -- a 10s last-resort in case the lock itself ever truly wedges, which
+    -- isn't normal pacing) -- waiting it out is never wasted since firing
+    -- early is proven to be pure waste instead.
+    local lockDeadline = os.clock() + 10
     while FrameworkLink.Update[RNGRollScript] ~= nil and os.clock() < lockDeadline do
         task.wait(0.03)
     end
@@ -336,9 +346,18 @@ local function doAutoRoll()
     local before = { pool[1], pool[2], pool[3] }
     pcall(function() OnClientGameEvent:Business("RNG_单位") end)
 
+    -- Real successful rolls resolve in ~70-100ms (confirmed live). If 300ms
+    -- pass with no pool change AND the lock never even engaged, this fire
+    -- was rejected outright (the lock-wait above should prevent that now,
+    -- but this is the recovery path if it ever still happens) -- bail
+    -- immediately instead of sitting through the rest of a 1.5s timeout
+    -- that was never going to resolve, so the next cycle can re-wait on
+    -- the lock properly right away.
     local pollDeadline = os.clock() + 1.5
+    local fastBailAt = os.clock() + 0.3
     while os.clock() < pollDeadline do
         if pool[1] ~= before[1] or pool[2] ~= before[2] or pool[3] ~= before[3] then break end
+        if os.clock() > fastBailAt and FrameworkLink.Update[RNGRollScript] == nil then break end
         task.wait(0.03)
     end
 
