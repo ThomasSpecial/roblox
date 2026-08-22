@@ -1953,11 +1953,25 @@ trackConfigElement(SettingsRight:Button({
         applyDataToGenv(data, true)
         updateConfigStatus("Loaded '" .. selectedConfigName .. "' -- reloading UI...")
         task.spawn(function()
+            -- Fetch BEFORE yielding -- network latency alone gives the click
+            -- handler's coroutine plenty of room to fully return. The
+            -- task.wait after is the part that actually matters: calling
+            -- compiledFn() (which Unloads *this* window) synchronously from
+            -- inside that window's own MouseButton1Click coroutine hit the
+            -- same reentrancy shape this repo already fixed once before
+            -- (65bc10b, "Maximum re-entrancy depth exceeded") -- confirmed
+            -- live here too: the direct call silently dropped the entire
+            -- Settings-Right section (Save Mode toggle included) on the
+            -- rebuilt window with no visible error, because the old pcall
+            -- swallowed it. One frame of separation from the signal that
+            -- triggered this fixed it the same way it did last time.
             local okFetch, body = pcall(function() return game:HttpGet(SELF_URL) end)
             if not okFetch then warn("[MutantPlants] Reload after Load Config failed: " .. tostring(body)); return end
             local compiledFn, err = loadstring(body)
             if not compiledFn then warn("[MutantPlants] Reload compile failed: " .. tostring(err)); return end
-            pcall(compiledFn)
+            task.wait(0.2)
+            local okRun, runErr = pcall(compiledFn)
+            if not okRun then warn("[MutantPlants] Reload run failed: " .. tostring(runErr)) end
         end)
     end,
 }, "MPLoadConfigButton"))
