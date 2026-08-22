@@ -1263,10 +1263,25 @@ end)
 -- from here.
 if not getgenv().__MPReconnectHooked then
     getgenv().__MPReconnectHooked = true
+    -- reconnectFired only debounces PlayerRemoving + AncestryChanged both
+    -- firing for the SAME disconnect (so Teleport doesn't get called twice
+    -- for one incident) -- it is NOT meant to be a lifetime latch. Confirmed
+    -- live this was the actual "Auto Reconnect stopped working" bug: this
+    -- whole block only ever runs once per real Roblox process (guarded by
+    -- __MPReconnectHooked, which getgenv() correctly keeps true across every
+    -- teleport-triggered rejoin), but reconnectFired never reset back to
+    -- false after firing -- so the FIRST disconnect of the whole session
+    -- reconnected fine, and every disconnect after that silently no-opped
+    -- forever, since tryReconnect's guard clause never let a second call
+    -- through. Resetting it a few seconds after firing fixes the debounce
+    -- without breaking that one-shot-per-session assumption -- by then the
+    -- client has either already left for the teleport, or the teleport
+    -- pcall failed and this is exactly when a retry should be allowed again.
     local reconnectFired = false
     local function tryReconnect()
         if reconnectFired then return end
         reconnectFired = true
+        task.delay(5, function() reconnectFired = false end)
         if getgenv().AutoReconnectEnabled then
             pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
         end
