@@ -65,6 +65,14 @@ local PlayConfig = require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("
 local MainBusiness = require(Business:WaitForChild("MainBusiness"))
 local BigNumber = require(ReplicatedStorage:WaitForChild("Framework"):WaitForChild("X0000"):WaitForChild("BigNumber"))
 
+-- This script's own raw URL -- the exact one loader.lua's PLACE_SCRIPTS table
+-- dispatches this PlaceId to. Used only by the Config "Load Config" button to
+-- self-reload with new getgenv() values already applied (same HttpGet ->
+-- loadstring -> call() shape as the loader itself, so the __MPG-bump/
+-- Unload-old-window teardown at the top of this file runs exactly the same
+-- way it does on a normal re-execute).
+local SELF_URL = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/mutant_plants.lua"
+
 local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
 local BusinessModules = PlayerScripts:WaitForChild("BusinessModules")
 -- C_Data specifically -- NOT PlayerScripts.Business.C_Data. That clone is
@@ -146,10 +154,14 @@ local function unitSpecies(cfg)
     return cfg.name
 end
 
--- ===== Auto Save =====
+-- ===== Save System: Auto Save (state.json) + Manual named Configs =====
 local SAVE_FOLDER = "MutantPlantsAutomation"
 local SAVE_FILE = SAVE_FOLDER .. "/state.json"
+local CONFIG_FOLDER = SAVE_FOLDER .. "/configs"
+local MODE_FILE = SAVE_FOLDER .. "/mode.txt"
+local AUTOLOAD_FILE = SAVE_FOLDER .. "/autoload.txt"
 pcall(function() if not isfolder(SAVE_FOLDER) then makefolder(SAVE_FOLDER) end end)
+pcall(function() if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end end)
 local PERSIST_KEYS = {
     "RollRarityIds", "RollPlantsByRarity", "RollMutationsByRarity", "AutoRollBuyEnabled",
     "AutoMergeEnabled",
@@ -166,17 +178,61 @@ local PERSIST_KEYS = {
     "AutoZoneBossEnabled", "ZoneBossMode", "ZoneBossPokeSeconds",
     "AntiAFKEnabled", "AutoReconnectEnabled", "BoostFpsEnabled", "HideOtherBasesEnabled",
 }
-local function loadPersistedState()
-    local ok, content = pcall(function() return readfile(SAVE_FILE) end)
-    if not ok or not content or content == "" then return end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
-    if not ok2 or type(data) ~= "table" then return end
+local function readTextFile(path)
+    local ok, content = pcall(function() return readfile(path) end)
+    if ok and content and content ~= "" then return content end
+    return nil
+end
+local function configPath(name)
+    return CONFIG_FOLDER .. "/" .. name .. ".json"
+end
+-- forceOverwrite=false (state.json's own load, and a Manual-mode AutoLoad
+-- config at startup) keeps the "only fill what's still nil" behavior a
+-- fresh session needs. forceOverwrite=true (Load Config button, mid-session)
+-- replaces whatever's already running -- that's the whole point of Load.
+local function applyDataToGenv(data, forceOverwrite)
     for _, key in ipairs(PERSIST_KEYS) do
-        if data[key] ~= nil and getgenv()[key] == nil then getgenv()[key] = data[key] end
+        if data[key] ~= nil and (forceOverwrite or getgenv()[key] == nil) then
+            getgenv()[key] = data[key]
+        end
     end
 end
-loadPersistedState()
+local function loadPersistedState()
+    local content = readTextFile(SAVE_FILE)
+    if not content then return end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if ok2 and type(data) == "table" then applyDataToGenv(data, false) end
+end
+
+-- ManualSaveMode lives in its own MODE_FILE, outside PERSIST_KEYS/state.json
+-- and outside every named Config -- so loading an old config (or one saved
+-- before this feature existed) can never silently flip the save mode out
+-- from under you. Read once per real session (getgenv() survives a Load
+-- Config self-reload, so this only ever re-reads disk on a truly fresh run).
+if getgenv().ManualSaveMode == nil then
+    getgenv().ManualSaveMode = readTextFile(MODE_FILE) == "manual"
+end
+if getgenv().ManualSaveMode then
+    -- Manual mode skips state.json entirely -- the only thing that loads
+    -- automatically is whichever Config (if any) is marked AutoLoad.
+    local autoLoadName = readTextFile(AUTOLOAD_FILE)
+    if autoLoadName then
+        local content = readTextFile(configPath(autoLoadName))
+        if content then
+            local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+            if ok2 and type(data) == "table" then applyDataToGenv(data, false) end
+        end
+    end
+else
+    loadPersistedState()
+end
+
 local function saveState()
+    -- The entire point of Manual mode: every one of the ~30 existing
+    -- Callback = function(v) e.X = v; saveState() end call sites across
+    -- this file goes quiet with this one early return, no per-callsite
+    -- edits needed.
+    if getgenv().ManualSaveMode then return end
     local data = {}
     for _, key in ipairs(PERSIST_KEYS) do data[key] = getgenv()[key] end
     pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(data)) end)
@@ -1768,7 +1824,203 @@ pcall(function()
     }, "MutantPlantsToggleUIKeybind")
 end)
 SettingsLeft:Header({ Text = "Auto Save" })
-SettingsLeft:Label({ Text = "Auto-saved to " .. SAVE_FILE })
+SettingsLeft:Label({ Text = "Auto-saved to " .. SAVE_FILE .. " (only while Manual Save Mode, right, is OFF)" })
+
+-- ----- Settings Tab, Right: Save Mode + named Config profiles -----
+-- Two systems, mutually exclusive by getgenv().ManualSaveMode (flipped by
+-- the toggle below, read at the top of this file before the UI even
+-- builds): Auto (left) keeps writing state.json on every change like
+-- before. Manual turns that off -- saveState() no-ops -- and instead you
+-- snapshot the live getgenv() settings into named files under
+-- CONFIG_FOLDER, load one back explicitly, and optionally mark one
+-- AutoLoad so a fresh session picks it up without state.json at all.
+local SettingsRight = Tabs.Settings:Section({ Side = "Right" })
+
+-- Config Create/List only matter once Manual mode is on -- Auto Save keeps
+-- doing its thing with none of this in view. Every element below that
+-- belongs to that section gets wrapped in trackConfigElement() and hidden
+-- until the toggle flips it on, instead of cluttering the tab permanently.
+local configSectionElements = {}
+local function trackConfigElement(el)
+    table.insert(configSectionElements, el)
+    return el
+end
+local function setConfigSectionVisible(v)
+    for _, el in ipairs(configSectionElements) do
+        pcall(function() el:SetVisibility(v) end)
+    end
+end
+
+SettingsRight:Header({ Text = "Save Mode" })
+SettingsRight:Toggle({
+    Name = "Manual Save Mode", Default = e.ManualSaveMode,
+    Callback = function(v)
+        e.ManualSaveMode = v
+        pcall(function() writefile(MODE_FILE, v and "manual" or "auto") end)
+        setConfigSectionVisible(v)
+    end,
+}, "ManualSaveMode")
+SettingsRight:Label({ Text = "OFF: every change auto-saves (default).\nON: nothing auto-saves -- use Configs below." })
+
+trackConfigElement(SettingsRight:Header({ Text = "Config Create" }))
+local configNameInput = trackConfigElement(safeInput(SettingsRight, {
+    Name = "Config Name", Placeholder = "e.g. Farming", Default = "",
+}, "MPConfigNameInput"))
+
+local configDropdown, autoLoadLabel, configStatusLabel
+local selectedConfigName = nil
+
+local function sanitizeConfigName(raw)
+    local name = tostring(raw or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return (name:gsub("[^%w _%-]", ""))
+end
+
+-- listfiles() returns full paths -- name:match strips folder + extension,
+-- handling both "/" and "\\" separators since executors differ on this.
+local function listConfigNames()
+    local names = {}
+    local ok, files = pcall(listfiles, CONFIG_FOLDER)
+    if ok and type(files) == "table" then
+        for _, path in ipairs(files) do
+            local name = path:match("([^/\\]+)%.json$")
+            if name then table.insert(names, name) end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function writeConfigSnapshot(name)
+    local data = {}
+    for _, key in ipairs(PERSIST_KEYS) do data[key] = getgenv()[key] end
+    return pcall(function() writefile(configPath(name), HttpService:JSONEncode(data)) end)
+end
+
+local function updateConfigStatus(msg)
+    pcall(function() configStatusLabel:UpdateName(msg) end)
+end
+
+local function refreshConfigDropdown()
+    local names = listConfigNames()
+    pcall(function() configDropdown:ClearOptions() end)
+    pcall(function() configDropdown:InsertOptions(names) end)
+    if selectedConfigName and not table.find(names, selectedConfigName) then
+        selectedConfigName = nil
+    end
+end
+
+local function refreshAutoLoadLabel()
+    local name = readTextFile(AUTOLOAD_FILE)
+    pcall(function() autoLoadLabel:UpdateName("Current AutoLoad Config: " .. (name or "(none)")) end)
+end
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Create Config",
+    Callback = function()
+        local okInput, raw = pcall(function() return configNameInput:GetInput() end)
+        local name = sanitizeConfigName(okInput and raw or "")
+        if name == "" then updateConfigStatus("Type a name first"); return end
+        if table.find(listConfigNames(), name) then
+            updateConfigStatus("'" .. name .. "' already exists -- use Overwrite")
+            return
+        end
+        local ok = writeConfigSnapshot(name)
+        updateConfigStatus(ok and ("Created '" .. name .. "'") or "Write failed")
+        refreshConfigDropdown()
+    end,
+}, "MPCreateConfigButton"))
+
+trackConfigElement(SettingsRight:Header({ Text = "Config List" }))
+configDropdown = trackConfigElement(SettingsRight:Dropdown({
+    Name = "Configs", Options = listConfigNames(), Multi = false, Search = true,
+    Callback = function(selected) selectedConfigName = selected end,
+}, "MPConfigDropdown"))
+
+-- Placing into an already-running window mid-session (not a fresh join) --
+-- so Load doesn't try to hot-patch ~30 live Toggles/Dropdowns one by one.
+-- It force-applies the config into getgenv(), then re-fetches and re-runs
+-- this exact script from SELF_URL, same HttpGet->loadstring->call() shape
+-- as loader.lua -- which is the same __MPG-bump/Unload-old-window path
+-- already proven safe every time this file gets manually reloaded.
+trackConfigElement(SettingsRight:Button({
+    Name = "Load Config",
+    Callback = function()
+        if not selectedConfigName then updateConfigStatus("Pick a config first"); return end
+        local content = readTextFile(configPath(selectedConfigName))
+        if not content then updateConfigStatus("Config file missing"); return end
+        local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+        if not ok2 or type(data) ~= "table" then updateConfigStatus("Corrupt config file"); return end
+        applyDataToGenv(data, true)
+        updateConfigStatus("Loaded '" .. selectedConfigName .. "' -- reloading UI...")
+        task.spawn(function()
+            local okFetch, body = pcall(function() return game:HttpGet(SELF_URL) end)
+            if not okFetch then warn("[MutantPlants] Reload after Load Config failed: " .. tostring(body)); return end
+            local compiledFn, err = loadstring(body)
+            if not compiledFn then warn("[MutantPlants] Reload compile failed: " .. tostring(err)); return end
+            pcall(compiledFn)
+        end)
+    end,
+}, "MPLoadConfigButton"))
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Overwrite Config",
+    Callback = function()
+        if not selectedConfigName then updateConfigStatus("Pick a config first"); return end
+        local ok = writeConfigSnapshot(selectedConfigName)
+        updateConfigStatus(ok and ("Overwrote '" .. selectedConfigName .. "'") or "Write failed")
+    end,
+}, "MPOverwriteConfigButton"))
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Delete Config",
+    Callback = function()
+        if not selectedConfigName then updateConfigStatus("Pick a config first"); return end
+        local name = selectedConfigName
+        pcall(function() delfile(configPath(name)) end)
+        if readTextFile(AUTOLOAD_FILE) == name then
+            pcall(function() writefile(AUTOLOAD_FILE, "") end)
+            refreshAutoLoadLabel()
+        end
+        selectedConfigName = nil
+        updateConfigStatus("Deleted '" .. name .. "'")
+        refreshConfigDropdown()
+    end,
+}, "MPDeleteConfigButton"))
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Refresh List",
+    Callback = function() refreshConfigDropdown(); updateConfigStatus("List refreshed") end,
+}, "MPRefreshConfigListButton"))
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Set as AutoLoad",
+    Callback = function()
+        if not selectedConfigName then updateConfigStatus("Pick a config first"); return end
+        local ok = pcall(function() writefile(AUTOLOAD_FILE, selectedConfigName) end)
+        if ok then
+            refreshAutoLoadLabel()
+            updateConfigStatus("AutoLoad set to '" .. selectedConfigName .. "'")
+        else
+            updateConfigStatus("Write failed")
+        end
+    end,
+}, "MPSetAutoLoadButton"))
+
+trackConfigElement(SettingsRight:Button({
+    Name = "Reset AutoLoad",
+    Callback = function()
+        pcall(function() writefile(AUTOLOAD_FILE, "") end)
+        refreshAutoLoadLabel()
+        updateConfigStatus("AutoLoad cleared")
+    end,
+}, "MPResetAutoLoadButton"))
+
+autoLoadLabel = trackConfigElement(SettingsRight:Label({ Text = "Current AutoLoad Config: " .. (readTextFile(AUTOLOAD_FILE) or "(none)") }))
+configStatusLabel = trackConfigElement(SettingsRight:Label({ Text = "" }))
+
+-- Initial visibility -- everything above starts hidden unless the account
+-- was already in Manual mode when this session's UI first built.
+setConfigSectionVisible(e.ManualSaveMode)
 
 -- ===== Background loops =====
 task.spawn(function()
