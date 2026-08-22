@@ -1317,6 +1317,28 @@ task.spawn(function()
                 end
             end)
         end
+
+        -- The game's own loading screen (PlayerGui.最初.加载界面) has been
+        -- observed live sitting at its own 100% progress (25/25) and never
+        -- dismissing itself, even though the game underneath was already
+        -- fully loaded and running the whole time -- confirmed live:
+        -- character spawned, leaderstats replicating, Wave counting up,
+        -- this script's own window already built and functioning, all
+        -- while that overlay just sat there. Character existing is a much
+        -- stronger "actually loaded" signal than that screen's own progress
+        -- bar (which is exactly what got stuck), so once it's there this
+        -- just force-hides the overlay -- not gated by AutoReconnectEnabled,
+        -- since this isn't a reconnect, it's a stuck-UI cleanup with no
+        -- gameplay side effect either way.
+        pcall(function()
+            if LocalPlayer.Character then
+                local gui = LocalPlayer.PlayerGui:FindFirstChild("最初")
+                local loadScreen = gui and gui:FindFirstChild("加载界面")
+                if loadScreen and loadScreen.Visible then
+                    loadScreen.Visible = false
+                end
+            end
+        end)
     end
 end)
 
