@@ -343,8 +343,33 @@ local function doAutoEquip()
         return
     end
 
-    local function scoreUnit(cfg, card)
-        return (cfg.rarity or 0) * 1000 + (cfg.MaterialRarity or 0) * 10 + (card and card.star or 0)
+    -- Real DPS, not a rarity/mutation/star proxy -- confirmed live the proxy
+    -- ranked wrong (a rarity7/mat1/star5 "Corn" scored ABOVE a rarity7/mat1/
+    -- star1 "Flytrap" despite the Flytrap doing 3x the actual DPS, because
+    -- attack and attack speed are per-species base stats the proxy never
+    -- looked at). MainBusiness.Get_UnitDps(bestUnitAtk, card, AtkRep,
+    -- atkSpeedRep) is the exact function the game's own DPS labels call
+    -- (confirmed call sites: 基本操作_c line 325, MainBackpack line 442) --
+    -- it internally does Get_UnitAtkCfg(...) / Get_UnitAtkCd(cfgId,
+    -- atkSpeedRep) and returns a BigNumber, same representation as
+    -- BigNumber.GetStr() displays ("7.17M" etc). BigCompareNoEqual(a, b) is
+    -- "a > b" as a boolean, not a signed int -- caught that the same way as
+    -- the World Boss DPS calculator earlier.
+    local bestUnitAtk = pd.bestUnitAtk and pd.bestUnitAtk.Value
+    local atkRep = pd.AtkRep and pd.AtkRep.Value
+    local atkSpeedRep = pd.atkSpeedRep and pd.atkSpeedRep.Value
+    if bestUnitAtk == nil or atkRep == nil or atkSpeedRep == nil then
+        equipStatusText = "No atk stat data (not in a match?)"
+        return
+    end
+
+    local function dpsOf(card)
+        local ok, v = pcall(function() return MainBusiness.Get_UnitDps(bestUnitAtk, card, atkRep, atkSpeedRep) end)
+        return ok and v or BigNumber.GetZero()
+    end
+    local function dpsGreater(a, b)
+        local ok, v = pcall(BigNumber.BigCompareNoEqual, a, b)
+        return ok and v or false
     end
 
     local handShowSize = PlayConfig.handShowSize or 6
@@ -352,15 +377,12 @@ local function doAutoEquip()
     for i = 1, handShowSize do
         local cardId = pd.hand[i]
         local card = cardId and pd.allCard[cardId]
-        if card and card.typeId == 1 then
-            local cfg = PlayConfig.allUnit[card.cfgId]
-            if cfg then
-                table.insert(candidates, { handIndex = i, score = scoreUnit(cfg, card) })
-            end
+        if card and card.typeId == 1 and PlayConfig.allUnit[card.cfgId] then
+            table.insert(candidates, { handIndex = i, score = dpsOf(card) })
         end
     end
     if #candidates == 0 then equipStatusText = "No units in hand"; return end
-    table.sort(candidates, function(a, b) return a.score > b.score end)
+    table.sort(candidates, function(a, b) return dpsGreater(a.score, b.score) end)
 
     -- serverData.sceneUnit, NOT playData.sceneUnit -- confirmed live that
     -- playData.sceneUnit is a VarValue wrapper object (AddSet/Set/SetAll
@@ -372,23 +394,26 @@ local function doAutoEquip()
     -- separate unequip call needed, and the bumped Chomper card reappeared
     -- back in pd.hand at the vacated index. So the fix isn't a new remote --
     -- it's scoring occupied slots too instead of skipping them.
+    local zero = BigNumber.GetZero()
     local slots = {}
     for j = 1, 14 do
         local unlocked = true
         pcall(function() unlocked = sd.sceneUnitChunkUnlock and sd.sceneUnitChunkUnlock[j] == true end)
         if unlocked then
             local occupied = sd.sceneUnit and sd.sceneUnit[j]
-            local slotScore = -1
+            local slotScore, isEmpty = zero, true
             if occupied and occupied ~= 0 then
                 local placedCard = pd.allCard[occupied]
-                local placedCfg = placedCard and PlayConfig.allUnit[placedCard.cfgId]
-                if placedCfg then slotScore = scoreUnit(placedCfg, placedCard) end
+                if placedCard and PlayConfig.allUnit[placedCard.cfgId] then
+                    slotScore = dpsOf(placedCard)
+                    isEmpty = false
+                end
             end
-            table.insert(slots, { slot = j, score = slotScore })
+            table.insert(slots, { slot = j, score = slotScore, isEmpty = isEmpty })
         end
     end
     if #slots == 0 then equipStatusText = "No unlocked slots"; return end
-    table.sort(slots, function(a, b) return a.score < b.score end) -- worst slot first
+    table.sort(slots, function(a, b) return dpsGreater(b.score, a.score) end) -- worst slot first
 
     local placed, replaced = 0, 0
     local slotIdx = 1
@@ -398,13 +423,13 @@ local function doAutoEquip()
         -- slots ascending + candidates descending: once the best remaining
         -- hand card can't beat the worst remaining slot, none of the rest
         -- can either -- stop instead of scanning the whole board.
-        if cand.score <= target.score then break end
+        if not dpsGreater(cand.score, target.score) then break end
         pcall(function() OnClientGameEvent:SelectHandUnit(cand.handIndex) end)
         task.wait(0.1)
         pcall(function() OnClientGameEvent:BusinessToId("放置_单位", target.slot) end)
         task.wait(0.15)
         placed += 1
-        if target.score >= 0 then replaced += 1 end
+        if not target.isEmpty then replaced += 1 end
         slotIdx += 1
     end
 
