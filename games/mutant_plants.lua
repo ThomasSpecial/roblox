@@ -305,7 +305,13 @@ if e.HideOtherBasesEnabled == nil then e.HideOtherBasesEnabled = false end
 -- the next roll the instant the game itself says it's safe to, no fixed
 -- "skip the animation" guess involved.
 -- ==========================================================================
-local rollStatusText = "Toggle is OFF"
+-- Status lives in getgenv(), not a local -- the catcher hook below is
+-- installed ONCE per real Roblox process (guarded, survives every reload of
+-- this script) so a local variable here would only ever be visible to the
+-- generation that first installed it. Routing through getgenv() lets every
+-- later generation's own status label read whatever the (possibly older)
+-- catcher closure last wrote.
+if getgenv().__MPRollStatus == nil then getgenv().__MPRollStatus = "Toggle is OFF" end
 
 local function rollMatchesFilter(cfg, raritySet)
     if not raritySet[cfg.rarity] then return false end
@@ -316,62 +322,83 @@ local function rollMatchesFilter(cfg, raritySet)
     return true
 end
 
-local function doAutoRoll()
-    if not e.AutoRollBuyEnabled then rollStatusText = "Toggle is OFF"; return end
-    if #e.RollRarityIds == 0 then rollStatusText = "Pick at least one Rarity first"; return end
-    local raritySet = {}
-    for _, id in ipairs(e.RollRarityIds) do raritySet[id] = true end
+-- Catches EVERY roll result as fast as this can react, regardless of which
+-- roller produced it -- this script's own Business("RNG_单位") fired from
+-- doAutoRoll below, OR the game's own native auto-roll if the user runs
+-- both together for extra throughput (confirmed live that's a real,
+-- intentional setup, not a misconfiguration -- doAutoRoll here does NOT
+-- disable serverData.aotuRollOpen, on request).
+-- The old version polled serverData.rollUnitPool every 30ms, but only in a
+-- short window right after firing its OWN roll -- fine for a roll THIS
+-- script triggered, but blind to one the native roller fires in between
+-- those windows. Confirmed live that gap is exactly how a matching Secret
+-- got missed: a match landed and then got overwritten by a second roll
+-- (from either roller) before this script ever looked again.
+-- Tried hooking playData.rollUnitPool:AddSetEnd for a true zero-poll,
+-- event-driven catch (that's the exact call RNG_单位_c's own UI-refresh
+-- code uses on this field) -- confirmed LIVE with a raw fire-counter that
+-- it never actually fires for this field in this environment (0 calls
+-- after a real roll + 1s wait, tested twice), so that idea is dropped
+-- rather than shipped on an assumption that didn't hold up. This instead
+-- runs a dedicated watcher every render step (task.wait() with no
+-- argument, ~16ms at 60fps -- about 2x tighter than the old 30ms poll)
+-- for as long as Auto Roll is on, independent of which roller is firing,
+-- so the gap a native-triggered roll could hide in shrinks close to a
+-- single frame instead of disappearing between this script's own fire
+-- cycles entirely.
+task.spawn(function()
+    local lastSeen = {}
+    while getgenv().__MPG == myGen do
+        if getgenv().AutoRollBuyEnabled then
+            local rarityIds = getgenv().RollRarityIds
+            if type(rarityIds) == "table" and #rarityIds > 0 then
+                local data = getData()
+                local pool = data and data.serverData and data.serverData.rollUnitPool
+                if type(pool) == "table"
+                    and (pool[1] ~= lastSeen[1] or pool[2] ~= lastSeen[2] or pool[3] ~= lastSeen[3]) then
+                    lastSeen[1], lastSeen[2], lastSeen[3] = pool[1], pool[2], pool[3]
+                    local raritySet = {}
+                    for _, id in ipairs(rarityIds) do raritySet[id] = true end
+                    local bought = 0
+                    for slot, cfgId in ipairs(pool) do
+                        local cfg = cfgId and PlayConfig.allUnit[cfgId]
+                        if cfg and rollMatchesFilter(cfg, raritySet) then
+                            pcall(function() OnClientGameEvent:AutoBuy_Backpack_Item("RNG_单位", slot) end)
+                            bought += 1
+                        end
+                    end
+                    if bought > 0 then
+                        getgenv().__MPRollStatus = "Caught " .. bought .. " match(es)"
+                    end
+                end
+            end
+        end
+        task.wait()
+    end
+end)
 
-    local data = getData()
-    local pool = data and data.serverData and data.serverData.rollUnitPool
-    if type(pool) ~= "table" then rollStatusText = "No roll pool data"; return end
+local function doAutoRoll()
+    if not e.AutoRollBuyEnabled then getgenv().__MPRollStatus = "Toggle is OFF"; return end
+    if #e.RollRarityIds == 0 then getgenv().__MPRollStatus = "Pick at least one Rarity first"; return end
 
     -- Firing while the lock is still set gets silently REJECTED server-side
     -- -- confirmed live by instrumented testing: pool never changes, the
-    -- roll just never happened, and the old 1.5s poll below burned its
-    -- entire timeout waiting on a result that was never coming. The old 3s
-    -- ceiling on this wait existed "in case it gets stuck," but real timing
-    -- data (7 consecutive rolls, same account) showed the lock consistently
-    -- holds for ~2.0-2.03s -- close enough to that 3s ceiling that a slow
-    -- tick could clip it, fire into a still-active lock, and produce exactly
-    -- the "rolls twice then stalls" pattern reported. No ceiling now (just
-    -- a 10s last-resort in case the lock itself ever truly wedges, which
-    -- isn't normal pacing) -- waiting it out is never wasted since firing
-    -- early is proven to be pure waste instead.
+    -- roll just never happened. No ceiling here (just a 10s last-resort in
+    -- case the lock itself ever truly wedges, which isn't normal pacing) --
+    -- waiting it out is never wasted since firing early is proven to be
+    -- pure waste instead.
     local lockDeadline = os.clock() + 10
     while FrameworkLink.Update[RNGRollScript] ~= nil and os.clock() < lockDeadline do
         task.wait(0.03)
     end
 
-    local before = { pool[1], pool[2], pool[3] }
     pcall(function() OnClientGameEvent:Business("RNG_单位") end)
-
-    -- Real successful rolls resolve in ~70-100ms (confirmed live). If 300ms
-    -- pass with no pool change AND the lock never even engaged, this fire
-    -- was rejected outright (the lock-wait above should prevent that now,
-    -- but this is the recovery path if it ever still happens) -- bail
-    -- immediately instead of sitting through the rest of a 1.5s timeout
-    -- that was never going to resolve, so the next cycle can re-wait on
-    -- the lock properly right away.
-    local pollDeadline = os.clock() + 1.5
-    local fastBailAt = os.clock() + 0.3
-    while os.clock() < pollDeadline do
-        if pool[1] ~= before[1] or pool[2] ~= before[2] or pool[3] ~= before[3] then break end
-        if os.clock() > fastBailAt and FrameworkLink.Update[RNGRollScript] == nil then break end
-        task.wait(0.03)
-    end
-
-    local bought = 0
-    for slot, cfgId in ipairs(pool) do
-        local cfg = cfgId and PlayConfig.allUnit[cfgId]
-        if cfg and rollMatchesFilter(cfg, raritySet) then
-            pcall(function() OnClientGameEvent:AutoBuy_Backpack_Item("RNG_单位", slot) end)
-            bought += 1
-        end
-    end
-    rollStatusText = bought > 0
-        and ("Bought " .. bought .. " match(es) this roll")
-        or "Rolled -- no match this time"
+    -- The per-frame watcher above owns reading the result and buying
+    -- matches the moment it sees the pool move -- this only needs to fire
+    -- and get straight back to waiting on the lock for the next one,
+    -- instead of sitting here polling for a result it no longer needs to
+    -- read itself.
+    getgenv().__MPRollStatus = "Rolled -- watcher catching the result"
 end
 
 -- ==========================================================================
@@ -2191,7 +2218,7 @@ end)
 task.spawn(function()
     while getgenv().__MPG == myGen do
         pcall(doAutoRoll)
-        pcall(function() rollStatusLabel:UpdateName(rollStatusText) end)
+        pcall(function() rollStatusLabel:UpdateName(getgenv().__MPRollStatus) end)
         -- doAutoRoll already paces itself on the real animation lock +
         -- pool-change poll -- this is just a floor so a stuck/instant
         -- return (e.g. toggle off) doesn't spin the loop at full tilt.
