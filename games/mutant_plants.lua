@@ -166,7 +166,7 @@ local PERSIST_KEYS = {
     "RollRarityIds", "RollPlantsByRarity", "RollMutationsByRarity", "AutoRollBuyEnabled",
     "AutoMergeEnabled",
     "AutoEquipEnabled",
-    "AutoDeleteEnabled", "DeleteRarityIds", "DeletePlants",
+    "AutoDeleteEnabled", "DeleteRarityIds", "DeletePlantsByRarity",
     "AutoCraftEnabled", "CraftRecipeId", "CraftBatchSize",
     "AutoBuyFruitEnabled", "BuyFruitNames", "AutoBuyItemEnabled", "BuyItemNames",
     "AutoStartWaveEnabled", "AutoStopWaveEnabled", "WaveStopTarget",
@@ -247,7 +247,7 @@ if e.AutoMergeEnabled == nil then e.AutoMergeEnabled = false end
 if e.AutoEquipEnabled == nil then e.AutoEquipEnabled = false end
 if e.AutoDeleteEnabled == nil then e.AutoDeleteEnabled = false end
 if e.DeleteRarityIds == nil then e.DeleteRarityIds = {} end
-if e.DeletePlants == nil then e.DeletePlants = {} end
+if e.DeletePlantsByRarity == nil then e.DeletePlantsByRarity = {} end
 if e.AutoCraftEnabled == nil then e.AutoCraftEnabled = false end
 if e.CraftBatchSize == nil then e.CraftBatchSize = 1 end
 if e.AutoBuyFruitEnabled == nil then e.AutoBuyFruitEnabled = false end
@@ -516,15 +516,15 @@ local function doAutoEquip()
 end
 
 -- ==========================================================================
--- 3b) Auto Delete -- Rarity (multi, empty = any) and Plant (multi, empty =
--- any) are two INDEPENDENT global filters now, not Plant-nested-per-Rarity.
--- Confirmed live this was a real gap, not just a config mix-up: a user
--- selecting only "Corn" under Plant, expecting every Corn regardless of
--- rarity/mutation/star to go, still had rarity-7 Corn survive -- because
--- the old model required the SAME rarity to also be checked in the Rarity
--- box before that rarity's own Plant sub-list even applied. "Delete this
--- species" and "delete this rarity" are separate intents; this treats them
--- that way; -- AND together, either can be left empty to mean "any".
+-- 3b) Auto Delete -- multi-select Rarity, each SELECTED rarity gets its own
+-- independent Plant filter (empty = delete every species at that rarity).
+-- This is the granularity that's actually useful here: e.g. Common with no
+-- Plant picks = wipe every Common duplicate, while Secret gets its own
+-- Plant list so only specific Secret species go -- two different rules per
+-- rarity, not one rule applied everywhere. (An earlier version made Plant a
+-- single global list independent of Rarity -- that solved "delete Corn
+-- everywhere" but broke exactly this per-rarity split, so it's back to
+-- per-rarity on request.)
 -- PERMANENT -- OnClientGameEvent:Destroy_GidData_Item("单位", gidList)
 -- (confirmed call site, MainBackpack.unit_uiView_DeleteYes_OnClick -- the
 -- confirm dialog wraps the button, not the remote, same shape as Merge/
@@ -538,22 +538,18 @@ end
 -- ==========================================================================
 local deleteStatusText = "Toggle is OFF"
 
-local function deleteMatchesFilter(cfg, raritySet, plantSet)
-    if next(raritySet) and not raritySet[cfg.rarity] then return false end
-    if next(plantSet) and not plantSet[unitSpecies(cfg)] then return false end
+local function deleteMatchesFilter(cfg, raritySet)
+    if not raritySet[cfg.rarity] then return false end
+    local plants = e.DeletePlantsByRarity["r" .. cfg.rarity] or {}
+    if #plants > 0 and not table.find(plants, unitSpecies(cfg)) then return false end
     return true
 end
 
 local function doAutoDelete()
     if not e.AutoDeleteEnabled then deleteStatusText = "Toggle is OFF"; return end
-    if #e.DeleteRarityIds == 0 and #e.DeletePlants == 0 then
-        deleteStatusText = "Pick a Rarity or a Plant first"
-        return
-    end
+    if #e.DeleteRarityIds == 0 then deleteStatusText = "Pick at least one Rarity first"; return end
     local raritySet = {}
     for _, id in ipairs(e.DeleteRarityIds) do raritySet[id] = true end
-    local plantSet = {}
-    for _, name in ipairs(e.DeletePlants) do plantSet[name] = true end
 
     local data = getData()
     if not data then deleteStatusText = "No data"; return end
@@ -576,7 +572,7 @@ local function doAutoDelete()
             local card = pd.allCard[gid]
             if card and card.typeId == 1 and not card.isLock then
                 local cfg = PlayConfig.allUnit[card.cfgId]
-                if cfg and deleteMatchesFilter(cfg, raritySet, plantSet) then
+                if cfg and deleteMatchesFilter(cfg, raritySet) then
                     table.insert(toDelete, gid)
                 end
             end
@@ -1030,18 +1026,53 @@ local function doAutoWorldBoss()
     end
 
     local mode = e.WorldBossModeByLevel["l" .. bossId] or "Full Fight"
-    if mode == "Poke & Leave" then
-        local elapsed = os.clock() - worldBossJoinedAt
+    local elapsed = os.clock() - worldBossJoinedAt
+
+    if mode == "Full Fight" then
+        -- Sitting the full ~20-minute run window (worldBossRunTime) gets
+        -- nothing if this tier's HP can't actually be cleared in that time
+        -- -- no partial credit, just a dead 20 minutes. Reuses the exact
+        -- same DPS-needed math the World Boss guide box already computes
+        -- (HP / worldBossRunTime, compared with BigCompare against this
+        -- tier's live PlayConfig.allWorldBoss[bossId].hp) to catch that
+        -- case and auto-downgrade to a short poke instead -- the user's own
+        -- Full Fight choice still holds for any tier the DPS actually
+        -- clears, this only kicks in when the fight literally cannot be won.
+        local cfg = PlayConfig.allWorldBoss[bossId]
+        local runTime = tonumber(PlayConfig.worldBossRunTime) or 1200
+        local myDps = computeMyTotalDps()
+        local canWin = true
+        if myDps and cfg then
+            local okNeeded, needed = pcall(function() return BigNumber.DivNumber(cfg.hp, runTime) end)
+            if okNeeded then
+                local okCmp, atLeast = pcall(function() return BigNumber.BigCompare(myDps, needed) end)
+                if okCmp then canWin = atLeast end
+            end
+        end
+        if canWin then
+            worldBossStatusText = "Tier " .. bossId .. " -- Full Fight"
+            return
+        end
         local dur = tonumber(e.WorldBossPokeSeconds) or 6
         if elapsed >= dur then
             pcall(function() OnClientGameEvent:BusinessToId("世界Boss", 2) end)
             worldBossJoined = false
-            worldBossStatusText = string.format("Tier %d -- left after %.1fs (poke)", bossId, elapsed)
+            worldBossStatusText = string.format(
+                "Tier %d -- DPS too low to clear in %ds, left after %.1fs instead of burning the window",
+                bossId, runTime, elapsed)
         else
-            worldBossStatusText = string.format("Tier %d -- poking %.1f/%ds", bossId, elapsed, dur)
+            worldBossStatusText = string.format("Tier %d -- DPS too low to clear, poking %.1f/%ds", bossId, elapsed, dur)
         end
+        return
+    end
+
+    local dur = tonumber(e.WorldBossPokeSeconds) or 6
+    if elapsed >= dur then
+        pcall(function() OnClientGameEvent:BusinessToId("世界Boss", 2) end)
+        worldBossJoined = false
+        worldBossStatusText = string.format("Tier %d -- left after %.1fs (poke)", bossId, elapsed)
     else
-        worldBossStatusText = "Tier " .. bossId .. " -- Full Fight"
+        worldBossStatusText = string.format("Tier %d -- poking %.1f/%ds", bossId, elapsed, dur)
     end
 end
 
@@ -1417,18 +1448,6 @@ local function currentPlantOptions(rarityId)
     return list
 end
 
--- Every distinct species across ALL rarities -- used by Auto Delete, which
--- (unlike Roll's per-rarity pickers) filters Plant independently of Rarity.
-local function allPlantOptions()
-    local set, list = {}, {}
-    for _, cfg in pairs(PlayConfig.allUnit) do
-        local species = unitSpecies(cfg)
-        if not set[species] then set[species] = true; table.insert(list, species) end
-    end
-    table.sort(list)
-    return list
-end
-
 local function currentMutationOptions(rarityId)
     local plants = e.RollPlantsByRarity["r" .. rarityId] or {}
     local set, list = {}, {}
@@ -1585,12 +1604,20 @@ safeInput(FarmLeft, {
 FarmLeft:Label({ Text = "Starts the recipe when the production slot is free, claims it the instant it's done" })
 local craftStatusLabel = FarmLeft:Label({ Text = "Idle" })
 
-FarmRight:Header({ Text = "Auto Delete" })
+FarmRight:Header({ Text = "Auto Delete -- Rarities (multi)" })
 FarmRight:Label({ Text = "PERMANENT -- never touches a locked or field-placed unit, everything else matching is gone" })
-FarmRight:Label({ Text = "Rarity and Plant are independent filters -- each empty = any. Pick just Plant to delete a species across every rarity, or just Rarity for everything at that tier, or both together to narrow it." })
+FarmRight:Label({ Text = "Each selected Rarity gets its own Plant list below -- empty = delete every species at that rarity, pick specific ones to narrow just that rarity" })
+
+local deletePlantDDByRarity = {}
+
+local function deleteRaritySet()
+    local set = {}
+    for _, id in ipairs(e.DeleteRarityIds) do set[id] = true end
+    return set
+end
 
 local deleteRarityDD = FarmRight:Dropdown({
-    Name = "Delete Rarity (multi, empty = any)", Options = RARITY_OPTIONS, Multi = true, IgnoreConfig = true,
+    Name = "Delete Rarity (multi)", Options = RARITY_OPTIONS, Multi = true, IgnoreConfig = true,
     Callback = function(selectedSet)
         local ids = {}
         if type(selectedSet) == "table" then
@@ -1599,22 +1626,31 @@ local deleteRarityDD = FarmRight:Dropdown({
             end
         end
         e.DeleteRarityIds = ids
+        local set = deleteRaritySet()
+        for id, dd in pairs(deletePlantDDByRarity) do pcall(function() dd:SetVisibility(set[id] == true) end) end
         saveState()
     end,
 }, "DeleteRarityDropdown")
 
-local deletePlantDD = FarmRight:Dropdown({
-    Name = "Delete Plant (multi, empty = any)", Options = allPlantOptions(), Multi = true, IgnoreConfig = true,
-    Callback = function(selectedSet)
-        local list = {}
-        if type(selectedSet) == "table" then
-            for name, isOn in pairs(selectedSet) do if isOn then table.insert(list, name) end end
-        end
-        e.DeletePlants = list
-        saveState()
-    end,
-}, "DeletePlantDropdown")
-if #e.DeletePlants > 0 then pcall(function() deletePlantDD:UpdateSelection(e.DeletePlants) end) end
+for _, rarityId in ipairs(RARITY_IDS_ORDERED) do
+    local rarityName = RARITY_NAME_BY_ID[rarityId]
+    local key = "r" .. rarityId
+    local pdd = FarmRight:Dropdown({
+        Name = rarityName .. " Plant (empty = any)", Options = currentPlantOptions(rarityId), Multi = true, IgnoreConfig = true,
+        Callback = function(selectedSet)
+            local list = {}
+            if type(selectedSet) == "table" then
+                for name, isOn in pairs(selectedSet) do if isOn then table.insert(list, name) end end
+            end
+            e.DeletePlantsByRarity[key] = list
+            saveState()
+        end,
+    }, "DeletePlant_" .. rarityId .. "Dropdown")
+    deletePlantDDByRarity[rarityId] = pdd
+    local persisted = e.DeletePlantsByRarity[key]
+    if persisted and #persisted > 0 then pcall(function() pdd:UpdateSelection(persisted) end) end
+    pdd:SetVisibility(deleteRaritySet()[rarityId] == true)
+end
 
 if #e.DeleteRarityIds > 0 then
     local names = {}
