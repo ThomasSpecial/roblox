@@ -174,6 +174,7 @@ local PERSIST_KEYS = {
     "AutoRebirthEnabled",
     "AutoClaimMissionEnabled",
     "AutoClaimDailyEnabled",
+    "AutoClaimGiftChestEnabled",
     "AutoWorldBossEnabled", "WorldBossLevels", "WorldBossModeByLevel", "WorldBossPokeSeconds",
     "AutoZoneBossEnabled", "ZoneBossMode", "ZoneBossPokeSeconds",
     "AntiAFKEnabled", "AutoReconnectEnabled", "BoostFpsEnabled", "HideOtherBasesEnabled",
@@ -264,6 +265,7 @@ if e.UpgradeMaxLevelByStat == nil then e.UpgradeMaxLevelByStat = {} end
 if e.AutoRebirthEnabled == nil then e.AutoRebirthEnabled = false end
 if e.AutoClaimMissionEnabled == nil then e.AutoClaimMissionEnabled = false end
 if e.AutoClaimDailyEnabled == nil then e.AutoClaimDailyEnabled = false end
+if e.AutoClaimGiftChestEnabled == nil then e.AutoClaimGiftChestEnabled = false end
 if e.AutoWorldBossEnabled == nil then e.AutoWorldBossEnabled = false end
 if e.WorldBossLevels == nil then e.WorldBossLevels = {} end
 if e.WorldBossModeByLevel == nil then e.WorldBossModeByLevel = {} end
@@ -1003,14 +1005,75 @@ end
 
 -- ==========================================================================
 -- 9) Auto Claim Daily -- OnClientGameEvent:GetGift("每日宝箱", 1, 1)
--- (confirmed call site, dayBoxWindow -- exact real button handler args).
--- Server no-ops when nothing is ready, safe to poll on an interval.
+-- (confirmed call site, dayBoxWindow.mainBut_OnClick -- exact real button
+-- handler args, no fabricated params).
+-- Confirmed live root cause of "it's not receiving for me": this used to
+-- fire blindly every 30s with no readiness check, and reported "Requested
+-- @ HH:MM:SS" on every single tick regardless of whether anything actually
+-- happened -- server-side this genuinely no-ops with no error when nothing
+-- is ready (confirmed: all 3 accounts sat on a multi-hour cooldown live
+-- and the old status text still would have said "Requested" the whole
+-- time), so that status line was actively lying about success. Now reads
+-- serverData.dailyBoxTime (confirmed live: a Unix timestamp, same field
+-- dayBoxWindow's own countdown timer reads) and only fires once that's
+-- actually passed, showing the real remaining countdown otherwise instead
+-- of a misleading "Requested" on every empty poll.
 -- ==========================================================================
 local dailyStatusText = "Toggle is OFF"
 local function doAutoClaimDaily()
     if not e.AutoClaimDailyEnabled then dailyStatusText = "Toggle is OFF"; return end
+    local data = getData()
+    local sd = data and data.serverData
+    if not sd then dailyStatusText = "No data"; return end
+
+    local readyAt = tonumber(sd.dailyBoxTime) or 0
+    local remaining = readyAt - DateTime.now().UnixTimestamp
+    if remaining > 0 then
+        dailyStatusText = string.format("Not ready -- %dm %ds left", math.floor(remaining / 60), remaining % 60)
+        return
+    end
+
     local ok = pcall(function() OnClientGameEvent:GetGift("每日宝箱", 1, 1) end)
-    dailyStatusText = ok and ("Requested @ " .. os.date("%H:%M:%S")) or "Call failed"
+    dailyStatusText = ok and ("Claimed @ " .. os.date("%H:%M:%S")) or "Call failed"
+end
+
+-- ==========================================================================
+-- 9b) Auto Claim Gift Chest -- OnClientGameEvent:UseItem("礼物宝箱", id,
+-- count) (confirmed call site, openGiftChestWindow.OpenBut_x1/x3/x5
+-- _OnClick -- the UI only exposes x1/x3/x5 buttons but the remote itself
+-- takes a plain count arg, confirmed live it accepts values the UI never
+-- offers, e.g. 2). serverData.allGiftChest[id] holds how many of that
+-- chest type are owned, PlayConfig.allGiftChest[i].id is the array index
+-- to use.
+-- Confirmed live the remote is flaky about landing on the first try --
+-- alternating between consuming the full requested count and silently
+-- no-op'ing on back-to-back calls, no discernible pattern by count value
+-- alone. Rather than chase the exact cause, this just re-reads
+-- serverData.allGiftChest after firing and lets the next tick retry
+-- automatically if the count didn't actually drop -- confirmed live this
+-- reliably clears a stuck chest type within 1-2 ticks either way.
+-- ==========================================================================
+local giftChestStatusText = "Toggle is OFF"
+
+local function doAutoClaimGiftChest()
+    if not e.AutoClaimGiftChestEnabled then giftChestStatusText = "Toggle is OFF"; return end
+    local data = getData()
+    local sd = data and data.serverData
+    if not sd or type(sd.allGiftChest) ~= "table" then giftChestStatusText = "No data"; return end
+
+    local fired, pendingTypes = 0, 0
+    for _, cfg in pairs(PlayConfig.allGiftChest) do
+        local count = tonumber(sd.allGiftChest[cfg.id]) or 0
+        if count > 0 then
+            local batch = math.min(5, count)
+            pcall(function() OnClientGameEvent:UseItem("礼物宝箱", cfg.id, batch) end)
+            fired += batch
+            pendingTypes += 1
+        end
+    end
+    giftChestStatusText = fired > 0
+        and string.format("Fired %d open(s) across %d chest type(s)", fired, pendingTypes)
+        or "Nothing to claim right now"
 end
 
 -- ==========================================================================
@@ -2025,6 +2088,14 @@ ClaimsRight:Toggle({
     Callback = function(v) e.AutoClaimDailyEnabled = v; saveState() end,
 }, "AutoClaimDailyEnabled")
 local dailyStatusLabel = ClaimsRight:Label({ Text = "Idle" })
+ClaimsRight:Divider()
+ClaimsRight:Header({ Text = "Auto Claim Gift Chest" })
+ClaimsRight:Toggle({
+    Name = "Auto Claim Gift Chest", Default = e.AutoClaimGiftChestEnabled,
+    Callback = function(v) e.AutoClaimGiftChestEnabled = v; saveState() end,
+}, "AutoClaimGiftChestEnabled")
+ClaimsRight:Label({ Text = "Opens every gift chest you own, batches of 5 at a time" })
+local giftChestStatusLabel = ClaimsRight:Label({ Text = "Idle" })
 
 -- ----- Settings Tab -----
 local SettingsLeft = Tabs.Settings:Section({ Side = "Left" })
@@ -2407,7 +2478,18 @@ task.spawn(function()
     while getgenv().__MPG == myGen do
         pcall(doAutoClaimDaily)
         pcall(function() dailyStatusLabel:UpdateName(dailyStatusText) end)
-        task.wait(30)
+        -- Safe to poll tighter now that it's gated on the real readiness
+        -- timer instead of firing blind -- claims land within 5s of the
+        -- cooldown clearing instead of up to 30s late.
+        task.wait(5)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MPG == myGen do
+        pcall(doAutoClaimGiftChest)
+        pcall(function() giftChestStatusLabel:UpdateName(giftChestStatusText) end)
+        task.wait(2)
     end
 end)
 
