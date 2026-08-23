@@ -381,6 +381,22 @@ local function doAutoRoll()
     if not e.AutoRollBuyEnabled then getgenv().__MPRollStatus = "Toggle is OFF"; return end
     if #e.RollRarityIds == 0 then getgenv().__MPRollStatus = "Pick at least one Rarity first"; return end
 
+    -- Keep the native auto-roll running alongside this one -- on request,
+    -- the user runs both together on purpose for the combined throughput
+    -- (confirmed live: two independent rollers hitting the same pool is
+    -- genuinely faster, and the per-frame watcher above already catches
+    -- results from either one). Business("自动抽取单位_是否开启") is a
+    -- FLIP, not an explicit on/off, so this only ever fires when
+    -- aotuRollOpen is confirmed false -- firing it while already true would
+    -- turn the native roller back OFF, the opposite of the point. Checked
+    -- every doAutoRoll cycle so it self-heals if native ever gets switched
+    -- off mid-session (an accidental click, a fresh join resetting it, etc)
+    -- without needing the user to notice and re-enable it by hand.
+    local rollData = getData()
+    if rollData and rollData.serverData and rollData.serverData.aotuRollOpen == false then
+        pcall(function() OnClientGameEvent:Business("自动抽取单位_是否开启") end)
+    end
+
     -- Firing while the lock is still set gets silently REJECTED server-side
     -- -- confirmed live by instrumented testing: pool never changes, the
     -- roll just never happened. No ceiling here (just a 10s last-resort in
