@@ -2325,9 +2325,12 @@ task.spawn(function()
     while getgenv().__MPG == myGen do
         pcall(doAutoDelete)
         pcall(function() deleteStatusLabel:UpdateName(deleteStatusText) end)
-        -- Slower than Merge on purpose -- this is permanent, no need to
-        -- hammer it every 3s when nothing new to delete shows up that often.
-        task.wait(5)
+        -- Was 5s on the theory duplicates don't show up that often -- on
+        -- request, tightened to match Auto Buy's cadence. Deleting is a
+        -- single batch scan-and-fire with no race to pace around (unlike
+        -- Roll), so there's no correctness reason to hold this back beyond
+        -- not hammering the remote needlessly when nothing's changed.
+        task.wait(1)
     end
 end)
 
