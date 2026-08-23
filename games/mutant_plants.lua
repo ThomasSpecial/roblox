@@ -169,7 +169,7 @@ local PERSIST_KEYS = {
     "AutoDeleteEnabled", "DeleteRarityIds", "DeletePlantsByRarity",
     "AutoCraftEnabled", "CraftRecipeId", "CraftBatchSize",
     "AutoBuyFruitEnabled", "BuyFruitNames", "AutoBuyItemEnabled", "BuyItemNames",
-    "AutoStartWaveEnabled", "AutoStopWaveEnabled", "WaveStopTarget",
+    "AutoStartWaveEnabled", "AutoStopWaveEnabled", "WaveStopTarget", "AutoGameSpeedMaxEnabled",
     "AutoUpgradeEnabled", "UpgradeStatIds", "UpgradeMaxLevelByStat",
     "AutoRebirthEnabled",
     "AutoClaimMissionEnabled",
@@ -257,6 +257,7 @@ if e.BuyItemNames == nil then e.BuyItemNames = {} end
 if e.AutoStartWaveEnabled == nil then e.AutoStartWaveEnabled = false end
 if e.AutoStopWaveEnabled == nil then e.AutoStopWaveEnabled = false end
 if e.WaveStopTarget == nil then e.WaveStopTarget = 0 end
+if e.AutoGameSpeedMaxEnabled == nil then e.AutoGameSpeedMaxEnabled = false end
 if e.AutoUpgradeEnabled == nil then e.AutoUpgradeEnabled = false end
 if e.UpgradeStatIds == nil then e.UpgradeStatIds = {} end
 if e.UpgradeMaxLevelByStat == nil then e.UpgradeMaxLevelByStat = {} end
@@ -402,10 +403,13 @@ local function doAutoRoll()
     -- roll just never happened. No ceiling here (just a 10s last-resort in
     -- case the lock itself ever truly wedges, which isn't normal pacing) --
     -- waiting it out is never wasted since firing early is proven to be
-    -- pure waste instead.
+    -- pure waste instead. Polls every render step (task.wait(), ~16ms) now
+    -- instead of a fixed 30ms -- shaves up to ~14ms of pure reaction lag
+    -- off every single cycle, so the fire lands the moment the game itself
+    -- says it's safe to instead of up to one 30ms tick late.
     local lockDeadline = os.clock() + 10
     while FrameworkLink.Update[RNGRollScript] ~= nil and os.clock() < lockDeadline do
-        task.wait(0.03)
+        task.wait()
     end
 
     pcall(function() OnClientGameEvent:Business("RNG_单位") end)
@@ -829,6 +833,55 @@ local function doAutoWave()
         return
     end
     waveStatusText = "Wave " .. wave .. (e.AutoStartWaveEnabled and (running and " -- match running" or " -- waiting to retry start") or "")
+end
+
+-- ==========================================================================
+-- 5b) Auto GameSpeed Max -- keeps the battle-speed multiplier (gpSpeed,
+-- confirmed live: playData.gpSpeed AND serverData.gpSpeed both hold the
+-- current tier as a plain number) pinned to whatever the HIGHEST tier this
+-- account can actually reach is. OnClientGameEvent:Business("比赛速度")
+-- (confirmed call site, upUIs.GpSpeedBut_OnClick) is a CYCLE, not a "set to
+-- X" call -- x1 -> x2 -> x1 without the gamepass, or -> x3 -> x1 with it --
+-- so this fires it once per tick while under the ceiling and lets it settle
+-- rather than trying to jump straight to a target.
+-- Ceiling is 2 unless PlayConfig.gamePassForEnum["战斗速度x3"] shows up in
+-- serverData.gamePass, confirmed live this account doesn't own it -- x3 is
+-- gated behind OnClientGameEvent:Buy_GamePass("战斗速度x3"), a real-money
+-- purchase prompt (confirmed call site, upUIs.GpSpeedButX3_OnClick), which
+-- this never fires -- "max" here means the highest tier already unlocked,
+-- not buying the next one.
+-- ==========================================================================
+local gameSpeedStatusText = "Toggle is OFF"
+local lastGameSpeedFire = 0
+
+local function gameSpeedCeiling(sd)
+    local x3Cfg = PlayConfig.gamePassForEnum["战斗速度x3"]
+    if x3Cfg and sd.gamePass and sd.gamePass[x3Cfg.id] then return 3 end
+    return 2
+end
+
+local function doAutoGameSpeedMax()
+    if not e.AutoGameSpeedMaxEnabled then gameSpeedStatusText = "Toggle is OFF"; return end
+    local data = getData()
+    local sd = data and data.serverData
+    if not sd then gameSpeedStatusText = "No data"; return end
+
+    local current = tonumber(sd.gpSpeed) or 1
+    local ceiling = gameSpeedCeiling(sd)
+    if current >= ceiling then
+        gameSpeedStatusText = "Already at max (x" .. current .. ")"
+        return
+    end
+    -- gpSpeed is server-synced, so a fired cycle takes a moment to land --
+    -- pacing on a real cooldown here instead of firing every tick avoids
+    -- overshooting past the ceiling before the last click even replicated.
+    if os.clock() - lastGameSpeedFire < 1 then
+        gameSpeedStatusText = "Cycling up -- was x" .. current .. ", target x" .. ceiling
+        return
+    end
+    pcall(function() OnClientGameEvent:Business("比赛速度") end)
+    lastGameSpeedFire = os.clock()
+    gameSpeedStatusText = "Cycling up -- was x" .. current .. ", target x" .. ceiling
 end
 
 -- ==========================================================================
@@ -1716,6 +1769,14 @@ WaveLeft:Toggle({
 }, "AutoStartWaveEnabled")
 WaveLeft:Label({ Text = "Keeps firing StartGp() so a run never sits idle" })
 
+WaveLeft:Header({ Text = "Auto GameSpeed Max" })
+WaveLeft:Toggle({
+    Name = "Auto GameSpeed Max", Default = e.AutoGameSpeedMaxEnabled,
+    Callback = function(v) e.AutoGameSpeedMaxEnabled = v; saveState() end,
+}, "AutoGameSpeedMaxEnabled")
+WaveLeft:Label({ Text = "Cycles battle speed up to the highest tier already unlocked -- never buys the x3 gamepass" })
+local gameSpeedStatusLabel = WaveLeft:Label({ Text = "Idle" })
+
 local WaveRight = Tabs.Wave:Section({ Side = "Right" })
 WaveRight:Header({ Text = "Auto Stop at Wave" })
 WaveRight:Toggle({
@@ -2233,12 +2294,19 @@ end)
 
 task.spawn(function()
     while getgenv().__MPG == myGen do
+        local cycleStart = os.clock()
         pcall(doAutoRoll)
         pcall(function() rollStatusLabel:UpdateName(getgenv().__MPRollStatus) end)
-        -- doAutoRoll already paces itself on the real animation lock +
-        -- pool-change poll -- this is just a floor so a stuck/instant
-        -- return (e.g. toggle off) doesn't spin the loop at full tilt.
-        task.wait(0.05)
+        -- A normal cycle already blocked inside doAutoRoll waiting on the
+        -- real animation lock before firing -- tacking a flat 50ms onto
+        -- every one of those on top was pure waste, confirmed live it was
+        -- adding up across a farming session. This floor only exists so an
+        -- INSTANT return (toggle off, no rarity picked -- doAutoRoll didn't
+        -- block on anything) doesn't spin the loop at full tilt; skip it
+        -- entirely once real waiting already happened this cycle.
+        if os.clock() - cycleStart < 0.05 then
+            task.wait(0.05)
+        end
     end
 end)
 
@@ -2290,6 +2358,14 @@ task.spawn(function()
     while getgenv().__MPG == myGen do
         pcall(doAutoWave)
         pcall(function() waveStatusLabel:UpdateName(waveStatusText) end)
+        task.wait(1)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().__MPG == myGen do
+        pcall(doAutoGameSpeedMax)
+        pcall(function() gameSpeedStatusLabel:UpdateName(gameSpeedStatusText) end)
         task.wait(1)
     end
 end)
