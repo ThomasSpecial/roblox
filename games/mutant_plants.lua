@@ -875,7 +875,10 @@ local function doAutoGameSpeedMax()
     -- gpSpeed is server-synced, so a fired cycle takes a moment to land --
     -- pacing on a real cooldown here instead of firing every tick avoids
     -- overshooting past the ceiling before the last click even replicated.
-    if os.clock() - lastGameSpeedFire < 1 then
+    -- 0.3s matches the round-trip other remotes in this game settle in
+    -- (Roll results land in ~70-100ms) -- tight enough to reach the
+    -- ceiling fast without hammering the remote every single tick.
+    if os.clock() - lastGameSpeedFire < 0.3 then
         gameSpeedStatusText = "Cycling up -- was x" .. current .. ", target x" .. ceiling
         return
     end
@@ -2366,7 +2369,10 @@ task.spawn(function()
     while getgenv().__MPG == myGen do
         pcall(doAutoGameSpeedMax)
         pcall(function() gameSpeedStatusLabel:UpdateName(gameSpeedStatusText) end)
-        task.wait(1)
+        -- doAutoGameSpeedMax has its own 0.3s fire cooldown -- this outer
+        -- wait just needs to be short enough not to add its own lag on top,
+        -- not the thing pacing the actual remote calls.
+        task.wait(0.2)
     end
 end)
 
