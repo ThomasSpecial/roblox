@@ -69,7 +69,38 @@ task.spawn(function()
     RV.PlayRoll=function(c,h,sz,sp,...) local m=(type(sp)=="number"and sp>0)and sp or 1;return o(c,h,sz,m*1000,...) end
 end)
 if not e.__AFKh then e.__AFKh=true;LP.Idled:Connect(function() if e.aAfk then pcall(function() VU:CaptureController();VU:ClickButton2(Vector2.new()) end) end end) end
-if not e.__RH then e.__RH=true;PL.PlayerRemoving:Connect(function(p) if p==LP and e.aRec then pcall(function() TSvc:Teleport(game.PlaceId,LP) end) end end) end
+-- Auto Reconnect -- ported from mutant_plants.lua's 3-trigger version: PlayerRemoving alone missed
+-- silent drops where the transport dies but LocalPlayer never actually leaves Players (native
+-- "Disconnected" dialog just sits there). tryReconnect is debounced (5s) so PlayerRemoving +
+-- AncestryChanged firing for the SAME disconnect don't double-Teleport, and the debounce resets
+-- after 5s so the NEXT real disconnect isn't silently swallowed by a latch that never cleared.
+if not e.__RH then
+    e.__RH=true
+    local reconnectFired=false
+    local function tryReconnect()
+        if reconnectFired then return end
+        reconnectFired=true
+        task.delay(5,function() reconnectFired=false end)
+        if e.aRec then pcall(function() TSvc:Teleport(game.PlaceId,LP) end) end
+    end
+    PL.PlayerRemoving:Connect(function(p) if p==LP then tryReconnect() end end)
+    LP.AncestryChanged:Connect(function(_,parent) if parent~=PL then tryReconnect() end end)
+    e.__tryReconnect=tryReconnect
+end
+-- Third trigger: scan CoreGui every 5s for the native "Disconnected" dialog (Error 277-style drops)
+-- -- confirmed in mutant_plants.lua that a plain Teleport still works from inside that state.
+task.spawn(function()
+    while e.__G==G do
+        task.wait(5)
+        if e.aRec and e.__tryReconnect then
+            pcall(function()
+                for _,inst in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+                    if inst:IsA("TextLabel") and inst.Text=="Disconnected" then e.__tryReconnect();return end
+                end
+            end)
+        end
+    end
+end)
 if not e.__OAD then e.__OAD=HR.ApplyLocalDamage end
 HR.ApplyLocalDamage=function(a,b,c,d,...) if e.hGod then return end;return e.__OAD(a,b,c,d,...) end
 if not e.__ONF then e.__ONF=NW.FireServer end
