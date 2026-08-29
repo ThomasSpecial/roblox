@@ -31,6 +31,10 @@ local HR=require(ClientF:WaitForChild("Heroes",10):WaitForChild("HeroRender",10)
 local NW=require(ClientF:WaitForChild("Network",10):WaitForChild("Network",10))
 local EN=require(ClientF:WaitForChild("Enemies",10):WaitForChild("Enemies",10))
 local Currency=require(ClientF:WaitForChild("Currency",10):WaitForChild("Currency",10))
+local FSH=require(SharedF:WaitForChild("Fusion",10):WaitForChild("Fusion",10))
+local FCL=require(ClientF:WaitForChild("Fusion",10):WaitForChild("Fusion",10))
+local Inv=require(ClientF:WaitForChild("Inventory",10):WaitForChild("Inventory",10))
+local CrateData=require(SharedF:WaitForChild("Items",10):WaitForChild("CrateData",10))
 print("[RNG] Modules ready")
 -- RuneData hardcoded เพราะ require ใน thread 8 callback ไม่ได้
 local RUNE_COST = 25
@@ -47,7 +51,7 @@ local RUNE_INFO = {
 }
 
 local SF="RNGHeroesAutomation/state.json"
-local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt"}
+local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt","aFuse","aLuck"}
 pcall(function() if not isfolder("RNGHeroesAutomation") then makefolder("RNGHeroesAutomation") end end)
 local function sv() local d={} for _,k in ipairs(SK) do d[k]=e[k] end;pcall(function() writefile(SF,HS:JSONEncode(d)) end) end
 pcall(function() local c=readfile(SF);local d=HS:JSONDecode(c);for _,k in ipairs(SK) do if d[k]~=nil and e[k]==nil then e[k]=d[k] end end end)
@@ -59,6 +63,8 @@ if e.hDmgIgn==nil then e.hDmgIgn="None" end
 if e.hSpdIgn==nil then e.hSpdIgn="None" end
 if e.aRune==nil then e.aRune=false end
 if e.aRuneAmt==nil then e.aRuneAmt=1 end
+if e.aFuse==nil then e.aFuse=false end
+if e.aLuck==nil then e.aLuck=false end
 
 -- roll speed x1000
 task.spawn(function()
@@ -107,11 +113,23 @@ if not e.__ONF then e.__ONF=NW.FireServer end
 NW.FireServer=function(ev,...) if e.hGod and(ev=="ReportEnemyAttack"or ev=="ReportBossAoeHit")then local a={...};a[#a]=0;return e.__ONF(ev,table.unpack(a))end;return e.__ONF(ev,...) end
 if not e.__OCA then e.__OCA=SH.Heroes.GetCombatATK end
 SH.Heroes.GetCombatATK=function(...) if e.hDmg then if e.hDmgIgn=="Boss"and e.__BSA then return e.__OCA(...) end;return 1e50 end;return e.__OCA(...) end
+-- Config.StatKeys grew a whole loot/economy layer since the last pass (Luck,
+-- drop-amount/chance multipliers, magnet range, power-roll crit, rune luck) --
+-- same GetStat interception point the hSpd/aClk hooks already use, just wider.
+-- Left off enemy-side keys (MaxEnemiesPerZone, mutation/size chances) on purpose --
+-- those drive server-authoritative spawns, not the client's own stat read.
+local LUCK_STATS={
+    Luck=1000,RuneLuck=1000,ExtraColumnChance=1,
+    GoldDropAmount=1000,XPDropAmount=1000,BeansDropAmount=1000,BeansDropChance=1000,
+    MaterialDropAmount=100,PotionDropChance=1000,TicketDropChance=1000,
+    MagnetRange=300,PowerCritChance=1,PowerChargePerRoll=1,PowerCapacity=999,
+}
 if not e.__OGS then e.__OGS=SH.GetStat end
 SH.GetStat=function(n,...)
     if e.hSpd and n=="HeroAttackSpeed" then if e.hSpdIgn=="Boss"and e.__BSA then return e.__OGS(n,...) end;return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackDpsFraction" then return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackMaxPerSec" then return 1000 end
+    if e.aLuck and LUCK_STATS[n] then return LUCK_STATS[n] end
     return e.__OGS(n,...)
 end
 task.spawn(function()
@@ -269,6 +287,68 @@ local function buildRuneList()
     return table.concat(lines,"\n")
 end
 
+-- ===== Fusion =====
+-- FuseHero's server validator (shared.Fusion.Fusion.BuildPlan) rejects before
+-- touching inventory if fromStar/size don't check out, so a bad call is a
+-- silent no-op, not a wasted dupe. Riding the game's own GetOwnedBuckets +
+-- GetNextFusableStar means the args are exactly what FusionView would send.
+local fuseStatus="Idle"
+local function autoFuseTick()
+    if not e.aFuse then fuseStatus="Off";return end
+    local ok,buckets=pcall(function() return Inv.GetOwnedBuckets() end)
+    if not ok or not buckets then fuseStatus="Error reading inventory";return end
+    local did=0
+    for _,b in ipairs(buckets) do
+        local ok2,entry=pcall(function() return Inv.GetHeroEntry(b.HeroId) end)
+        local sz=ok2 and entry and entry.Sizes and entry.Sizes[b.Size]
+        if sz then
+            local ok3,star=pcall(function() return FSH.GetNextFusableStar(sz) end)
+            if ok3 and star then
+                pcall(function() FCL.RequestFuse(b.HeroId,b.Size,star,{}) end)
+                did+=1
+            end
+        end
+    end
+    fuseStatus=did>0 and("Fused "..did.." batch(es) this pass")or"Nothing fusable"
+end
+task.spawn(function() while e.__G==G do autoFuseTick();task.wait(2) end end)
+
+-- ===== Codes =====
+local codeStatus="Idle"
+local function redeemCode(code)
+    code=(code or""):gsub("^%s+",""):gsub("%s+$","")
+    if code=="" then return end
+    local ok,res=pcall(function() return NW.InvokeServer("RedeemCode",code) end)
+    if not ok or type(res)~="table" then codeStatus=code..": try again in a moment.";return end
+    codeStatus=code..": "..(res.message or(res.success and"Redeemed!"or"Failed"))
+end
+local function redeemCodeList(text)
+    task.spawn(function()
+        for line in (text or""):gmatch("[^\r\n,]+") do
+            redeemCode(line);task.wait(1)
+        end
+    end)
+end
+
+-- ===== Crate Pity =====
+local function buildPityList()
+    local ok,pity=pcall(function() return NW.InvokeServer("GetCratePity") end)
+    if not ok or type(pity)~="table" then return "Failed to load" end
+    local lines={}
+    for crateName,crate in pairs(CrateData.Crates) do
+        if crate.Pity then
+            for _,itemName in ipairs(crate.Order or{}) do
+                local need=crate.Pity[itemName]
+                if need then
+                    table.insert(lines,string.format("[%s] %s Pity: %d/%d",crateName,itemName,pity[itemName]or 0,need))
+                end
+            end
+        end
+    end
+    table.sort(lines)
+    return #lines>0 and table.concat(lines,"\n")or"No pity-tracked crates found"
+end
+
 -- ===== UI =====
 print("[RNG] Loading UI...")
 -- Used to cache e.__LIB across reloads to skip the re-fetch -- but this script
@@ -288,19 +368,22 @@ task.wait()
 if e.__G~=G or e.__tok~=myUID then print("[RNG] Aborted") return end
 pcall(function() if e.__W then e.__W:Unload() end end)
 
-local W=Lib:Window({Title="RNG Heroes",Subtitle="v5.12",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
+local W=Lib:Window({Title="RNG Heroes",Subtitle="v6.0",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
 local TG=W:TabGroup()
 local TA  =TG:Tab({Name="Auto",    Image="rbxassetid://10723343321"})
 local TPr =TG:Tab({Name="Prestige",Image="rbxassetid://10734963191"})
 local TH  =TG:Tab({Name="Heroes",  Image="rbxassetid://6022668955"})
 local TB  =TG:Tab({Name="Boss",    Image="rbxassetid://10734975692"})
 local TRune=TG:Tab({Name="Runes",  Image="rbxassetid://10723343321"})
+local TE  =TG:Tab({Name="Extra",   Image="rbxassetid://10723343321"})
 local TM  =TG:Tab({Name="Misc",    Image="rbxassetid://10723343321"})
 
 -- Auto tab
 local AL=TA:Section({Side="Left"})
 AL:Header({Text="Roll"})
 AL:Toggle({Name="Auto Roll",Default=e.aRoll,Callback=function(v) e.aRoll=v;ar();sv() end},"aRoll")
+AL:Header({Text="Loot Stats  (client-side GetStat override)"})
+AL:Toggle({Name="Max Luck",Default=e.aLuck,Callback=function(v) e.aLuck=v;sv() end},"aLuck")
 AL:Header({Text="Daily & Offline"})
 AL:Toggle({Name="Auto Daily",Default=e.aDly,Callback=function(v) e.aDly=v;sv() end},"aDly")
 local AR=TA:Section({Side="Right"})
@@ -332,6 +415,9 @@ HL:Toggle({Name="Infinite Damage",Default=e.hDmg,Callback=function(v) e.hDmg=v;s
 HL:Dropdown({Name="  Ignore DMG",Options={"None","Boss"},Default=e.hDmgIgn,Callback=function(v) e.hDmgIgn=v;sv() end},"hDmgIgn")
 HL:Toggle({Name="Atk Speed x1000",Default=e.hSpd,Callback=function(v) e.hSpd=v;sv() end},"hSpd")
 HL:Dropdown({Name="  Ignore ATK",Options={"None","Boss"},Default=e.hSpdIgn,Callback=function(v) e.hSpdIgn=v;sv() end},"hSpdIgn")
+HL:Header({Text="Fusion"})
+HL:Toggle({Name="Auto Fuse",Default=e.aFuse,Callback=function(v) e.aFuse=v;sv() end},"aFuse")
+local fuseLbl=HL:Label({Text="Idle"})
 local HR_=TH:Section({Side="Right"})
 local heroLbl=HR_:Label({Text="HP:ok  DMG:ok  ATK:ok"})
 local bsLbl=HR_:Label({Text="Boss: -"})
@@ -379,6 +465,16 @@ RRight:Button({Name="Refresh",Callback=function()
 end})
 RRight:Label({Text="Rune Effects Reference:\nBean — BeanFind x (Rare)\nBlade — HeroDamage x (Rare)\nCrit — CritChance + (Epic)\nFortune — Luck x (Legendary)\nGreed — Gold x (Epic)\nHavoc — CritDamage + (Legendary)\nSwift — HeroAttackSpeed x (Rare)\nWisdom — XP x (Epic)"})
 
+-- Extra tab
+local EL=TE:Section({Side="Left"})
+EL:Header({Text="Redeem Codes"})
+EL:Input({Name="Code(s)",Placeholder="code1, code2, ...",Default="",Callback=function(t) redeemCodeList(t) end})
+local codeLbl=EL:Label({Text="Idle"})
+local ER=TE:Section({Side="Right"})
+ER:Header({Text="Crate Pity"})
+local pityLbl=ER:Label({Text="Loading..."})
+ER:Button({Name="Refresh",Callback=function() pcall(function() pityLbl:UpdateName(buildPityList()) end) end})
+
 -- Misc tab
 local MsL=TM:Section({Side="Left"})
 MsL:Header({Text="System"})
@@ -417,6 +513,16 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    task.wait(2)
+    pcall(function() pityLbl:UpdateName(buildPityList()) end)
+    while e.__G==G do
+        task.wait(1)
+        pcall(function() fuseLbl:UpdateName(fuseStatus) end)
+        pcall(function() codeLbl:UpdateName(codeStatus) end)
+    end
+end)
+
+task.spawn(function()
     while e.__G==G do
         pcall(chkBoss);pcall(chkDly)
         pcall(chkAll,
@@ -438,4 +544,4 @@ end)
 
 e.__W=W
 TA:Select()
-print("[RNG] v5.12 OK")
+print("[RNG] v6.0 OK")
