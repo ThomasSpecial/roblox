@@ -34,7 +34,9 @@ local Currency=require(ClientF:WaitForChild("Currency",10):WaitForChild("Currenc
 local FSH=require(SharedF:WaitForChild("Fusion",10):WaitForChild("Fusion",10))
 local FCL=require(ClientF:WaitForChild("Fusion",10):WaitForChild("Fusion",10))
 local Inv=require(ClientF:WaitForChild("Inventory",10):WaitForChild("Inventory",10))
-local CrateData=require(SharedF:WaitForChild("Items",10):WaitForChild("CrateData",10))
+local TowerData=require(SharedF:WaitForChild("Tower",10):WaitForChild("TowerData",10))
+local Crafting=require(SharedF:WaitForChild("Crafting",10):WaitForChild("Crafting",10))
+local Items=require(ClientF:WaitForChild("Items",10):WaitForChild("Items",10))
 print("[RNG] Modules ready")
 -- RuneData hardcoded เพราะ require ใน thread 8 callback ไม่ได้
 local RUNE_COST = 25
@@ -51,7 +53,7 @@ local RUNE_INFO = {
 }
 
 local SF="RNGHeroesAutomation/state.json"
-local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt","aFuse","aLuck"}
+local SK={"aRoll","aPre","aClk","aSC","aAfk","aBoss","aRec","fSpt","bSpt","aDly","hGod","hSpd","hDmg","wSpd","wJmp","hDmgIgn","hSpdIgn","aRune","aRuneAmt","aFuse","aCraft","aCraftList","aTower","aTowerTier","aTowerBackToFarm","aTowerUpgOn","aTowerUpg"}
 pcall(function() if not isfolder("RNGHeroesAutomation") then makefolder("RNGHeroesAutomation") end end)
 local function sv() local d={} for _,k in ipairs(SK) do d[k]=e[k] end;pcall(function() writefile(SF,HS:JSONEncode(d)) end) end
 pcall(function() local c=readfile(SF);local d=HS:JSONDecode(c);for _,k in ipairs(SK) do if d[k]~=nil and e[k]==nil then e[k]=d[k] end end end)
@@ -59,12 +61,21 @@ if e.aRoll==nil then e.aRoll=true end
 if e.aAfk==nil then e.aAfk=true end
 if e.aRec==nil then e.aRec=true end
 if e.aDly==nil then e.aDly=true end
-if e.hDmgIgn==nil then e.hDmgIgn="None" end
-if e.hSpdIgn==nil then e.hSpdIgn="None" end
+-- hDmgIgn/hSpdIgn used to be a single string ("None"/"Boss"); now a multi-select
+-- list of zones to ignore. Migrate an old string value from a saved state.json
+-- straight into the new list shape instead of dropping it.
+if type(e.hDmgIgn)~="table" then e.hDmgIgn=(e.hDmgIgn and e.hDmgIgn~="None")and{e.hDmgIgn}or{} end
+if type(e.hSpdIgn)~="table" then e.hSpdIgn=(e.hSpdIgn and e.hSpdIgn~="None")and{e.hSpdIgn}or{} end
 if e.aRune==nil then e.aRune=false end
 if e.aRuneAmt==nil then e.aRuneAmt=1 end
 if e.aFuse==nil then e.aFuse=false end
-if e.aLuck==nil then e.aLuck=false end
+if e.aCraft==nil then e.aCraft=false end
+if e.aCraftList==nil then e.aCraftList={} end
+if e.aTower==nil then e.aTower=false end
+if e.aTowerTier==nil then e.aTowerTier=1 end
+if e.aTowerBackToFarm==nil then e.aTowerBackToFarm=true end
+if e.aTowerUpgOn==nil then e.aTowerUpgOn=false end
+if e.aTowerUpg==nil then e.aTowerUpg={} end
 
 -- roll speed x1000
 task.spawn(function()
@@ -111,26 +122,27 @@ if not e.__OAD then e.__OAD=HR.ApplyLocalDamage end
 HR.ApplyLocalDamage=function(a,b,c,d,...) if e.hGod then return end;return e.__OAD(a,b,c,d,...) end
 if not e.__ONF then e.__ONF=NW.FireServer end
 NW.FireServer=function(ev,...) if e.hGod and(ev=="ReportEnemyAttack"or ev=="ReportBossAoeHit")then local a={...};a[#a]=0;return e.__ONF(ev,table.unpack(a))end;return e.__ONF(ev,...) end
+-- "Tower" ignore option rides the same e.__BSA-style flag as "Boss" -- e.__InTower
+-- is kept current by the TowerDelta listener below (kind=="Floor"/"End"), a second
+-- Connect on the same RemoteEvent, so the game's own Tower.lua listener is untouched.
 if not e.__OCA then e.__OCA=SH.Heroes.GetCombatATK end
-SH.Heroes.GetCombatATK=function(...) if e.hDmg then if e.hDmgIgn=="Boss"and e.__BSA then return e.__OCA(...) end;return 1e50 end;return e.__OCA(...) end
--- Config.StatKeys grew a whole loot/economy layer since the last pass (Luck,
--- drop-amount/chance multipliers, magnet range, power-roll crit, rune luck) --
--- same GetStat interception point the hSpd/aClk hooks already use, just wider.
--- Left off enemy-side keys (MaxEnemiesPerZone, mutation/size chances) on purpose --
--- those drive server-authoritative spawns, not the client's own stat read.
-local LUCK_STATS={
-    Luck=1000,RuneLuck=1000,ExtraColumnChance=1,
-    GoldDropAmount=1000,XPDropAmount=1000,BeansDropAmount=1000,BeansDropChance=1000,
-    MaterialDropAmount=100,PotionDropChance=1000,TicketDropChance=1000,
-    MagnetRange=300,PowerCritChance=1,PowerChargePerRoll=1,PowerCapacity=999,
-}
+SH.Heroes.GetCombatATK=function(...) if e.hDmg then if(table.find(e.hDmgIgn or{},"Boss")and e.__BSA)or(table.find(e.hDmgIgn or{},"Tower")and e.__InTower)then return e.__OCA(...) end;return 1e50 end;return e.__OCA(...) end
 if not e.__OGS then e.__OGS=SH.GetStat end
 SH.GetStat=function(n,...)
-    if e.hSpd and n=="HeroAttackSpeed" then if e.hSpdIgn=="Boss"and e.__BSA then return e.__OGS(n,...) end;return 1000 end
+    if e.hSpd and n=="HeroAttackSpeed" then if(table.find(e.hSpdIgn or{},"Boss")and e.__BSA)or(table.find(e.hSpdIgn or{},"Tower")and e.__InTower)then return e.__OGS(n,...) end;return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackDpsFraction" then return 1000 end
     if (e.aClk or e.aSC) and n=="ClickAttackMaxPerSec" then return 1000 end
-    if e.aLuck and LUCK_STATS[n] then return LUCK_STATS[n] end
     return e.__OGS(n,...)
+end
+if not e.__TDL then
+    e.__TDL=true
+    pcall(function()
+        NW.OnClientEvent("TowerDelta",function(p1)
+            if type(p1)~="table" then return end
+            if p1.kind=="Floor" then e.__InTower=true;e.__TowerFloor=p1.floor
+            elseif p1.kind=="End" then e.__InTower=false end
+        end)
+    end)
 end
 task.spawn(function()
     while e.__G==G do
@@ -179,6 +191,12 @@ local function chkBoss()
     local ok,st=pcall(function() return GBS:InvokeServer() end)
     e.__BSA=(ok and st~=nil)
     if not e.aBoss then bStat="Off";return end
+    -- Tower has the floor while Auto Tower is actively running one -- warping out to
+    -- fight a boss mid-run abandons it and the key that bought it. Gated on e.aTower
+    -- too, not just e.__InTower: that flag only clears on the server's own "End"
+    -- delta, so if the user flicks Auto Tower off mid-run it can stay stuck true with
+    -- nothing driving it -- without this it would silently mute Auto Boss forever.
+    if e.aTower and e.__InTower then bStat="Skipped (Tower active)";return end
     if not ok then bStat="Error";return end
     local a=e.__BSA
     if a and not e.__IBA then
@@ -196,10 +214,18 @@ local function chkBoss()
     else bStat="Waiting..." end
 end
 local _xpLast,_xpT=nil,nil
+-- Tower's GetTierClearDPS scales with G=1.09 per floor, 25 floors/tier -- by
+-- tier 10 that's already north of 1e13. Capped at B before, so Tier 10 printed
+-- as a bare "18125B" instead of stepping up a suffix. Extended through Qi
+-- (1e18) for headroom against however high tiers keep climbing.
 local function fmt(n)
-    if n>=1e9 then return string.format("%.2fB",n/1e9)
+    n=n or 0
+    if n>=1e18 then return string.format("%.2fQi",n/1e18)
+    elseif n>=1e15 then return string.format("%.2fQa",n/1e15)
+    elseif n>=1e12 then return string.format("%.2fT",n/1e12)
+    elseif n>=1e9 then return string.format("%.2fB",n/1e9)
     elseif n>=1e6 then return string.format("%.1fM",n/1e6)
-    elseif n>=1e3 then return string.format("%.0fK",n/1e3)
+    elseif n>=1e3 then return string.format("%.1fK",n/1e3)
     else return tostring(math.floor(n)) end
 end
 local function chkAll(preCb,lvCb,xpCb,pEtaCb)
@@ -313,41 +339,126 @@ local function autoFuseTick()
 end
 task.spawn(function() while e.__G==G do autoFuseTick();task.wait(2) end end)
 
--- ===== Codes =====
-local codeStatus="Idle"
-local function redeemCode(code)
-    code=(code or""):gsub("^%s+",""):gsub("%s+$","")
-    if code=="" then return end
-    local ok,res=pcall(function() return NW.InvokeServer("RedeemCode",code) end)
-    if not ok or type(res)~="table" then codeStatus=code..": try again in a moment.";return end
-    codeStatus=code..": "..(res.message or(res.success and"Redeemed!"or"Failed"))
-end
-local function redeemCodeList(text)
-    task.spawn(function()
-        for line in (text or""):gmatch("[^\r\n,]+") do
-            redeemCode(line);task.wait(1)
-        end
-    end)
-end
-
--- ===== Crate Pity =====
-local function buildPityList()
-    local ok,pity=pcall(function() return NW.InvokeServer("GetCratePity") end)
-    if not ok or type(pity)~="table" then return "Failed to load" end
-    local lines={}
-    for crateName,crate in pairs(CrateData.Crates) do
-        if crate.Pity then
-            for _,itemName in ipairs(crate.Order or{}) do
-                local need=crate.Pity[itemName]
-                if need then
-                    table.insert(lines,string.format("[%s] %s Pity: %d/%d",crateName,itemName,pity[itemName]or 0,need))
+-- ===== Craft =====
+-- Reuses Crafting.MaxAffordable(recipe, Items.GetCount) verbatim -- the exact
+-- function CraftingView calls -- instead of re-deriving cost math. GetCraftDaily
+-- returns USED counts per recipe Id (confirmed live: Hammer showed 2 with
+-- DailyLimit=2, i.e. already exhausted today), not remaining, so remaining is
+-- DailyLimit-used, clamped at 0. CraftItem is rate-limited 5 calls/sec server-side --
+-- staggered 0.3s apart here so a full-list selection can't burst past it.
+local craftStatus="Idle"
+local function autoCraftTick()
+    if not e.aCraft then craftStatus="Off";return end
+    local list=e.aCraftList
+    if not list or #list==0 then craftStatus="On, but nothing selected";return end
+    local ok,daily=pcall(function() return NW.InvokeServer("GetCraftDaily") end)
+    if not ok or type(daily)~="table" then daily={} end
+    local did=0
+    for _,id in ipairs(list) do
+        local recipe=Crafting.GetRecipe(id)
+        if recipe then
+            local ok2,afford=pcall(function() return Crafting.MaxAffordable(recipe,Items.GetCount) end)
+            if ok2 and afford and afford>0 then
+                local remaining=afford
+                if recipe.DailyLimit then
+                    remaining=math.min(remaining,math.max(0,recipe.DailyLimit-(daily[id]or 0)))
+                end
+                if remaining>=1 then
+                    pcall(function() NW.InvokeServer("CraftItem",id,remaining) end)
+                    did+=1
+                    task.wait(0.3)
                 end
             end
         end
     end
-    table.sort(lines)
-    return #lines>0 and table.concat(lines,"\n")or"No pity-tracked crates found"
+    craftStatus=did>0 and("Crafted "..did.." recipe(s) this pass")or"Nothing craftable right now"
 end
+task.spawn(function() while e.__G==G do autoCraftTick();task.wait(5) end end)
+
+-- ===== Tower =====
+-- EnterTower takes the TIER number (not a raw floor) -- confirmed from Tower.lua's
+-- own selector (u202) feeding straight into Network.InvokeServer("EnterTower", u202).
+-- Run-active state (e.__InTower) comes from the TowerDelta listener above, so this
+-- never re-enters mid-run. enteringUntil is a local debounce on top of that in case
+-- the delta hasn't arrived yet -- EnterTower is rate-limited 5/5s so nothing exotic,
+-- just cheap insurance against double-spending a key on a race.
+local towerStatus="Idle"
+local towerRanOut=false
+local towerEnteringUntil=0
+local function autoTowerTick()
+    if not e.aTower then towerStatus="Off";towerRanOut=false;return end
+    -- Run-active check comes FIRST, before the keys check. EnterTower spends a key
+    -- immediately, so Currency.Get("TowerKeys") reads 0 the moment a run starts on
+    -- your last key -- checking keys first was reading that as "ran out", firing
+    -- LeaveTower on a run that had 240s left on the clock. A run already paid for
+    -- runs to completion regardless of what the wallet says.
+    if e.__InTower or os.clock()<towerEnteringUntil then
+        towerRanOut=false
+        towerStatus="In tower (floor "..tostring(e.__TowerFloor or"?")..")"
+        return
+    end
+    local keys=0
+    pcall(function() keys=Currency.Get("TowerKeys") end)
+    if keys<=0 then
+        if not towerRanOut then
+            towerRanOut=true
+            if e.aTowerBackToFarm then
+                local h=hh()
+                if h and e.fSpt then pcall(function() h.CFrame=t2c(e.fSpt) end);towerStatus="Out of keys -- back to farm spot"
+                else towerStatus="Out of keys -- no farm spot saved (Boss tab)" end
+            else
+                towerStatus="Out of keys"
+            end
+        end
+        return
+    end
+    towerRanOut=false
+    -- Boss wins the handoff on the way back in: e.__IBA is chkBoss's own "currently
+    -- warped to the boss arena" flag. Holding off here means a boss that shows up
+    -- right as a tower run ends gets fought first -- tower resumes the moment
+    -- chkBoss clears __IBA and returns the player to the farm spot.
+    if e.aBoss and e.__IBA then
+        towerStatus="Boss fight in progress -- tower paused"
+        return
+    end
+    towerEnteringUntil=os.clock()+6
+    local ok,res=pcall(function() return NW.InvokeServer("EnterTower",e.aTowerTier or 1) end)
+    if ok and type(res)=="table" and res.ok then
+        towerStatus="Entered tier "..(e.aTowerTier or 1).." (floor "..tostring(res.floor or"?")..")"
+    else
+        towerEnteringUntil=0
+        towerStatus="Enter failed"..((ok and type(res)=="table" and res.err)and(": "..tostring(res.err))or"")
+    end
+end
+task.spawn(function() while e.__G==G do autoTowerTick();task.wait(3) end end)
+
+-- BuyTowerUpgrade is rate-limited 10 calls/5s server-side; capped at 8/tick with a
+-- 6s tick interval so consecutive ticks never share a rate-limit window. Round-robins
+-- the selected upgrades so one maxed/unaffordable id doesn't starve the others.
+local towerUpgStatus="Idle"
+local function autoTowerUpgradeTick()
+    if not e.aTowerUpgOn then towerUpgStatus="Off";return end
+    local sel=e.aTowerUpg
+    if not sel or #sel==0 then towerUpgStatus="On, but nothing selected";return end
+    local pool={}
+    for _,id in ipairs(sel) do table.insert(pool,id) end
+    local bought=0
+    local budget=8
+    while budget>0 and #pool>0 do
+        local id=pool[1]
+        local ok,res=pcall(function() return NW.InvokeServer("BuyTowerUpgrade",id) end)
+        budget-=1
+        if not ok or not res or(type(res)=="table"and res.err)then
+            table.remove(pool,1)
+        else
+            bought+=1
+            table.remove(pool,1);table.insert(pool,id)
+            task.wait(0.1)
+        end
+    end
+    towerUpgStatus=bought>0 and("Bought "..bought.." level(s) this pass")or"Nothing affordable right now"
+end
+task.spawn(function() while e.__G==G do autoTowerUpgradeTick();task.wait(6) end end)
 
 -- ===== UI =====
 print("[RNG] Loading UI...")
@@ -368,22 +479,21 @@ task.wait()
 if e.__G~=G or e.__tok~=myUID then print("[RNG] Aborted") return end
 pcall(function() if e.__W then e.__W:Unload() end end)
 
-local W=Lib:Window({Title="RNG Heroes",Subtitle="v6.0",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
+local W=Lib:Window({Title="RNG Heroes",Subtitle="v6.4",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
 local TG=W:TabGroup()
 local TA  =TG:Tab({Name="Auto",    Image="rbxassetid://10723343321"})
 local TPr =TG:Tab({Name="Prestige",Image="rbxassetid://10734963191"})
 local TH  =TG:Tab({Name="Heroes",  Image="rbxassetid://6022668955"})
 local TB  =TG:Tab({Name="Boss",    Image="rbxassetid://10734975692"})
 local TRune=TG:Tab({Name="Runes",  Image="rbxassetid://10723343321"})
-local TE  =TG:Tab({Name="Extra",   Image="rbxassetid://10723343321"})
+local TC  =TG:Tab({Name="Craft",   Image="rbxassetid://10723343321"})
+local TW  =TG:Tab({Name="Tower",   Image="rbxassetid://10723343321"})
 local TM  =TG:Tab({Name="Misc",    Image="rbxassetid://10723343321"})
 
 -- Auto tab
 local AL=TA:Section({Side="Left"})
 AL:Header({Text="Roll"})
 AL:Toggle({Name="Auto Roll",Default=e.aRoll,Callback=function(v) e.aRoll=v;ar();sv() end},"aRoll")
-AL:Header({Text="Loot Stats  (client-side GetStat override)"})
-AL:Toggle({Name="Max Luck",Default=e.aLuck,Callback=function(v) e.aLuck=v;sv() end},"aLuck")
 AL:Header({Text="Daily & Offline"})
 AL:Toggle({Name="Auto Daily",Default=e.aDly,Callback=function(v) e.aDly=v;sv() end},"aDly")
 local AR=TA:Section({Side="Right"})
@@ -412,9 +522,25 @@ HL:Header({Text="Defense"})
 HL:Toggle({Name="Infinite Health",Default=e.hGod,Callback=function(v) e.hGod=v;sv() end},"hGod")
 HL:Header({Text="Offense"})
 HL:Toggle({Name="Infinite Damage",Default=e.hDmg,Callback=function(v) e.hDmg=v;sv() end},"hDmg")
-HL:Dropdown({Name="  Ignore DMG",Options={"None","Boss"},Default=e.hDmgIgn,Callback=function(v) e.hDmgIgn=v;sv() end},"hDmgIgn")
+HL:Dropdown({
+    Name="  Ignore DMG",Multi=true,Options={"Boss","Tower"},Default=e.hDmgIgn,
+    Callback=function(sel)
+        local list={}
+        for id in pairs(sel) do table.insert(list,id) end
+        table.sort(list)
+        e.hDmgIgn=list;sv()
+    end,
+},"hDmgIgn")
 HL:Toggle({Name="Atk Speed x1000",Default=e.hSpd,Callback=function(v) e.hSpd=v;sv() end},"hSpd")
-HL:Dropdown({Name="  Ignore ATK",Options={"None","Boss"},Default=e.hSpdIgn,Callback=function(v) e.hSpdIgn=v;sv() end},"hSpdIgn")
+HL:Dropdown({
+    Name="  Ignore ATK",Multi=true,Options={"Boss","Tower"},Default=e.hSpdIgn,
+    Callback=function(sel)
+        local list={}
+        for id in pairs(sel) do table.insert(list,id) end
+        table.sort(list)
+        e.hSpdIgn=list;sv()
+    end,
+},"hSpdIgn")
 HL:Header({Text="Fusion"})
 HL:Toggle({Name="Auto Fuse",Default=e.aFuse,Callback=function(v) e.aFuse=v;sv() end},"aFuse")
 local fuseLbl=HL:Label({Text="Idle"})
@@ -465,15 +591,86 @@ RRight:Button({Name="Refresh",Callback=function()
 end})
 RRight:Label({Text="Rune Effects Reference:\nBean — BeanFind x (Rare)\nBlade — HeroDamage x (Rare)\nCrit — CritChance + (Epic)\nFortune — Luck x (Legendary)\nGreed — Gold x (Epic)\nHavoc — CritDamage + (Legendary)\nSwift — HeroAttackSpeed x (Rare)\nWisdom — XP x (Epic)"})
 
--- Extra tab
-local EL=TE:Section({Side="Left"})
-EL:Header({Text="Redeem Codes"})
-EL:Input({Name="Code(s)",Placeholder="code1, code2, ...",Default="",Callback=function(t) redeemCodeList(t) end})
-local codeLbl=EL:Label({Text="Idle"})
-local ER=TE:Section({Side="Right"})
-ER:Header({Text="Crate Pity"})
-local pityLbl=ER:Label({Text="Loading..."})
-ER:Button({Name="Refresh",Callback=function() pcall(function() pityLbl:UpdateName(buildPityList()) end) end})
+-- Craft tab
+local CL=TC:Section({Side="Left"})
+CL:Header({Text="Auto Craft  (5 calls/sec cap, staggered)"})
+CL:Toggle({Name="Auto Craft",Default=e.aCraft,Callback=function(v) e.aCraft=v;sv() end},"aCraft")
+local craftIds={}
+pcall(function() for _,r in ipairs(Crafting.GetOrderedRecipes()) do table.insert(craftIds,r.Id) end end)
+CL:Dropdown({
+    Name="Recipes",Multi=true,Options=craftIds,Default=e.aCraftList or {},
+    Callback=function(sel)
+        local list={}
+        for id in pairs(sel) do table.insert(list,id) end
+        table.sort(list)
+        e.aCraftList=list;sv()
+    end,
+})
+local craftLbl=CL:Label({Text="Idle"})
+local CR=TC:Section({Side="Right"})
+CR:Header({Text="Recipe Reference"})
+local recipeRefLines={}
+pcall(function()
+    for _,r in ipairs(Crafting.GetOrderedRecipes()) do
+        local costParts={}
+        for mat,amt in pairs(r.Costs or{}) do table.insert(costParts,amt.."x"..mat) end
+        table.sort(costParts)
+        local lim=r.DailyLimit and(" (daily "..r.DailyLimit..")")or""
+        table.insert(recipeRefLines,string.format("%s -> %s [%s]%s",r.Id,r.Output or r.OutputCurrency or"?",table.concat(costParts,","),lim))
+    end
+end)
+table.sort(recipeRefLines)
+CR:Label({Text=#recipeRefLines>0 and table.concat(recipeRefLines,"\n")or"Failed to load"})
+
+-- Tower tab
+local WL=TW:Section({Side="Left"})
+WL:Header({Text="Auto Tower"})
+WL:Toggle({
+    Name="Auto Tower",Default=e.aTower,
+    Callback=function(v)
+        e.aTower=v;sv()
+        if not v and e.__InTower then
+            pcall(function() NW.FireServer("LeaveTower") end)
+            local h=hh()
+            if h and e.fSpt then pcall(function() h.CFrame=t2c(e.fSpt) end) end
+        end
+    end,
+},"aTower")
+local towerTierOpts={}
+local towerTierLookup={}
+pcall(function()
+    local ts=NW.InvokeServer("GetTowerState")
+    local maxTier=(type(ts)=="table" and ts.maxTier) or 1
+    for i=1,math.min(maxTier,30) do
+        local dps=0
+        pcall(function() dps=TowerData.GetTierClearDPS(i) end)
+        local label=("Tier %d (DMG Require %s)"):format(i,fmt(dps))
+        table.insert(towerTierOpts,label)
+        towerTierLookup[label]=i
+    end
+end)
+if #towerTierOpts==0 then towerTierOpts={"Tier 1 (DMG Require ?)"};towerTierLookup[towerTierOpts[1]]=1 end
+WL:Dropdown({
+    Name="Tier",Multi=false,Options=towerTierOpts,
+    Default=towerTierOpts[math.min(e.aTowerTier or 1,#towerTierOpts)],
+    Callback=function(v) e.aTowerTier=towerTierLookup[v] or 1;sv() end,
+})
+local towerLbl=WL:Label({Text="Idle"})
+WL:Toggle({Name="Back to Farm on Empty Keys",Default=e.aTowerBackToFarm,Callback=function(v) e.aTowerBackToFarm=v;sv() end},"aTowerBackToFarm")
+WL:Label({Text="Uses the Boss tab's Farm Spot as the return point."})
+local WR=TW:Section({Side="Right"})
+WR:Header({Text="Auto Upgrade Tower  (10 calls/5s cap)"})
+WR:Toggle({Name="Auto Upgrade",Default=e.aTowerUpgOn,Callback=function(v) e.aTowerUpgOn=v;sv() end},"aTowerUpgOn")
+WR:Dropdown({
+    Name="Upgrades",Multi=true,Options={"Damage","Luck","Gold","XP"},Default=e.aTowerUpg or {},
+    Callback=function(sel)
+        local list={}
+        for id in pairs(sel) do table.insert(list,id) end
+        table.sort(list)
+        e.aTowerUpg=list;sv()
+    end,
+})
+local towerUpgLbl=WR:Label({Text="Idle"})
 
 -- Misc tab
 local MsL=TM:Section({Side="Left"})
@@ -513,12 +710,12 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    task.wait(2)
-    pcall(function() pityLbl:UpdateName(buildPityList()) end)
     while e.__G==G do
         task.wait(1)
         pcall(function() fuseLbl:UpdateName(fuseStatus) end)
-        pcall(function() codeLbl:UpdateName(codeStatus) end)
+        pcall(function() craftLbl:UpdateName(craftStatus) end)
+        pcall(function() towerLbl:UpdateName(towerStatus) end)
+        pcall(function() towerUpgLbl:UpdateName(towerUpgStatus) end)
     end
 end)
 
@@ -534,8 +731,8 @@ task.spawn(function()
         pcall(function() stLbl:UpdateName("Hits: "..e.__CC2) end)
         pcall(function() bossLbl:UpdateName(bStat) end)
         local hg=e.hGod and"GOD"or"ok"
-        local hd=e.hDmg and((e.hDmgIgn=="Boss"and e.__BSA)and"SKIP"or"INF")or"ok"
-        local hs=e.hSpd and((e.hSpdIgn=="Boss"and e.__BSA)and"SKIP"or"x1k")or"ok"
+        local hd=e.hDmg and(((table.find(e.hDmgIgn or{},"Boss")and e.__BSA)or(table.find(e.hDmgIgn or{},"Tower")and e.__InTower))and"SKIP"or"INF")or"ok"
+        local hs=e.hSpd and(((table.find(e.hSpdIgn or{},"Boss")and e.__BSA)or(table.find(e.hSpdIgn or{},"Tower")and e.__InTower))and"SKIP"or"x1k")or"ok"
         pcall(function() heroLbl:UpdateName("HP:"..hg.."  DMG:"..hd.."  ATK:"..hs) end)
         pcall(function() bsLbl:UpdateName("Boss: "..(e.__BSA and"ACTIVE"or"none")) end)
         task.wait(3)
@@ -544,4 +741,4 @@ end)
 
 e.__W=W
 TA:Select()
-print("[RNG] v6.0 OK")
+print("[RNG] v6.4 OK")
