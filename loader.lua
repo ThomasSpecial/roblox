@@ -15,6 +15,9 @@ local PLACE_SCRIPTS = {
     -- a gap being filled -- whichever URL sits on this line is the one that loads.
     [90086669327265]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/cutgrass.lua",  -- +1 Cut Grass Adventure
     [105954652742326] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/mutant_plants.lua", -- Mutant Plants: Base Defense[World Boss]
+    -- Not ours -- hands off to Ouroboros' CreatorId dispatcher, same as the Grow a
+    -- Chicken Fighter entry above.
+    [74729868188364]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Fish an Anime RNG
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
