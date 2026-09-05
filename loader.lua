@@ -18,7 +18,12 @@ local PLACE_SCRIPTS = {
     -- Not ours -- hands off to Ouroboros' CreatorId dispatcher, same as the Grow a
     -- Chicken Fighter entry above.
     [74729868188364]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Fish an Anime RNG
-    [106484206883664] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr (ClickBytes)
+    -- Dungeon Lootr is a multi-place universe: 106484206883664 is the RELEASE
+    -- lobby, 132285059959516 is the [Gameplay] sub-place you get teleported into.
+    -- Both need the entry -- a direct join into a gameplay server never touches
+    -- the lobby, so Ouroboros' queue_on_teleport persistence never gets armed.
+    [106484206883664] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr [RELEASE] (ClickBytes)
+    [132285059959516] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr [Gameplay] (ClickBytes)
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
