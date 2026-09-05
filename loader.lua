@@ -18,6 +18,7 @@ local PLACE_SCRIPTS = {
     -- Not ours -- hands off to Ouroboros' CreatorId dispatcher, same as the Grow a
     -- Chicken Fighter entry above.
     [74729868188364]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Fish an Anime RNG
+    [106484206883664] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr (ClickBytes)
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
