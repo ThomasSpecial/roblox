@@ -21,9 +21,10 @@ local PLACE_SCRIPTS = {
     -- Dungeon Lootr is a multi-place universe: 106484206883664 is the RELEASE
     -- lobby, 132285059959516 is the [Gameplay] sub-place you get teleported into.
     -- Both need the entry -- a direct join into a gameplay server never touches
-    -- the lobby, so Ouroboros' queue_on_teleport persistence never gets armed.
-    [106484206883664] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr [RELEASE] (ClickBytes)
-    [132285059959516] = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Dungeon Lootr [Gameplay] (ClickBytes)
+    -- the lobby. Luarmor loader: needs getgenv().script_key set BEFORE this runs;
+    -- the autoexec does that locally so the key never lands in this public repo.
+    [106484206883664] = "https://api.luarmor.net/files/v4/loaders/68c9fa895f076506ac0b47e12868d124.lua",   -- Dungeon Lootr [RELEASE] (Luarmor)
+    [132285059959516] = "https://api.luarmor.net/files/v4/loaders/68c9fa895f076506ac0b47e12868d124.lua",   -- Dungeon Lootr [Gameplay] (Luarmor)
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
