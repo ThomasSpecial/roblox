@@ -36,7 +36,8 @@ local function fireRemote(name,...)
 	local f=remotesFolder()
 	local r=f and f:FindFirstChild(name)
 	if r and r:IsA("RemoteEvent") then
-		pcall(function() r:FireServer(...) end)
+		local args={...}
+		pcall(function() r:FireServer(table.unpack(args)) end)
 		return true
 	end
 	return false
