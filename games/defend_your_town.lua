@@ -12,8 +12,10 @@ local HS=game:GetService("HttpService")
 local LP=Players.LocalPlayer
 
 local SF="DefendYourTown/state.json"
-local SK={"coinOn","prodOn","chestOn","startWaveOn","skipWaveOn","afkOn","recOn"}
-local COIN_BIG=1e9
+local SK={"coinOn","prodOn","chestOn","questOn","startWaveOn","skipWaveOn","afkOn","recOn"}
+-- 400 studs covers the whole plot. Do NOT use a huge value: the game's PickupLoot
+-- loops over a (2*radius/10)^2 grid every Heartbeat -- 1e9 = full client freeze.
+local COIN_BIG=400
 local COIN_DEF=25
 
 -- ===== game hooks =====
@@ -64,8 +66,9 @@ end)
 
 local function scanChests()
 	local gp=workspace:FindFirstChild("Gameplay")
-	if not gp then return end
-	for _,d in ipairs(gp:GetDescendants()) do
+	local bin=gp and gp:FindFirstChild("Bin")
+	if not bin then return end
+	for _,d in ipairs(bin:GetChildren()) do            -- Bin only -- ~40 items, not the whole map
 		if d:IsA("Model") then
 			local uq=d:GetAttribute("UnqiueID")
 			if uq and d:GetAttribute("DespawnAt") and not e.__chestSeen[uq] then
@@ -79,7 +82,18 @@ end
 task.spawn(function()
 	while e.__DYT==G do
 		if e.chestOn then pcall(scanChests) end
-		task.wait(0.5)
+		task.wait(1.5)
+	end
+end)
+
+-- ===== Auto Claim Quest (daily quests + daily goal; server ignores incomplete) =====
+task.spawn(function()
+	while e.__DYT==G do
+		if e.questOn then
+			for i=1,6 do fire("ClaimDailyQuestReward",i) end
+			fire("ClaimDailyGoalReward")
+		end
+		task.wait(5)
 	end
 end)
 
@@ -167,6 +181,8 @@ CL:Toggle({Name="Auto Collect Production",Default=e.prodOn,Callback=function(v)
 	sv()
 end},"prodOn")
 CL:Toggle({Name="Auto Open Chest",Default=e.chestOn,Callback=function(v) e.chestOn=v;sv() end},"chestOn")
+CL:Header({Text="Rewards"})
+CL:Toggle({Name="Auto Claim Quest",Default=e.questOn,Callback=function(v) e.questOn=v;sv() end},"questOn")
 local CR=TCollect:Section({Side="Right"})
 CR:Header({Text="Status"})
 local statLbl=CR:Label({Text="idle"})
