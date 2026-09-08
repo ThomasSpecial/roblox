@@ -25,6 +25,8 @@ local PLACE_SCRIPTS = {
     -- the autoexec does that locally so the key never lands in this public repo.
     [106484206883664] = "https://api.luarmor.net/files/v4/loaders/68c9fa895f076506ac0b47e12868d124.lua",   -- Dungeon Lootr [RELEASE] (Luarmor)
     [132285059959516] = "https://api.luarmor.net/files/v4/loaders/68c9fa895f076506ac0b47e12868d124.lua",   -- Dungeon Lootr [Gameplay] (Luarmor)
+    [70640255604878]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pull_an_egg.lua",      -- Pull An Egg
+    [87075726814250]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/defend_your_town.lua", -- Defend Your Town
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
