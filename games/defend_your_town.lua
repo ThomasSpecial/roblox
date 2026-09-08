@@ -12,7 +12,7 @@ local HS=game:GetService("HttpService")
 local LP=Players.LocalPlayer
 
 local SF="DefendYourTown/state.json"
-local SK={"coinOn","prodOn","chestOn","questOn","startWaveOn","skipWaveOn","afkOn","recOn"}
+local SK={"coinOn","prodOn","chestOn","questOn","startWaveOn","skipWaveOn","shieldOn","afkOn","recOn"}
 -- 400 studs covers the whole plot. Do NOT use a huge value: the game's PickupLoot
 -- loops over a (2*radius/10)^2 grid every Heartbeat -- 1e9 = full client freeze.
 local COIN_BIG=400
@@ -122,6 +122,31 @@ task.spawn(function()
 	end
 end)
 
+-- ===== Auto Shield (keep the town shield up whenever it's Ready -- the game's
+-- own raid protection; there is no client-side building invulnerability). =====
+local function myPlot()
+	local plots=workspace:FindFirstChild("Gameplay") and workspace.Gameplay:FindFirstChild("Plots")
+	if not plots then return end
+	local id=tostring(LP.UserId)
+	for _,p in ipairs(plots:GetChildren()) do
+		if tostring(p:GetAttribute("Owner"))==id then return p end
+	end
+end
+task.spawn(function()
+	while e.__DYT==G do
+		if e.shieldOn then
+			local plot=myPlot()
+			local st=plot and plot:GetAttribute("ShieldState")
+			local dur=LP:GetAttribute("TownShieldDuration") or 0
+			local cd=(plot and plot:GetAttribute("ShieldCooldown")) or 0
+			if not LP:GetAttribute("IsRaided") and dur<=0 and cd<=0 and (st==nil or st=="Ready") then
+				fire("ActivateShield")
+			end
+		end
+		task.wait(3)
+	end
+end)
+
 -- ===== Anti-AFK / Auto Reconnect =====
 if not e.__DYT_AFK then
 	e.__DYT_AFK=true
@@ -195,7 +220,9 @@ WL:Toggle({Name="Auto Skip Wave",Default=e.skipWaveOn,Callback=function(v)
 	if not v and LP:GetAttribute("AutoSkipWave") then fire("ToggleAutoSkipWave") end
 	sv()
 end},"skipWaveOn")
-WL:Label({Text="Skip has a 2s server cooldown between waves."})
+WL:Header({Text="Town Protection"})
+WL:Toggle({Name="Auto Shield",Default=e.shieldOn,Callback=function(v) e.shieldOn=v;sv() end},"shieldOn")
+WL:Label({Text="Buildings can't be made invulnerable client-side (server-authoritative). Auto Shield re-applies the town shield whenever it's Ready; pair with Auto Skip Wave."})
 
 local ML=TMisc:Section({Side="Left"})
 ML:Header({Text="System"})
