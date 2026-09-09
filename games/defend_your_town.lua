@@ -195,25 +195,17 @@ task.spawn(function()
 	end
 end)
 
--- ===== Auto Buy (Game Shop stock, only selected item ids) =====
+-- ===== Auto Buy (fire BuyFromGameShopStock per selected id; server no-ops if
+-- the item isn't in the current rotating stock or you can't afford it) =====
 local function autoBuy()
 	if #e.buyItems==0 then return end
-	local gs=LP.PlayerGui:FindFirstChild("GameShop")
-	if not gs then return end
-	local want={} for _,id in ipairs(e.buyItems) do want[id]=true end
-	local cash=LP:GetAttribute("Cash") or 0
-	for _,d in ipairs(gs:GetDescendants()) do
+	for _,id in ipairs(e.buyItems) do
 		if not e.buyOn or e.__DYT~=G then return end
-		local id=d:GetAttribute("ID")
-		if id and want[id] then
-			local typ=d:GetAttribute("Type") or ID_TO_TYPE[id]
-			local price=tonumber(d:GetAttribute("Price")) or 0
-			if typ and typ~="Product" and cash>=price then
-				fire("BuyFromGameShopStock",{Type=typ,ID=id})
-				e.__bought=(e.__bought or 0)+1
-				cash=cash-price
-				task.wait(0.3)
-			end
+		local typ=ID_TO_TYPE[id]
+		if typ then
+			fire("BuyFromGameShopStock",{Type=typ,ID=id})
+			e.__bought=(e.__bought or 0)+1
+			task.wait(0.35)
 		end
 	end
 end
@@ -244,22 +236,20 @@ local function autoSell()
 	end
 end
 
--- ===== Auto Buy Trader (Black Market -- only selected ids, when open) =====
+-- ===== Auto Buy Trader (fire BuyShopEventItem per selected id, only while the
+-- Black Market / trader event is live) =====
+local function traderLive()
+	local gp=workspace:FindFirstChild("Gameplay")
+	local bin=gp and gp:FindFirstChild("Bin")
+	return (bin and bin:FindFirstChild("TraderArea"))~=nil
+end
 local function autoTrader()
-	if not FMC or #e.traderItems==0 then return end
-	local bm=LP.PlayerGui:FindFirstChild("BlackMarket")
-	if not bm then return end
-	local want={} for _,id in ipairs(e.traderItems) do want[id]=true end
-	local seen={}
-	for _,d in ipairs(bm:GetDescendants()) do
+	if not FMC or #e.traderItems==0 or not traderLive() then return end
+	for _,id in ipairs(e.traderItems) do
 		if not e.traderOn or e.__DYT~=G then return end
-		local id=d:GetAttribute("ID")
-		if id and want[id] and not seen[id] then
-			seen[id]=true
-			invoke("BuyShopEventItem",id)
-			e.__bought=(e.__bought or 0)+1
-			task.wait(0.4)
-		end
+		invoke("BuyShopEventItem",id)
+		e.__bought=(e.__bought or 0)+1
+		task.wait(0.4)
 	end
 end
 
