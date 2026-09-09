@@ -14,12 +14,25 @@ local LP=Players.LocalPlayer
 local SF="DefendYourTown/state.json"
 local SK={"coinOn","prodOn","chestOn","questOn","startWaveOn","skipWaveOn","shieldOn",
 	"buyOn","sellOn","traderOn","afkOn","recOn"}
-local SKL={"buyCats","sellRars"}
+local SKL={"buyCats","buyItems","sellRars","traderItems"}
 local COIN_BIG=400
 local COIN_DEF=25
 local RARITIES={"Common","Uncommon","Rare","Epic","Mythic","Legendary","Void","Limited","Secret"}
-local BUY_CATS={"Fighter","Defense","Production","Walls"}
+local BUY_CATS={"Production","Defense","Fighter","Walls"}
 local UICAT_TO_TYPE={Fighter="Warrior",Defense="Defense",Production="Resource",Walls="Wall"}
+local TRADER_POOL={
+	{id="DamageBooster_1",label="Damage Booster"},
+	{id="HealthBooster_1",label="Health Booster"},
+	{id="CoinBooster_1",label="Coin Booster"},
+	{id="HealingTower_1",label="Healing Tower"},
+	{id="VoidCannon",label="Void Cannon"},
+	{id="VoidBallista",label="Void Ballista"},
+	{id="GemProduction_1",label="Gem Miner"},
+	{id="GemProduction_2",label="Gem Mine"},
+	{id="GemProduction_3",label="Gem Drill"},
+	{id="UltraBuildingSpeedPotion",label="Ultra Build Speed Potion"},
+	{id="UltraCoinPotion",label="Ultra Coin Potion"},
+}
 
 -- ===== game hooks =====
 local EMC;pcall(function() EMC=require(RS.Modules.EventManagerClient) end)
@@ -46,6 +59,29 @@ local function setCoinRadius(v)
 	pcall(debug.setupvalue,lootMod.UpdateMagnet,3,v)
 end
 
+-- ===== building catalog (id -> name/rarity/price, per UI category) =====
+local CATALOG={}         -- CATALOG[uiCat] = { {id, label, price} ... }
+local ID_TO_TYPE={}      -- item id -> game Type (Warrior/Defense/Resource/Wall)
+pcall(function()
+	local BI=require(RS.Data.BuildingsInfo)
+	for uiCat,gameType in pairs(UICAT_TO_TYPE) do
+		CATALOG[uiCat]={}
+		local t=BI.Buildings[gameType]
+		if type(t)=="table" then
+			for id,m in pairs(t) do
+				if typeof(m)=="Instance" then
+					local nm=m:GetAttribute("Name") or id
+					local rar=m:GetAttribute("Rarity") or "?"
+					local price=tonumber(m:GetAttribute("Price")) or 0
+					table.insert(CATALOG[uiCat],{id=id,label=("%s (%s)"):format(nm,rar),price=price})
+					ID_TO_TYPE[id]=gameType
+				end
+			end
+			table.sort(CATALOG[uiCat],function(a,b) return a.price<b.price end)
+		end
+	end
+end)
+
 -- ===== state =====
 pcall(function() if not isfolder("DefendYourTown") then makefolder("DefendYourTown") end end)
 local function sv()
@@ -62,8 +98,7 @@ end)
 if e.afkOn==nil then e.afkOn=true end
 if e.recOn==nil then e.recOn=true end
 for _,k in ipairs(SK) do if e[k]==nil then e[k]=false end end
-if type(e.buyCats)~="table" then e.buyCats={} end
-if type(e.sellRars)~="table" then e.sellRars={} end
+for _,k in ipairs(SKL) do if type(e[k])~="table" then e[k]={} end end
 e.__chestSeen=e.__chestSeen or {}
 e.__chestCount=e.__chestCount or 0
 e.__lastSkip=0
@@ -160,37 +195,36 @@ task.spawn(function()
 	end
 end)
 
--- ===== Auto Buy (Game Shop stock, by category) =====
+-- ===== Auto Buy (Game Shop stock, only selected item ids) =====
 local function autoBuy()
+	if #e.buyItems==0 then return end
 	local gs=LP.PlayerGui:FindFirstChild("GameShop")
 	if not gs then return end
-	local want={}
-	for _,c in ipairs(e.buyCats) do want[UICAT_TO_TYPE[c] or c]=true end
-	if not next(want) then return end
+	local want={} for _,id in ipairs(e.buyItems) do want[id]=true end
 	local cash=LP:GetAttribute("Cash") or 0
 	for _,d in ipairs(gs:GetDescendants()) do
 		if not e.buyOn or e.__DYT~=G then return end
 		local id=d:GetAttribute("ID")
-		local typ=d:GetAttribute("Type")
-		local price=tonumber(d:GetAttribute("Price"))
-		if id and typ and price and typ~="Product" and want[typ] and cash>=price then
-			fire("BuyFromGameShopStock",{Type=typ,ID=id})
-			e.__bought=(e.__bought or 0)+1
-			cash=cash-price
-			task.wait(0.3)
+		if id and want[id] then
+			local typ=d:GetAttribute("Type") or ID_TO_TYPE[id]
+			local price=tonumber(d:GetAttribute("Price")) or 0
+			if typ and typ~="Product" and cash>=price then
+				fire("BuyFromGameShopStock",{Type=typ,ID=id})
+				e.__bought=(e.__bought or 0)+1
+				cash=cash-price
+				task.wait(0.3)
+			end
 		end
 	end
 end
 
 -- ===== Auto Sell (inventory, by rarity) =====
 local function autoSell()
-	if not (FMC and GU) then return end
+	if not (FMC and GU) or #e.sellRars==0 then return end
 	local inv=invoke("GetInventoryData")
 	if type(inv)~="table" then return end
 	local locked=invoke("GetData","LockedSellItems");if type(locked)~="table" then locked={} end
-	local want={}
-	for _,r in ipairs(e.sellRars) do want[r]=true end
-	if not next(want) then return end
+	local want={} for _,r in ipairs(e.sellRars) do want[r]=true end
 	for cat,items in pairs(inv) do
 		if type(items)=="table" then
 			for id,dat in pairs(items) do
@@ -210,18 +244,20 @@ local function autoSell()
 	end
 end
 
--- ===== Auto Buy Trader (Black Market / Shop Event -- buys with Gems) =====
+-- ===== Auto Buy Trader (Black Market -- only selected ids, when open) =====
 local function autoTrader()
-	if not FMC then return end
+	if not FMC or #e.traderItems==0 then return end
 	local bm=LP.PlayerGui:FindFirstChild("BlackMarket")
 	if not bm then return end
+	local want={} for _,id in ipairs(e.traderItems) do want[id]=true end
 	local seen={}
 	for _,d in ipairs(bm:GetDescendants()) do
 		if not e.traderOn or e.__DYT~=G then return end
 		local id=d:GetAttribute("ID")
-		if id and not seen[id] and (d:GetAttribute("Price") or d:GetAttribute("Cost") or d:GetAttribute("GemCost") or d:GetAttribute("GemPrice")) then
+		if id and want[id] and not seen[id] then
 			seen[id]=true
 			invoke("BuyShopEventItem",id)
+			e.__bought=(e.__bought or 0)+1
 			task.wait(0.4)
 		end
 	end
@@ -283,7 +319,36 @@ local function listFromSet(sel)
 	table.sort(t);return t
 end
 
-local W=Lib:Window({Title="Defend Your Town",Subtitle="v2.0",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
+-- item dropdown option list from selected categories
+local function buildItemOptions()
+	local opts,map={},{}
+	local cats=(#e.buyCats>0) and e.buyCats or BUY_CATS
+	for _,c in ipairs(cats) do
+		for _,entry in ipairs(CATALOG[c] or {}) do
+			local o=c.." : "..entry.label
+			table.insert(opts,o)
+			map[o]=entry.id
+		end
+	end
+	return opts,map
+end
+-- preselect labels from stored ids
+local function idsToLabels(ids,map)
+	local rev={} for label,id in pairs(map) do rev[id]=label end
+	local out={} for _,id in ipairs(ids) do if rev[id] then out[#out+1]=rev[id] end end
+	return out
+end
+
+local traderMap={}       -- label -> id
+local traderOpts={}
+for _,x in ipairs(TRADER_POOL) do traderOpts[#traderOpts+1]=x.label;traderMap[x.label]=x.id end
+local function traderIdsToLabels(ids)
+	local rev={} for l,i in pairs(traderMap) do rev[i]=l end
+	local o={} for _,id in ipairs(ids) do if rev[id] then o[#o+1]=rev[id] end end
+	return o
+end
+
+local W=Lib:Window({Title="Defend Your Town",Subtitle="v3.0",DragStyle=1,ShowUserInfo=true,AcrylicBlur=false})
 local TG=W:TabGroup()
 local TCollect=TG:Tab({Name="Collect",Image="rbxassetid://10723345035"})
 local TShop=TG:Tab({Name="Shop",Image="rbxassetid://10723415576"})
@@ -312,16 +377,51 @@ local statLbl=CR:Label({Text="idle"})
 local SHL=TShop:Section({Side="Left"})
 SHL:Header({Text="Auto Buy  (Game Shop, uses Cash)"})
 SHL:Toggle({Name="Enable Auto Buy",Default=e.buyOn,Callback=function(v) e.buyOn=v;sv() end},"buyOn")
-SHL:Dropdown({Name="Categories",Multi=true,Options=BUY_CATS,Default=e.buyCats,
-	Callback=function(sel) e.buyCats=listFromSet(sel);sv() end},"buyCats")
+
+local itemDD
+SHL:Dropdown({Name="Category",Multi=true,Options=BUY_CATS,Default=e.buyCats,
+	Callback=function(sel)
+		e.buyCats=listFromSet(sel)
+		local opts,map=buildItemOptions()
+		e.__buyMap=map
+		if itemDD then
+			pcall(function() itemDD:ClearOptions() end)
+			pcall(function() itemDD:InsertOptions(opts) end)
+			pcall(function() itemDD:UpdateSelection(idsToLabels(e.buyItems,map)) end)
+		end
+		sv()
+	end},"buyCats")
+
+local initOpts,initMap=buildItemOptions()
+e.__buyMap=initMap
+itemDD=SHL:Dropdown({Name="Items",Multi=true,Search=true,Options=initOpts,
+	Default=idsToLabels(e.buyItems,initMap),
+	Callback=function(sel)
+		local ids={}
+		for label in pairs(sel) do
+			local id=e.__buyMap and e.__buyMap[label]
+			if id then ids[#ids+1]=id end
+		end
+		table.sort(ids)
+		e.buyItems=ids;sv()
+	end})
+
 SHL:Header({Text="Auto Sell  (Inventory, by Rarity)"})
 SHL:Toggle({Name="Enable Auto Sell",Default=e.sellOn,Callback=function(v) e.sellOn=v;sv() end},"sellOn")
 SHL:Dropdown({Name="Rarities",Multi=true,Options=RARITIES,Default=e.sellRars,
 	Callback=function(sel) e.sellRars=listFromSet(sel);sv() end},"sellRars")
+
 local SHR=TShop:Section({Side="Right"})
-SHR:Header({Text="Trader"})
-SHR:Toggle({Name="Auto Buy Trader",Default=e.traderOn,Callback=function(v) e.traderOn=v;sv() end},"traderOn")
-SHR:Label({Text="Trader (Black Market) shows up periodically and buys with Gems -- runs only while it's open. 10M Shield is a Robux product; Unlimited Builder / x10 Build Speed / x10 Money are server-authoritative and can't be done client-side."})
+SHR:Header({Text="Auto Buy Trader  (Black Market, uses Gems)"})
+SHR:Toggle({Name="Enable Auto Buy Trader",Default=e.traderOn,Callback=function(v) e.traderOn=v;sv() end},"traderOn")
+SHR:Dropdown({Name="Trader Items",Multi=true,Options=traderOpts,Default=traderIdsToLabels(e.traderItems),
+	Callback=function(sel)
+		local ids={}
+		for label in pairs(sel) do if traderMap[label] then ids[#ids+1]=traderMap[label] end end
+		table.sort(ids)
+		e.traderItems=ids;sv()
+	end},"traderItems")
+SHR:Label({Text="Trader shows a random subset each visit; only buys your picks that are in stock. 10M Shield is a Robux product; Unlimited Builder / x10 Build Speed / x10 Money are server-authoritative and can't be done client-side."})
 local shopLbl=SHR:Label({Text="bought 0  sold 0"})
 
 -- Wave
@@ -360,4 +460,4 @@ end)
 
 e.__DYTW=W
 TCollect:Select()
-print("[DYT] v2.0 OK")
+print("[DYT] v3.0 OK")
