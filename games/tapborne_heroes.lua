@@ -76,6 +76,7 @@ if game.PlaceId ~= TAPBORNE then print("[TapborneHeroes] Wrong place, aborting")
 local RS = game:GetService("ReplicatedStorage")
 local HS = game:GetService("HttpService")
 local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
 local plr = Players.LocalPlayer
 
 local Msg = require(RS:WaitForChild("Msg"))
@@ -115,7 +116,7 @@ end
 local SF = "TapborneHeroes/state.json"
 local SK = {"thTapEnabled", "thRecruitEnabled", "thRecruitQualities", "thDungeonEnabled",
             "thDungeonSelected", "thDailyEnabled", "thAchievementEnabled", "thAntiAFK",
-            "thUpgradeEnabled", "thUpgradeCategories", "thMigratedV2"}
+            "thUpgradeEnabled", "thUpgradeCategories", "thMigratedV2", "thAutoReconnect"}
 
 local ok3, DungeonCfg = pcall(function() return require(RS.Configs.Dungeon) end)
 if not ok3 then DungeonCfg = {} end
@@ -151,6 +152,7 @@ if type(e.thDungeonSelected) ~= "table" then e.thDungeonSelected = {} end
 if e.thDailyEnabled == nil then e.thDailyEnabled = true end
 if e.thAchievementEnabled == nil then e.thAchievementEnabled = true end
 if e.thAntiAFK == nil then e.thAntiAFK = true end
+if e.thAutoReconnect == nil then e.thAutoReconnect = true end
 if e.thUpgradeEnabled == nil then e.thUpgradeEnabled = true end
 local UPGRADE_CATS = {"Player Level", "Heroes", "Skills"}
 if type(e.thUpgradeCategories) ~= "table" then e.thUpgradeCategories = {} end
@@ -392,6 +394,22 @@ plr.Idled:Connect(function()
 	end
 end)
 
+-- ---------------------------------------------------------------- Auto Reconnect
+-- Same pattern as roll_anime.lua: Players.PlayerRemoving fires right as the
+-- local player is about to leave the server (kick, crash, or the "Client:
+-- Disconnect" case this whole session has been chasing) -- Teleport back
+-- into the same place immediately. Hooked once via a flag, not gated by the
+-- generation counter, since PlayerRemoving only ever fires once per real
+-- disconnect regardless of which script generation is currently "active".
+if not getgenv().__THReconnectHooked then
+	getgenv().__THReconnectHooked = true
+	Players.PlayerRemoving:Connect(function(player)
+		if player == plr and e.thAutoReconnect then
+			pcall(function() TeleportService:Teleport(game.PlaceId, plr) end)
+		end
+	end)
+end
+
 -- ---------------------------------------------------------------------- UI
 print("[TapborneHeroes] Loading MacLib...")
 local okLib, Lib = pcall(function()
@@ -475,6 +493,10 @@ SettingsLeft:Toggle({
 	Name = "Anti-AFK", Default = e.thAntiAFK,
 	Callback = function(v) e.thAntiAFK = v; sv() end,
 }, "thAntiAFK")
+SettingsLeft:Toggle({
+	Name = "Auto Reconnect", Default = e.thAutoReconnect,
+	Callback = function(v) e.thAutoReconnect = v; sv() end,
+}, "thAutoReconnect")
 SettingsLeft:Keybind({
 	Name = "Show/Hide UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() W:SetState(not W:GetState()) end) end,
