@@ -202,47 +202,149 @@ for i = 1, TAP_LOOPS do
 end
 
 -- ---------------------------------------------------------------- Auto Fight Boss
--- Verified live 2026-09-21: C2S_TapChallengeBoss (no args) starts a boss fight,
--- and damage lands immediately afterward through the EXACT SAME combat feed
--- as regular monsters -- both Source="Click" and Source="AutoTap" land on the
--- boss's MonsterHp same as any normal monster, no separate targeting step
--- needed. (The in-game arrow/pointer is a world-space "walk to the boss
--- spawn" wayfinding marker, not a combat gate -- confirmed by challenging and
--- landing hits without ever touching it.)
+-- Two bugs, two fixes, in order:
 --
--- BUT: re-firing ChallengeBoss while ALREADY mid-fight does NOT no-op or
--- resume -- it starts a brand new encounter and throws the current one away.
--- Caught live: a boss sitting at 1.28e18/5.81e18 HP (78% dead, close to a
--- real kill) got re-challenged by this loop's blind 15s timer -- the very
--- next hit landed on a FRESH boss with MonsterMaxHp = 5.81e19, 10x bigger,
--- back near full HP. Every 15s after that resets progress into a harder
--- fight before the player's real DPS ever has a chance to finish one -- this
--- is exactly what "ยังสู้บอสไม่ได้" (still can't beat the boss) was reporting:
--- the loop was the thing making it unbeatable, not the account's damage.
+-- BUG 1 (fixed 2026-09-21): C2S_TapChallengeBoss (no args) starts a boss
+-- fight, and damage lands immediately afterward through the EXACT SAME
+-- combat feed as regular monsters -- no special targeting step needed. But
+-- re-firing it while ALREADY mid-fight does NOT no-op or resume -- it starts
+-- a brand new encounter and throws the current one away. Caught live: a boss
+-- at 1.28e18/5.81e18 HP (78% dead) got re-challenged by the original blind
+-- 15s timer and the next hit landed on a FRESH boss 10x bigger, back near
+-- full HP. First fix: gate re-challenging on BossRetryAvailable from the
+-- S2C_UpdateCombatData (9001) snapshot.
 --
--- Real fix: only challenge when the server itself says it's safe to, via
--- BossRetryAvailable on the S2C_UpdateCombatData (9001) snapshot the generic
--- router below already keeps fresh (the server pushes 9001 periodically on
--- its own during normal play, confirmed live with zero manual calls in
--- between) -- true means no fight is currently in progress, false means one
--- is live and must be left alone. No snapshot seen yet -> don't guess, wait
--- for one; a boss that's never been challenged this session still gets a
--- snapshot from the game's own periodic push before too long.
+-- BUG 2 (fixed 2026-09-22): that gate is only as good as the snapshot
+-- feeding it, and 9001 turned out NOT to push reliably or often -- passively
+-- watching it for 40s of real, ongoing gameplay caught exactly 2 pushes,
+-- both stale "true" values, while boss fights were verifiably starting and
+-- dealing real damage the whole time (confirmed separately via the 9013
+-- damage feed). Relying on it left the exact same symptom as Bug 1 under a
+-- different mechanism -- reported again as "ยัง Fight ตอนดาเมทฉันไม่พอ" (still
+-- fighting when my damage isn't enough): the loop kept reading a stale
+-- "available" and blindly re-challenging into fights already in progress.
+--
+-- Real fix: stop depending on any pushed snapshot for fight-state at all.
+-- The 9013 damage feed IS reliable during an active fight -- dozens of real
+-- events land every ~30s window, every one carrying the current target's
+-- MonsterMaxHp for free. So: challenge, then actively WATCH that feed for
+-- the fight's own known duration (measured live, ~30s -- wait a bit past it
+-- for margin) summing real damage dealt, and only decide to challenge again
+-- once that wait is over. Structurally can't re-challenge mid-fight anymore
+-- -- there's no poll gap for a stale flag to lie into, the loop is asleep
+-- for the fight's whole duration by construction.
+--
+-- The same watch also finally gives a REAL win/loss check with zero
+-- dependency on ever finding a reward message (never found one worth
+-- trusting -- see the long dead-end in this file's history): summed damage
+-- >= the boss's own MonsterMaxHp means it died. A loss earns a backoff
+-- before the next attempt, buying Auto Upgrade time to raise real damage
+-- instead of burning attempts on a fight current power already proved it
+-- can't finish (measured live: base Click+AutoTap alone was only covering
+-- ~50-55% of a boss's HP per window at this account's current power -- a
+-- genuine account-power gap, not something any smarter challenge timing
+-- fixes -- see the "don't rely on Auto Use Skills" note lower down).
+-- First live test of the watch-window design (above) produced an
+-- immediate false "defeated!" every single cycle -- the watcher was summing
+-- ALL S2C_TapDamageFeedback events for the full 34s blindly, and once a
+-- fight actually ends (win, or the ~30s timer), the account's Click/AutoTap
+-- loops carry straight on hitting REGULAR monsters for the REST of that same
+-- 34s window -- those hits landed in the same sum. A run of ordinary kills
+-- easily outweighs a single monster's MaxHp, so the "damage >= MaxHp" check
+-- tripped almost immediately regardless of whether the boss itself ever
+-- took meaningful damage. Fix: LOCK ONTO the specific target's MonsterMaxHp
+-- from the first event seen after challenging, only accumulate further hits
+-- whose MonsterMaxHp still matches that locked value (a ~0.01% tolerance,
+-- not exact equality -- these numbers run past 1e18 where Luau's
+-- double-precision floats can't represent every integer exactly, so two
+-- reads of what's conceptually the same value aren't guaranteed bit-
+-- identical), and treat a stretch with no matching event as that specific
+-- fight being over -- stop watching THEN rather than blindly riding out the
+-- full window padded with unrelated grinding damage.
+-- Second live iteration: summing Damage myself (first version of this
+-- comment block) produced an immediate false "defeated!" every cycle --
+-- once a fight actually ends, the account's Click/AutoTap loops carry
+-- straight on hitting REGULAR monsters for the rest of the watch window,
+-- and those hits landed in the same sum, trivially exceeding any one
+-- monster's MaxHp. A same-target-lock fix (matching MonsterMaxHp within a
+-- tolerance) then showed the opposite problem -- premature idle-timeouts at
+-- ~1% HP, because the boss's own reported MaxHp isn't perfectly constant
+-- moment to moment at these magnitudes (regen recalculating the pool, or
+-- float precision past 1e18) and kept slipping outside the match tolerance.
+--
+-- Simpler fix that sidesteps both: don't reimplement damage accounting at
+-- all -- every S2C_TapDamageFeedback event already carries the server's own
+-- authoritative MonsterHp (remaining), not just Damage dealt. Track the
+-- LARGEST MonsterMaxHp pool seen during the watch window (the boss should
+-- always dwarf whatever regular monster the account might also be grinding
+-- in the background) and the most recent MonsterHp reading that belongs to
+-- that same pool (5% tolerance, self-updating so gradual drift/regen still
+-- tracks) -- that reading, at the moment the fight goes idle, IS the real
+-- outcome, read straight from the server instead of computed by us.
+local BOSS_FIGHT_WATCH_S = 34       -- hard ceiling -- measured fight length ~30s, +margin
+local BOSS_TARGET_IDLE_S = 4        -- no matching-target hit for this long = fight's over
+local BOSS_LOSS_BACKOFF_S = 180     -- 3 min between retries after a confirmed loss
+local BOSS_NO_FIGHT_RETRY_S = 10    -- short retry if a challenge visibly did nothing
+local bossNextAllowedAt = 0
 task.spawn(function()
     while getgenv().__TH == G do
-        if e.thBossEnabled then
-            local combat = latest[Msg.S2C_UpdateCombatData]
-            local snap = combat and combat[1]
-            if snap and snap.BossRetryAvailable then
-                local ok = req(Msg.C2S_TapChallengeBoss)
-                if ok then stats.boss = "challenged" end
-            elseif snap then
-                stats.boss = "fighting..."
+        if e.thBossEnabled and os.clock() >= bossNextAllowedAt then
+            req(Msg.C2S_TapChallengeBoss)
+            stats.boss = "challenged, watching fight..."
+            -- brief warm-up: lets any regular-monster hit reply already in
+            -- flight from the tap loop land and clear out first, so it
+            -- can't get adopted as "the boss" by accident right at the start
+            task.wait(0.5)
+
+            local bestMaxHp = 0
+            local hpAtBest = nil
+            local lastMatchAt = nil
+            local watchConn
+            watchConn = sn.OnClientEvent:Connect(function(payload)
+                local m = payload and payload[1]
+                if not (m and m.msgID == Msg.S2C_TapDamageFeedback) then return end
+                local d = m.msgData[1]
+                if d.MonsterMaxHp > bestMaxHp * 1.05 then
+                    -- a clearly bigger pool than anything seen this window --
+                    -- the boss (or its regen growing it); adopt it
+                    bestMaxHp = d.MonsterMaxHp
+                    hpAtBest = d.MonsterHp
+                    lastMatchAt = os.clock()
+                elseif bestMaxHp > 0 and math.abs(d.MonsterMaxHp - bestMaxHp) / bestMaxHp < 0.05 then
+                    -- same pool, fresher reading
+                    bestMaxHp = d.MonsterMaxHp
+                    hpAtBest = d.MonsterHp
+                    lastMatchAt = os.clock()
+                end
+                -- anything clearly smaller than the biggest pool seen so far
+                -- (regular grinding continuing alongside/after the boss) is
+                -- simply ignored -- never touches bestMaxHp/hpAtBest
+            end)
+
+            local t0 = os.clock()
+            while os.clock() - t0 < BOSS_FIGHT_WATCH_S and getgenv().__TH == G do
+                task.wait(1)
+                if lastMatchAt and os.clock() - lastMatchAt > BOSS_TARGET_IDLE_S then
+                    break   -- the boss's own pool stopped updating -- fight's over
+                end
+            end
+            watchConn:Disconnect()
+
+            if not hpAtBest then
+                -- challenge visibly did nothing (no boss-scale damage seen at
+                -- all) -- nothing to back off from, just don't hammer it
+                bossNextAllowedAt = os.clock() + BOSS_NO_FIGHT_RETRY_S
+                stats.boss = "no boss available right now"
+            elseif hpAtBest <= bestMaxHp * 0.01 then
+                bossNextAllowedAt = os.clock()
+                stats.boss = "defeated! trying next one"
             else
-                stats.boss = "waiting for boss data"
+                bossNextAllowedAt = os.clock() + BOSS_LOSS_BACKOFF_S
+                stats.boss = ("lost (%.0f%% HP left) -- retrying in %ds"):format(
+                    100 * hpAtBest / bestMaxHp, BOSS_LOSS_BACKOFF_S)
             end
         end
-        task.wait(5)   -- check often; only actually fires ChallengeBoss when the flag allows it
+        task.wait(2)
     end
 end)
 
