@@ -73,7 +73,8 @@ local SK = {
     "thTapEnabled","thRecruitEnabled","thRecruitQualities",
     "thDungeonEnabled","thDungeonSelected","thDailyEnabled",
     "thAchievementEnabled","thAntiAFK","thUpgradeEnabled",
-    "thUpgradeCategories","thMigratedV2","thAutoReconnect","thBossEnabled"
+    "thUpgradeCategories","thMigratedV2","thAutoReconnect","thBossEnabled",
+    "thSkillsEnabled","thReserveEnabled","thReserveQualities"
 }
 
 local ok3, DungeonCfg = pcall(function() return require(RS.Configs.Dungeon) end)
@@ -107,6 +108,21 @@ end)
 if e.thTapEnabled      == nil then e.thTapEnabled      = true end
 if e.thRecruitEnabled  == nil then e.thRecruitEnabled  = true end
 if type(e.thRecruitQualities)  ~= "table" then e.thRecruitQualities  = {} end
+if e.thReserveEnabled  == nil then e.thReserveEnabled  = true end
+-- Brand new key -- nil means genuinely first-ever load, default it to the
+-- full rarity set then (same as thRecruitQualities' own defaults). Present
+-- but not a table (or already an empty {} the user deliberately emptied via
+-- the dropdown) is respected as-is -- NOT force-repopulated, learned the
+-- hard way from thRecruitQualities silently un-unchecking itself every
+-- reload when an earlier version of this backfill ran unconditionally.
+if e.thReserveQualities == nil then
+    e.thReserveQualities = {}
+    for _, name in ipairs({"Common","Uncommon","Rare","Epic","Legendary","Mythic","Mythic+"}) do
+        e.thReserveQualities[name] = true
+    end
+elseif type(e.thReserveQualities) ~= "table" then
+    e.thReserveQualities = {}
+end
 if e.thDungeonEnabled  == nil then e.thDungeonEnabled  = true end
 if type(e.thDungeonSelected)   ~= "table" then e.thDungeonSelected   = {} end
 if e.thDailyEnabled    == nil then e.thDailyEnabled    = true end
@@ -115,6 +131,7 @@ if e.thAntiAFK         == nil then e.thAntiAFK         = true end
 if e.thAutoReconnect   == nil then e.thAutoReconnect   = true end
 if e.thUpgradeEnabled  == nil then e.thUpgradeEnabled  = true end
 if e.thBossEnabled     == nil then e.thBossEnabled     = true end
+if e.thSkillsEnabled   == nil then e.thSkillsEnabled   = true end
 local UPGRADE_CATS = {"Player Level","Heroes","Skills"}
 if type(e.thUpgradeCategories) ~= "table" then e.thUpgradeCategories = {} end
 
@@ -132,7 +149,7 @@ if not e.thMigratedV2 then
     sv()
 end
 
-local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-"}
+local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-", skills=0}
 
 -- Sliding window for real-time taps/sec display
 local tapTimes = {}
@@ -229,14 +246,92 @@ task.spawn(function()
     end
 end)
 
--- ---------------------------------------------------------------- Auto Recruit
+-- ---------------------------------------------------------------- Auto Use Skills
+-- The real fix for "ยังสู้บอสไม่ได้" turned out to need more than not resetting
+-- the fight -- verified live that Click+AutoTap alone gets the boss down to
+-- ~7.5% HP within its ~30s window but not quite to zero. Configs.Skill has 4
+-- combat-relevant active skills this account owns that the script never used:
+--   101 Heavenly Strike -- deals tapDamageMultiplier x tap damage INSTANTLY.
+--       Confirmed live: a single cast hit for 2.44e19 while a normal tap was
+--       hitting for 1.63e17 at the same time -- ~150x one tap in one call.
+--       That alone is a huge chunk of a boss's total HP pool.
+--   105 Berserker Rage -- +tap damage% for 20s, "Also affects Heavenly
+--       Strike" per its own description -- cast this right before 101 so the
+--       multiplier applies to the burst too, not just regular taps.
+--   103 Critical Strike / 104 War Cry -- smaller buffs (+crit%, +hero atk
+--       speed%), harmless to also try.
+-- Skill 102 (Shadow Clone) is deliberately left out -- its "AutoTap" damage
+-- source has been observed running continuously since before this script
+-- ever called TapUseSkill, so it's already active/self-sustaining and
+-- doesn't need a poke here.
+--
+-- Cooldowns read from Configs.Skill are long (1800s/30min for Heavenly
+-- Strike, 3600s/60min for the others) -- trying one every 20s is the same
+-- harmless soft-no pattern as everywhere else in this script (confirmed
+-- live: InvokeServer on an on-cooldown skill just returns false, no error),
+-- it just happens to actually succeed once every 30-60 minutes. Casting
+-- Berserker Rage then Heavenly Strike in that order, together, right as a
+-- boss fight is live (BossRetryAvailable == false) is what lines the burst
+-- up with the fight that actually needs it instead of a random grind moment.
+-- Not gated on "boss fight currently active" -- cooldowns are long enough
+-- (30-60min) relative to how often a boss fight is actually up that gating
+-- would just leave a ready skill sitting unused for a long stretch; firing
+-- as soon as it's off cooldown regardless of context still helps (normal
+-- stage clearing benefits from these too), and whenever a cast does land
+-- during a live boss fight, that's this loop's 20s poll cadence lining up
+-- with a fight window on its own, not a hard requirement to do so.
+local SKILL_ORDER = {105, 103, 104, 101}   -- buffs first, Heavenly Strike last
 task.spawn(function()
     while getgenv().__TH == G do
-        if e.thRecruitEnabled then
+        if e.thSkillsEnabled then
+            for _, id in ipairs(SKILL_ORDER) do
+                if getgenv().__TH ~= G then break end
+                local ok, res = req(Msg.C2S_TapUseSkill, id)
+                if res == true then stats.skills += 1 end
+                task.wait(0.3)
+            end
+        end
+        task.wait(20)
+    end
+end)
+
+-- ---------------------------------------------------------------- Auto Recruit
+-- Auto Reserve is folded into this same loop rather than a separate one --
+-- it needs the exact same tavern-offer data Auto Recruit already fetches,
+-- and its whole point is to catch offers Auto Recruit just failed to buy.
+--
+-- Verified live 2026-09-22:
+--   - C2S_TavernReserveOffer(offerId) moves an Available offer into
+--     data.Reserved (a dict keyed by reserve slot, each entry carrying the
+--     same OfferId/HeroId/RecruitCost as the original) and flips that
+--     offer's State to "Reserved" so the tavern's own rotation/refresh can't
+--     wipe it out from under the account while gold catches up.
+--   - Slot limit (GameSettings.HERO_TAVERN_DEFAULT_RESERVE_SLOTS = 2 by
+--     default) is enforced server-side, not tracked here: reserving past the
+--     limit answers {Success=false, Reason="ReserveFull"} cleanly -- no need
+--     to count slots ourselves, same soft-no pattern as everything else.
+--   - S2C_TavernActionResult (9215) reports {Action, OfferId, Success,
+--     Reason} for BOTH Recruit and Reserve attempts -- a failed hire on an
+--     unaffordable offer answers {Action="Recruit", Success=false,
+--     Reason="PurchaseFailed"}, confirmed live. That Success flag is read
+--     right after each hire attempt below to decide whether to fall back to
+--     reserving it -- no need to read/parse the account's Gold value at all
+--     (there's no cheap on-demand way to read it found this session; the
+--     visible GoldLabel in ScreenGui_Main reads stale/desynced numbers next
+--     to everything server-confirmed here, not trustworthy).
+--   - TavernHireOffer on an already-Reserved offer works exactly like a
+--     normal hire (confirmed live: State went Reserved -> Hired) -- so
+--     "buying out of reserve" is just retrying the normal hire call on
+--     whatever's sitting in data.Reserved each pass, same soft-no-until-
+--     affordable pattern.
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thRecruitEnabled or e.thReserveEnabled then
             req(Msg.C2S_TavernRequestData)
             task.wait(1)
             local data = latest[Msg.S2C_UpdateTavernData] and latest[Msg.S2C_UpdateTavernData][1]
-            if data and data.Offers then
+
+            if e.thRecruitEnabled and data and data.Offers then
                 for _, offer in pairs(data.Offers) do
                     if getgenv().__TH ~= G then break end
                     if offer.State == "Available" and offer.OfferId then
@@ -244,8 +339,31 @@ task.spawn(function()
                         local qName = q and QUALITY_NAMES[q]
                         if qName and e.thRecruitQualities[qName] then
                             req(Msg.C2S_TavernHireOffer, offer.OfferId)
+                            task.wait(0.4)
+                            local result = latest[Msg.S2C_TavernActionResult]
+                            local r = result and result[1]
+                            local bought = r and r.Action == "Recruit" and r.OfferId == offer.OfferId and r.Success
+                            if bought then
+                                stats.recruits += 1
+                            elseif e.thReserveEnabled and e.thReserveQualities[qName] then
+                                req(Msg.C2S_TavernReserveOffer, offer.OfferId)
+                                task.wait(0.4)
+                            end
+                        end
+                    end
+                end
+            end
+
+            if e.thReserveEnabled and data and data.Reserved then
+                for _, r in pairs(data.Reserved) do
+                    if getgenv().__TH ~= G then break end
+                    if r.OfferId then
+                        req(Msg.C2S_TavernHireOffer, r.OfferId)
+                        task.wait(0.4)
+                        local result = latest[Msg.S2C_TavernActionResult]
+                        local rr = result and result[1]
+                        if rr and rr.Action == "Recruit" and rr.OfferId == r.OfferId and rr.Success then
                             stats.recruits += 1
-                            task.wait(0.5)
                         end
                     end
                 end
@@ -419,6 +537,11 @@ L:Toggle({
     Default=e.thBossEnabled,
     Callback=function(v) e.thBossEnabled=v; sv() end
 }, "thBossEnabled")
+L:Toggle({
+    Name="Auto Use Skills",
+    Default=e.thSkillsEnabled,
+    Callback=function(v) e.thSkillsEnabled=v; sv() end
+}, "thSkillsEnabled")
 
 L:Header({Text="Upgrade"})
 L:Toggle({
@@ -452,6 +575,21 @@ L:Dropdown({
         e.thRecruitQualities=set; sv()
     end,
 }, "thRecruitQualities")
+L:Toggle({
+    Name="Auto Reserve",
+    Default=e.thReserveEnabled,
+    Callback=function(v) e.thReserveEnabled=v; sv() end
+}, "thReserveEnabled")
+L:Dropdown({
+    Name="Reserve Rarity", Multi=true, Search=false,
+    Options={"Common","Uncommon","Rare","Epic","Legendary","Mythic","Mythic+"},
+    Default=setToArray(e.thReserveQualities),
+    Callback=function(sel)
+        local set={}
+        for name in pairs(sel) do set[name]=true end
+        e.thReserveQualities=set; sv()
+    end,
+}, "thReserveQualities")
 
 L:Header({Text="Dungeon"})
 L:Toggle({
@@ -512,12 +650,13 @@ task.spawn(function()
             statusLbl:UpdateName((
                 "Auto Tap: %.1f/s  (%d total)\n" ..
                 "Boss: %s\n" ..
+                "Skills used: %d\n" ..
                 "Recruits: %d\n" ..
                 "Upgrades: %d\n" ..
                 "Dungeon: %s\n" ..
                 "Daily: %s\n" ..
                 "Achievements: %d"
-            ):format(rate, stats.taps, stats.boss, stats.recruits, stats.upgrades,
+            ):format(rate, stats.taps, stats.boss, stats.skills, stats.recruits, stats.upgrades,
                      stats.dungeon, stats.daily, stats.achievements))
         end)
     end
