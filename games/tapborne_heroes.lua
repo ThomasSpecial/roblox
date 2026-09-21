@@ -187,27 +187,45 @@ end
 -- ---------------------------------------------------------------- Auto Fight Boss
 -- Verified live 2026-09-21: C2S_TapChallengeBoss (no args) starts a boss fight,
 -- and damage lands immediately afterward through the EXACT SAME combat feed
--- as regular monsters -- confirmed by watching the live 9013 (damage) stream
--- during a real challenge: both Source="Click" (this script's own tap loop)
--- and Source="AutoTap" (the passive hero DPS) kept landing on the boss's much
--- bigger MonsterHp pool every ~150-300ms, no different from a normal monster.
--- So there's no separate "make sure damage actually lands" step needed --
--- once challenged, the Auto Tap loops above already do that automatically,
--- same as they do for everything else. (The in-game arrow/pointer some
--- players see is a world-space "walk to the boss spawn" wayfinding marker,
--- not a combat gate -- confirmed by challenging and landing hits without
--- ever touching it.) This loop's only real job is noticing a boss is up and
--- firing the challenge; a repeat challenge on a boss that isn't available
--- (already mid-fight, or none spawned) is the same harmless soft-no pattern
--- every other loop in this script already relies on -- no result to trust,
--- just try again next tick.
+-- as regular monsters -- both Source="Click" and Source="AutoTap" land on the
+-- boss's MonsterHp same as any normal monster, no separate targeting step
+-- needed. (The in-game arrow/pointer is a world-space "walk to the boss
+-- spawn" wayfinding marker, not a combat gate -- confirmed by challenging and
+-- landing hits without ever touching it.)
+--
+-- BUT: re-firing ChallengeBoss while ALREADY mid-fight does NOT no-op or
+-- resume -- it starts a brand new encounter and throws the current one away.
+-- Caught live: a boss sitting at 1.28e18/5.81e18 HP (78% dead, close to a
+-- real kill) got re-challenged by this loop's blind 15s timer -- the very
+-- next hit landed on a FRESH boss with MonsterMaxHp = 5.81e19, 10x bigger,
+-- back near full HP. Every 15s after that resets progress into a harder
+-- fight before the player's real DPS ever has a chance to finish one -- this
+-- is exactly what "ยังสู้บอสไม่ได้" (still can't beat the boss) was reporting:
+-- the loop was the thing making it unbeatable, not the account's damage.
+--
+-- Real fix: only challenge when the server itself says it's safe to, via
+-- BossRetryAvailable on the S2C_UpdateCombatData (9001) snapshot the generic
+-- router below already keeps fresh (the server pushes 9001 periodically on
+-- its own during normal play, confirmed live with zero manual calls in
+-- between) -- true means no fight is currently in progress, false means one
+-- is live and must be left alone. No snapshot seen yet -> don't guess, wait
+-- for one; a boss that's never been challenged this session still gets a
+-- snapshot from the game's own periodic push before too long.
 task.spawn(function()
     while getgenv().__TH == G do
         if e.thBossEnabled then
-            local ok, res = req(Msg.C2S_TapChallengeBoss)
-            if ok then stats.boss = "challenged" end
+            local combat = latest[Msg.S2C_UpdateCombatData]
+            local snap = combat and combat[1]
+            if snap and snap.BossRetryAvailable then
+                local ok = req(Msg.C2S_TapChallengeBoss)
+                if ok then stats.boss = "challenged" end
+            elseif snap then
+                stats.boss = "fighting..."
+            else
+                stats.boss = "waiting for boss data"
+            end
         end
-        task.wait(15)
+        task.wait(5)   -- check often; only actually fires ChallengeBoss when the flag allows it
     end
 end)
 
