@@ -29,6 +29,7 @@ local PLACE_SCRIPTS = {
     [70640255604878]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pull_an_egg.lua",      -- Pull An Egg
     [87075726814250]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/defend_your_town.lua", -- Defend Your Town
     [80519520593681]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/tapborne_heroes.lua",  -- Tapborne Heroes
+    [99388466709359]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/soul_hero.lua",        -- [IDLE] Soul Hero
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
