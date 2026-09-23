@@ -111,7 +111,7 @@ local SK = {
 	"shOrbitEnabled", "shOrbitMode", "shOrbitSpeed", "shOrbitHeight", "shOrbitDistance",
 	"shEquipBestEnabled", "shSkillTreeEnabled",
 	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
-	"shLoopLevelEnabled", "shLoopLevel",
+	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeRest",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -149,6 +149,40 @@ if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
+if e.shSkipAnim == nil then e.shSkipAnim = true end
+if type(e.shUpgradePriority) ~= "table" then e.shUpgradePriority = {} end
+if e.shUpgradeRest == nil then e.shUpgradeRest = true end
+
+-- Skill-tree families, as the server names them (rankByFamily keys from
+-- GetSkillTreeState-RemoteFunction, read live). Node ids are family..rank,
+-- so the next purchasable node of a family is family .. (rankByFamily+1)
+-- -- confirmed: PurchaseSkillTreeNode("coinIncome4") with rank 3 answered
+-- {ok=false, error="NotEnoughCoins"} (a valid id, just unaffordable), and a
+-- made-up id answered error="UnknownNode". Order here is the order the
+-- priority list is walked in each pass.
+local SKILL_FAMILIES = {
+	{"Player Damage", "playerDamage"}, {"Hero Damage", "heroDamage"}, {"Coin Income", "coinIncome"},
+	{"Soul Income", "soulIncome"}, {"Magnetic Riches", "magneticRiches"}, {"Player Health", "playerHealth"},
+	{"Hero Health", "heroHealth"}, {"Player Recovery", "playerRecovery"}, {"Hero Recovery", "heroRecovery"},
+	{"Hero Attack Speed", "heroAttackSpeed"}, {"Player Speed", "playerSpeed"}, {"Enemy Capacity", "enemyCapacity"},
+	{"Larger Horde", "largerHorde"}, {"Elite Enemies", "eliteEnemies"}, {"Enemy Rush", "enemyRush"},
+	{"Hunter's Mark", "huntersMark"}, {"Momentum Rush", "momentumRush"}, {"Battle Frenzy", "battleFrenzy"},
+	{"Cleaving Strikes", "cleavingStrikes"}, {"Shockwave Slam", "shockwaveSlam"}, {"Arcane Burst", "arcaneBurst"},
+	{"Chain Lightning", "chainLightning"}, {"Longshot", "longshot"}, {"Juggernaut", "juggernaut"},
+	{"Empowered Summons", "empoweredSummons"},
+}
+local SKILL_LABEL_TO_FAMILY, SKILL_LABELS = {}, {}
+for i, pair in ipairs(SKILL_FAMILIES) do SKILL_LABEL_TO_FAMILY[pair[1]] = pair[2] SKILL_LABELS[i] = pair[1] end
+
+-- MacLib's multi-Dropdown Default wants an ARRAY of selected option names,
+-- not a {name=true} set (learned the hard way in the Tapborne Heroes
+-- script: feeding it the set silently dropped entries). Loops keep the set
+-- shape for O(1) membership; convert only at the one spot MacLib reads it.
+local function setToArray(set)
+	local arr = {}
+	for k, v in pairs(set) do if v then arr[#arr + 1] = k end end
+	return arr
+end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
@@ -159,6 +193,33 @@ local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, 
 -- -- computed once here every 1s and shared, instead of three separate loops
 -- each re-deriving it (and re-InvokeServer'ing the ledger) independently.
 local currentTarget = nil   -- {enemyId, part, position}
+
+-- Which part of an enemy model to orbit/face. `FindFirstChildWhichIsA(
+-- "BasePart", true)` -- the original choice -- is descendant order, not
+-- anatomy: on the level-35 boss (zone4_a2) it returns "Plane", a sprite
+-- hanging at Y=40.7, while the body (PrimaryPart "RootPart", 6x6x3) stands
+-- at Y=20.0. Orbit then circled ~20 studs above anything hittable and the
+-- weapon (Range 10.5) silently found nothing -- 0 hits AND 0 rejections
+-- across every distance/height combo tried, versus 15 hits in 8s the
+-- moment RootPart was targeted instead (measured live, same boss, seconds
+-- apart). Lower bosses only looked fine because their first BasePart
+-- happened to sit at body height. Priority: PrimaryPart, then a part named
+-- RootPart/HumanoidRootPart, then the lowest non-flat part (covers pure
+-- billboard models), then the old first-BasePart fallback.
+local function bodyPartOf(model)
+	if model.PrimaryPart then return model.PrimaryPart end
+	local named = model:FindFirstChild("RootPart", true) or model:FindFirstChild("HumanoidRootPart", true)
+	if named and named:IsA("BasePart") then return named end
+	local best, bestY
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and not d.Name:lower():find("plane") then
+			local s = d.Size
+			local flat = math.min(s.X, s.Y, s.Z) < 0.2 and math.max(s.X, s.Y, s.Z) > 8
+			if not flat and (not bestY or d.Position.Y < bestY) then best, bestY = d, d.Position.Y end
+		end
+	end
+	return best or model:FindFirstChildWhichIsA("BasePart", true)
+end
 
 local function refreshTarget()
 	local ok, entries = call("GetEnemyLedgerEntries-RemoteFunction")
@@ -175,17 +236,19 @@ local function refreshTarget()
 	for _, entry in pairs(entries) do
 		-- skip anything without a real hp reading -- bosses (BossIntroPending)
 		-- didn't carry one in testing; a mob mid-farm always did
-		-- Entries with no hp block are bosses (confirmed live) -- they used to be
-		-- skipped, which left Orbit/M1 with no target for the whole boss phase
-		-- of every level and let the ally heroes do all the boss work. Since M1
-		-- is Tool:Activate() and the SERVER picks what's in the weapon arc,
-		-- orbiting a boss is all that's needed to include it; a pre-intro boss
-		-- just answers BossIntroPending (soft no) until its intro finishes.
+		-- Boss entries DO carry hp (measured live: 62,814 / 108,289 / 380,874 on
+		-- the level 25/30/35 bosses) -- the earlier "bosses have no hp block"
+		-- read was wrong. The hp==nil allowance below is kept purely as a
+		-- safety net so a ledger entry that ever omits hp isn't silently
+		-- dropped as a target. Since M1 is Tool:Activate() and the SERVER picks
+		-- what's in the weapon arc, orbiting a boss is all that's needed to
+		-- fight it; a pre-intro boss answers BossIntroPending for the ~1.6s its
+		-- intro lasts, then hits land normally.
 		local alive = entry.enemyId and (entry.hp == nil or (entry.hp.current or 0) > 0)
 		if alive then
 			for _, m in ipairs(enemiesFolder:GetChildren()) do
 				if m.Name == entry.archetypeId then
-					local part = m:FindFirstChildWhichIsA("BasePart", true)
+					local part = bodyPartOf(m)
 					if part then
 						local d = (hrp.Position - part.Position).Magnitude
 						if not bestDist or d < bestDist then
@@ -416,12 +479,41 @@ task.spawn(function()
 	end
 end)
 
+-- Priority (added on request): families ticked in "Upgrade Priority" are
+-- bought FIRST, each pushed as far as coins allow (PurchaseSkillTreeNode
+-- on family..(rank+1) until it answers NotEnoughCoins / UnknownNode), in
+-- SKILL_FAMILIES order; only then, if "buy the rest" is on, MaxBuy sweeps
+-- whatever else is affordable. With nothing ticked this is exactly the old
+-- behaviour. Without this ordering MaxBuy spends the whole coin pool on
+-- whatever the server picks, which is why "upgrade Damage/Coin first" was
+-- impossible before.
 task.spawn(function()
 	while getgenv().__SH == G do
 		if e.shSkillTreeEnabled then
-			local ok, res = call("MaxBuySkillTreeNodes-RemoteFunction")
-			if ok and type(res) == "table" and res.purchasedCount and res.purchasedCount > 0 then
-				stats.skillNodes += res.purchasedCount
+			local hasPriority = next(e.shUpgradePriority) ~= nil
+			if hasPriority then
+				local ok, st = call("GetSkillTreeState-RemoteFunction")
+				local ranks = ok and type(st) == "table" and st.rankByFamily or {}
+				for _, pair in ipairs(SKILL_FAMILIES) do
+					if getgenv().__SH ~= G then break end
+					local label, fam = pair[1], pair[2]
+					if e.shUpgradePriority[label] then
+						local rank = tonumber(ranks[fam]) or 0
+						for _ = 1, 10 do   -- cap per pass; NotEnoughCoins/UnknownNode ends it early
+							local pok, pres = call("PurchaseSkillTreeNode-RemoteFunction", fam .. (rank + 1))
+							if not (pok and type(pres) == "table" and pres.ok) then break end
+							stats.skillNodes += 1
+							rank += 1
+							task.wait(0.2)
+						end
+					end
+				end
+			end
+			if e.shUpgradeRest or not hasPriority then
+				local ok, res = call("MaxBuySkillTreeNodes-RemoteFunction")
+				if ok and type(res) == "table" and res.purchasedCount and res.purchasedCount > 0 then
+					stats.skillNodes += res.purchasedCount
+				end
 			end
 		end
 		task.wait(15)
@@ -562,6 +654,37 @@ task.spawn(function()
 			end
 		end
 		if e.shNextStageEnabled or e.shLoopLevelEnabled then
+			-- THE actual "Auto Next Stage doesn't work" cause, found live at a
+			-- level-30 boss: after a boss VICTORY the server parks the run --
+			-- GetPendingBossResult reports {phase="victory", resultId=N},
+			-- CurrentLevel stays put, no enemies spawn, SetCurrentLevel is
+			-- refused and even AutoProgressionEnabled=true doesn't move it --
+			-- until the player presses the game's own "Next Stage" button on
+			-- GameUI.VictoryEndScreen. Every RequestBossAction payload guessed
+			-- (9 shapes) came back invalid_payload, so instead of guessing the
+			-- protocol, press the real button by invoking its own connected
+			-- click handlers (getconnections) -- the game's code then sends
+			-- exactly what the server expects. Confirmed: level 30 -> 31 within
+			-- 3s, pending result cleared, wave encounter active. Only the
+			-- VictoryEndScreen button is pressed -- DefeatEndScreen's is
+			-- "Revive & Continue" and is left alone on purpose.
+			pcall(function()
+				local pg = plr:FindFirstChild("PlayerGui")
+				local screen = pg and pg:FindFirstChild("GameUI") and pg.GameUI:FindFirstChild("VictoryEndScreen", true)
+				local btn = screen and screen:FindFirstChild("NextStage", true)
+				if btn and btn.Visible and (btn:IsA("TextButton") or btn:IsA("ImageButton")) and getconnections then
+					local pressed = false
+					for _, sig in ipairs({"Activated", "MouseButton1Click"}) do
+						local okc, conns = pcall(getconnections, btn[sig])
+						if okc and type(conns) == "table" then
+							for _, c in ipairs(conns) do
+								if pcall(function() if c.Function then c.Function() elseif c.Fire then c:Fire() end end) then pressed = true end
+							end
+						end
+					end
+					if pressed then stats.target = "pressed Next Stage" end
+				end
+			end)
 			if plr:GetAttribute("PlayerArea") == "Lobby" then
 				local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
 				local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
@@ -579,6 +702,59 @@ task.spawn(function()
 		-- for most of that window before the pin caught it. 3s keeps the drift
 		-- to a couple of seconds at most.
 		task.wait(3)
+	end
+end)
+
+-- ---------------------------------------------------------------- Auto Skip Animation
+-- Measured live before building this: the SERVER has essentially no
+-- end-of-level delay -- StageCleared, the CurrentLevel attribute change, and
+-- AutoProgressionAdvanced all land in the same tick (0.0s apart, 3 levels
+-- in a row), and a boss goes intro -> active in 1.6s. The animations the
+-- player sits through are client-side only: the stage-clear banner, the
+-- zone-intro cinematic (ZoneIntroGui), area transitions (AreaTransitionGui)
+-- and the boss intro overlay (BossIntroGui), which also grabs the camera
+-- (CameraType Scriptable) for its cinematic. None of them gate anything
+-- server-side, so skipping is purely local:
+--   - keep those ScreenGuis disabled while the toggle is on (re-enabled the
+--     moment it's turned off, nothing is destroyed);
+--   - hand the camera back to the player whenever an intro takes it;
+--   - if the zone-intro remotes exist at the time (they come and go --
+--     ZoneIntroStarted wasn't present during a later probe), acknowledge
+--     completion straight away and ask for future intros to be deferred.
+-- HeroRollRevealGui is deliberately left alone: hero-summon reveals go
+-- through their own Acknowledge*HeroSummon remotes and shouldn't be hidden.
+local SKIP_GUIS = {"ZoneIntroGui", "AreaTransitionGui", "BossIntroGui"}
+local skipGuiWasEnabled = {}
+task.spawn(function()
+	while getgenv().__SH == G do
+		local pg = plr:FindFirstChild("PlayerGui")
+		if pg then
+			for _, name in ipairs(SKIP_GUIS) do
+				local g = pg:FindFirstChild(name)
+				if g and g:IsA("ScreenGui") then
+					if e.shSkipAnim then
+						if g.Enabled then skipGuiWasEnabled[name] = true g.Enabled = false end
+					elseif skipGuiWasEnabled[name] then
+						g.Enabled = true skipGuiWasEnabled[name] = nil
+					end
+				end
+			end
+		end
+		if e.shSkipAnim then
+			local cam = workspace.CurrentCamera
+			if cam and cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+			local zc = net:FindFirstChild("ZoneIntroCompleted-RemoteEvent")
+			local zd = net:FindFirstChild("SetZoneIntroDeferred-RemoteEvent")
+			local zs = net:FindFirstChild("GetZoneIntroState-RemoteFunction")
+			if zs and zc then
+				local ok, st = pcall(function() return zs:InvokeServer() end)
+				if ok and type(st) == "table" and (st.active or st.isActive or st.introId) then
+					pcall(function() zc:FireServer(st.introId or st) end)
+					if zd then pcall(function() zd:FireServer(true) end) end
+				end
+			end
+		end
+		task.wait(0.5)
 	end
 end)
 
@@ -658,6 +834,10 @@ FL:Dropdown({
 		if n then e.shLoopLevel = n; sv() end
 	end,
 }, "shLoopLevel")
+FL:Header({Text = "Animation"})
+FL:Toggle({Name = "Auto Skip Animation", Default = e.shSkipAnim,
+	Callback = function(v) e.shSkipAnim = v; sv() end}, "shSkipAnim")
+FL:Label({Text = "Hides the stage-clear / zone-intro / boss-intro cinematics\nand hands the camera back. Server-side there's no delay to\nskip -- the next level starts the same tick a stage clears."})
 
 local FR = Tabs.Farm:Section({Side = "Right"})
 FR:Header({Text = "Status"})
@@ -702,6 +882,17 @@ IL:Toggle({Name = "Auto Equip Best", Default = e.shEquipBestEnabled,
 IL:Header({Text = "Progression"})
 IL:Toggle({Name = "Auto Upgrade Skill Tree", Default = e.shSkillTreeEnabled,
 	Callback = function(v) e.shSkillTreeEnabled = v; sv() end}, "shSkillTreeEnabled")
+IL:Dropdown({
+	Name = "Upgrade Priority (bought first)", Multi = true, Search = true,
+	Options = SKILL_LABELS, Default = setToArray(e.shUpgradePriority),
+	Callback = function(sel)
+		local set = {}
+		for name, on in pairs(sel) do if on then set[name] = true end end
+		e.shUpgradePriority = set; sv()
+	end,
+}, "shUpgradePriority")
+IL:Toggle({Name = "Then buy everything else (Max Buy)", Default = e.shUpgradeRest,
+	Callback = function(v) e.shUpgradeRest = v; sv() end}, "shUpgradeRest")
 IL:Toggle({Name = "Auto Claim Quest", Default = e.shQuestEnabled,
 	Callback = function(v) e.shQuestEnabled = v; sv() end}, "shQuestEnabled")
 IL:Toggle({Name = "Auto Claim Index", Default = e.shIndexEnabled,
