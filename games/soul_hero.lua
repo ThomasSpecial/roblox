@@ -127,13 +127,22 @@ end)
 
 if e.shFarmEnabled == nil then e.shFarmEnabled = true end
 if e.shM1Enabled == nil then e.shM1Enabled = true end
-if e.shM1Interval == nil then e.shM1Interval = 0.1 end
+if e.shM1Interval == nil then e.shM1Interval = 0.8 end
+-- one-time upward clamp, not a full re-default: a value saved by an earlier
+-- version (when the default/floor was still 0.1/0.05) would otherwise load
+-- back in and silently reintroduce the exact wasted-calls problem the fix
+-- above exists to prevent. Below the real 0.75s weapon cooldown is never
+-- correct for any weapon in this game, so nudging it up is safe -- unlike
+-- blindly re-populating a user's deliberate selection (the mistake made
+-- with thRecruitQualities in the Tapborne Heroes script), this isn't a
+-- preference to respect, it's a value that can only ever waste calls.
+if e.shM1Interval < 0.75 then e.shM1Interval = 0.8 end
 if e.shCollectEnabled == nil then e.shCollectEnabled = true end
 if e.shOrbitEnabled == nil then e.shOrbitEnabled = true end
 if e.shOrbitMode == nil then e.shOrbitMode = "On Foot" end
 if e.shOrbitSpeed == nil then e.shOrbitSpeed = 60 end
-if e.shOrbitHeight == nil then e.shOrbitHeight = 6 end
-if e.shOrbitDistance == nil then e.shOrbitDistance = 8 end
+if e.shOrbitHeight == nil then e.shOrbitHeight = 4 end
+if e.shOrbitDistance == nil then e.shOrbitDistance = 6 end
 if e.shEquipBestEnabled == nil then e.shEquipBestEnabled = true end
 if e.shSkillTreeEnabled == nil then e.shSkillTreeEnabled = true end
 if e.shQuestEnabled == nil then e.shQuestEnabled = true end
@@ -260,37 +269,63 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 -- ---------------------------------------------------------------- Auto Farm Mob / Auto M1
+-- "Doesn't work" turned out to mean every single call was landing inside
+-- the weapon's own cooldown and getting silently dropped -- confirmed by
+-- reading ReplicatedStorage.Shared.Config.PlayerWeaponConfig directly:
+-- this account's equipped weapon (ClassicSword) has CooldownSeconds=0.75
+-- and Range=10.5. The original 0.1s default interval fired ~7.5x faster
+-- than the weapon can actually swing -- the server never emits a rejection
+-- for a too-fast call, it just doesn't produce ANY event at all, which is
+-- indistinguishable from "not working" with nothing to see live. A single
+-- attack fired after a clean gap DID land (HitResolved, defeated=true) --
+-- confirms the remote/enemyId/args were correct all along; only the pacing
+-- was wrong. Default bumped to 0.8s (a hair above the real cooldown); the
+-- floor below is deliberately kept at the real 0.75s so the slider can't be
+-- dragged back into wasting calls the same way.
 task.spawn(function()
 	while getgenv().__SH == G do
 		if (e.shFarmEnabled and e.shM1Enabled) and currentTarget then
 			local ok = fire("PlayerWeaponAttackRequested-RemoteEvent", currentTarget.enemyId)
 			if ok then stats.hits += 1 end
 		end
-		task.wait(math.max(e.shM1Interval or 0.1, 0.05))
+		task.wait(math.max(e.shM1Interval or 0.8, 0.75))
 	end
 end)
 
 -- ---------------------------------------------------------------- Auto Collect Coin (Instant)
-task.spawn(function()
-	while getgenv().__SH == G do
-		if e.shCollectEnabled then
-			local ok, groups = call("GetDropGroups-RemoteFunction")
-			if ok and type(groups) == "table" then
-				for _, grp in pairs(groups) do
-					if getgenv().__SH ~= G then break end
-					if grp.dropGroupId then
-						local cok, res = call("ClaimDropSlice-RemoteFunction", grp.dropGroupId)
-						if cok and type(res) == "table" and res.ok then
-							stats.collected += 1
-						end
-						task.wait(0.15)
-					end
+-- First version polled GetDropGroups-RemoteFunction every 3s and tried
+-- ClaimDropSlice on whatever it found -- confirmed live this basically never
+-- lands: every drop's own originPosition field reads null (no position data
+-- available through ANY remote here), and DropGroupAdded's own expiresAt is
+-- only a few seconds out. By the time a 3s poll noticed a drop, it had
+-- usually either expired or the character (mid-orbit, already moved to
+-- whatever's now the nearest target) had drifted out of range -- confirmed
+-- live: claiming a drop caught mid-window still answered
+-- {ok=false, reason="missing_or_wrong_owner"} once enough time had passed.
+--
+-- Real fix: since coins drop at the kill location and Orbit is already
+-- flying the character right next to whatever it just killed, the character
+-- is likely AT ITS CLOSEST to a fresh drop in the instant it's announced --
+-- so claim on the DropGroupAdded event itself instead of polling, firing a
+-- few quick retries in case the very first attempt lands a tick before the
+-- drop is fully registered server-side.
+if net:FindFirstChild("DropGroupAdded-RemoteEvent") then
+	net["DropGroupAdded-RemoteEvent"].OnClientEvent:Connect(function(grp)
+		if getgenv().__SH ~= G or not e.shCollectEnabled then return end
+		if not (grp and grp.dropGroupId) then return end
+		task.spawn(function()
+			for _ = 1, 4 do
+				if getgenv().__SH ~= G then break end
+				local ok, res = call("ClaimDropSlice-RemoteFunction", grp.dropGroupId)
+				if ok and type(res) == "table" and res.ok then
+					stats.collected += 1
+					break
 				end
+				task.wait(0.2)
 			end
-		end
-		task.wait(3)
-	end
-end)
+		end)
+	end)
+end
 
 -- ---------------------------------------------------------------- Inventory: Equip Best / Skill Tree
 task.spawn(function()
@@ -415,7 +450,7 @@ FL:Toggle({Name = "Auto Farm Mob", Default = e.shFarmEnabled,
 FL:Toggle({Name = "Auto M1", Default = e.shM1Enabled,
 	Callback = function(v) e.shM1Enabled = v; sv() end}, "shM1Enabled")
 FL:Slider({
-	Name = "M1 Interval", Default = e.shM1Interval, Minimum = 0.05, Maximum = 2,
+	Name = "M1 Interval", Default = e.shM1Interval, Minimum = 0.75, Maximum = 3,
 	DisplayMethod = "Float", Precision = 2,
 	Callback = function(v) e.shM1Interval = v; sv() end,
 }, "shM1Interval")
