@@ -258,35 +258,79 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	setOrbitFlight(hrp, hum, true)
 
+	-- Read the mob's position LIVE every frame rather than the snapshot
+	-- refreshTarget() took up to 1s ago -- mobs here move (moveSpeed=14 on
+	-- the ledger), and since the server picks the M1 target purely by which
+	-- mob sits inside the weapon's facing arc, circling and facing a stale
+	-- point means facing where the mob WAS, not where it is.
+	local part = currentTarget.part
+	local center = (part and part.Parent) and part.Position or currentTarget.position
 	orbitAngle = (orbitAngle + math.rad(e.shOrbitSpeed) * dt) % (2 * math.pi)
 	local dist = e.shOrbitDistance
 	local height = (e.shOrbitMode == "On Head") and (e.shOrbitHeight + 6) or math.max(e.shOrbitHeight, 0)
 	local offset = Vector3.new(math.cos(orbitAngle) * dist, height, math.sin(orbitAngle) * dist)
-	local pos = currentTarget.position + offset
-	hrp.CFrame = CFrame.new(pos, currentTarget.position)
+	local pos = center + offset
+	-- CFrame.new(pos, target.position) pitches the whole body up/down to
+	-- literally point at the target -- fine at "On Foot" height but visibly
+	-- wrong at any real height offset (the character tips over instead of
+	-- standing upright while circling). Flattening the look-at point to the
+	-- character's OWN height keeps the CFrame's forward vector horizontal --
+	-- only yaw (facing left/right) changes, no pitch -- so the character
+	-- stays upright and just turns to face the target, same as a normal
+	-- humanoid always does on the ground.
+	--
+	-- This also matters for M1, not just looks: PlayerWeaponConfig's
+	-- ArcDegrees=120 means the server checks the target falls within a
+	-- forward-facing cone from the character's OWN orientation -- a pitched-
+	-- up/down CFrame points that cone partly at the sky/ground instead of
+	-- level at the target, which can fail the arc check even at correct
+	-- range. Facing level at the target keeps the cone aimed where it
+	-- actually needs to be.
+	local lookAt = Vector3.new(center.X, pos.Y, center.Z)
+	hrp.CFrame = CFrame.new(pos, lookAt)
 	hrp.AssemblyLinearVelocity = Vector3.zero
 	hrp.AssemblyAngularVelocity = Vector3.zero
 end)
 
 -- ---------------------------------------------------------------- Auto Farm Mob / Auto M1
--- "Doesn't work" turned out to mean every single call was landing inside
--- the weapon's own cooldown and getting silently dropped -- confirmed by
--- reading ReplicatedStorage.Shared.Config.PlayerWeaponConfig directly:
--- this account's equipped weapon (ClassicSword) has CooldownSeconds=0.75
--- and Range=10.5. The original 0.1s default interval fired ~7.5x faster
--- than the weapon can actually swing -- the server never emits a rejection
--- for a too-fast call, it just doesn't produce ANY event at all, which is
--- indistinguishable from "not working" with nothing to see live. A single
--- attack fired after a clean gap DID land (HitResolved, defeated=true) --
--- confirms the remote/enemyId/args were correct all along; only the pacing
--- was wrong. Default bumped to 0.8s (a hair above the real cooldown); the
--- floor below is deliberately kept at the real 0.75s so the slider can't be
--- dragged back into wasting calls the same way.
+-- Took three wrong turns to land this one, all verified live on 2026-09-23:
+--   1. Firing PlayerWeaponAttackRequested-RemoteEvent:FireServer(enemyId)
+--      directly does NOTHING on its own -- no hit, no rejection, no event
+--      at all, at 0.05s, 0.8s, or one call after a 6s idle gap, standing
+--      still 6.9 studs from a live mob in a normal humanoid state. The
+--      single "hit" that made it look like it worked earlier was a target
+--      the server picked itself (requested enemy_106, HitResolved named
+--      enemy_103) -- i.e. it was never my call that landed it.
+--   2. The weapon cooldown theory (PlayerWeaponConfig CooldownSeconds=0.75)
+--      was real config but the wrong diagnosis -- the pacing fix alone
+--      changed nothing.
+--   3. The real mechanism: the M1 is the equipped Tool ("Sword" in the
+--      Character). Tool:Activate() runs the game's own client-side swing
+--      handler, which does whatever handshake the server actually expects
+--      (it's that handler, not us, that fires the Swing/Attack remotes with
+--      the right state). Measured back to back in one controlled probe:
+--        Activate() only            -> HitResolved (player) = 1
+--        swing+attack remotes only  -> 0
+--        Activate()+both remotes    -> 1  (remotes add nothing)
+--      Target selection is server-side by weapon arc (ArcDegrees=120 from
+--      the character's facing, Range=10.5) -- there is no enemyId to send
+--      at all; Orbit keeping the character close and FACING the mob is what
+--      chooses the target. Interval floor stays at the real 0.75s cooldown.
 task.spawn(function()
 	while getgenv().__SH == G do
 		if (e.shFarmEnabled and e.shM1Enabled) and currentTarget then
-			local ok = fire("PlayerWeaponAttackRequested-RemoteEvent", currentTarget.enemyId)
-			if ok then stats.hits += 1 end
+			local char = plr.Character
+			local hum = char and char:FindFirstChild("Humanoid")
+			local tool = char and char:FindFirstChildWhichIsA("Tool")
+			if not tool and hum then
+				local bp = plr:FindFirstChild("Backpack")
+				local t = bp and bp:FindFirstChildWhichIsA("Tool")
+				if t then hum:EquipTool(t) task.wait(0.3) tool = char:FindFirstChildWhichIsA("Tool") end
+			end
+			if tool then
+				local ok = pcall(function() tool:Activate() end)
+				if ok then stats.hits += 1 end
+			end
 		end
 		task.wait(math.max(e.shM1Interval or 0.8, 0.75))
 	end
