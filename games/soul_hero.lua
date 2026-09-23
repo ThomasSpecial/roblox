@@ -111,6 +111,7 @@ local SK = {
 	"shOrbitEnabled", "shOrbitMode", "shOrbitSpeed", "shOrbitHeight", "shOrbitDistance",
 	"shEquipBestEnabled", "shSkillTreeEnabled",
 	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
+	"shLoopLevelEnabled", "shLoopLevel",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -127,16 +128,13 @@ end)
 
 if e.shFarmEnabled == nil then e.shFarmEnabled = true end
 if e.shM1Enabled == nil then e.shM1Enabled = true end
-if e.shM1Interval == nil then e.shM1Interval = 0.8 end
--- one-time upward clamp, not a full re-default: a value saved by an earlier
--- version (when the default/floor was still 0.1/0.05) would otherwise load
--- back in and silently reintroduce the exact wasted-calls problem the fix
--- above exists to prevent. Below the real 0.75s weapon cooldown is never
--- correct for any weapon in this game, so nudging it up is safe -- unlike
--- blindly re-populating a user's deliberate selection (the mistake made
--- with thRecruitQualities in the Tapborne Heroes script), this isn't a
--- preference to respect, it's a value that can only ever waste calls.
-if e.shM1Interval < 0.75 then e.shM1Interval = 0.8 end
+-- Default 0.01 by request. Note this does NOT mean 100 hits/s: the weapon's
+-- own cooldown (PlayerWeaponCooldownSeconds attribute, 0.75 on the starter
+-- sword) still gates how often the server accepts a swing -- Tool:Activate()
+-- calls landing inside the cooldown are simply ignored. Hammering it this
+-- fast just guarantees a swing fires the instant the cooldown clears rather
+-- than up to one interval late. Client-side cost of the spam is negligible.
+if e.shM1Interval == nil then e.shM1Interval = 0.01 end
 if e.shCollectEnabled == nil then e.shCollectEnabled = true end
 if e.shOrbitEnabled == nil then e.shOrbitEnabled = true end
 if e.shOrbitMode == nil then e.shOrbitMode = "On Foot" end
@@ -149,6 +147,8 @@ if e.shQuestEnabled == nil then e.shQuestEnabled = true end
 if e.shIndexEnabled == nil then e.shIndexEnabled = true end
 if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
+if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
+if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
@@ -340,7 +340,7 @@ task.spawn(function()
 				if ok then stats.hits += 1 end
 			end
 		end
-		task.wait(math.max(e.shM1Interval or 0.8, 0.75))
+		task.wait(math.max(e.shM1Interval or 0.01, 0.01))
 	end
 end)
 
@@ -378,6 +378,32 @@ if net:FindFirstChild("DropGroupAdded-RemoteEvent") then
 		end)
 	end)
 end
+
+-- Periodic 0.5s sweep (by request) on top of the event-driven claim above:
+-- re-tries every drop the server still lists via GetDropGroups. The
+-- event path is what lands the instant claim at the kill spot; this sweep
+-- picks up anything that was out of range at drop time but is in range
+-- now that Orbit has moved the character on. Claims within one sweep are
+-- spaced 0.1s so a big pile of drops doesn't trip the server's rate limit
+-- the way a tight burst of quest claims did ("rate_limited").
+task.spawn(function()
+	while getgenv().__SH == G do
+		if e.shCollectEnabled then
+			local ok, groups = call("GetDropGroups-RemoteFunction")
+			if ok and type(groups) == "table" then
+				for _, grp in pairs(groups) do
+					if getgenv().__SH ~= G then break end
+					if grp.dropGroupId then
+						local cok, res = call("ClaimDropSlice-RemoteFunction", grp.dropGroupId)
+						if cok and type(res) == "table" and res.ok then stats.collected += 1 end
+						task.wait(0.1)
+					end
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+end)
 
 -- ---------------------------------------------------------------- Inventory: Equip Best / Skill Tree
 task.spawn(function()
@@ -505,12 +531,37 @@ end)
 --      within a couple of seconds (confirmed live). Same fix works for a
 --      character that ends up in the lobby for any other reason (respawn,
 --      rebirth flow).
+-- Loop Level (added on request): pin the account to ONE chosen level and
+-- keep replaying it instead of advancing. Two remotes, both confirmed live:
+--   - SetAutoProgressionEnabled-RemoteEvent takes a BARE boolean. true
+--     flipped the AutoProgressionEnabled attribute on and the level advanced
+--     within the same second; {enabled=true} (table) was read as false and
+--     turned it OFF -- so never wrap it.
+--   - SetCurrentLevel-RemoteEvent takes a bare level number (31 -> 30
+--     confirmed live; the game bounces a cleared level up by one and this
+--     pulls it back). Only levels <= UnlockedLevel are meaningful.
+-- Loop mode and Auto Next Stage are mutually exclusive by construction: with
+-- Loop on, this loop keeps auto-progression OFF and re-pins the level every
+-- pass; with Loop off and Next Stage on, it keeps auto-progression ON. It
+-- never touches the flag when both are off, so a setting made by hand in
+-- the game's own UI is left alone in that case.
 task.spawn(function()
 	while getgenv().__SH == G do
-		if e.shNextStageEnabled then
+		local loopLevel = tonumber(e.shLoopLevel)
+		if e.shLoopLevelEnabled and loopLevel then
+			if plr:GetAttribute("AutoProgressionEnabled") ~= false then
+				fire("SetAutoProgressionEnabled-RemoteEvent", false)
+			end
+			local cur = tonumber(plr:GetAttribute("CurrentLevel"))
+			if cur and cur ~= loopLevel then
+				fire("SetCurrentLevel-RemoteEvent", loopLevel)
+			end
+		elseif e.shNextStageEnabled then
 			if plr:GetAttribute("AutoProgressionEnabled") == false then
 				fire("SetAutoProgressionEnabled-RemoteEvent", true)
 			end
+		end
+		if e.shNextStageEnabled or e.shLoopLevelEnabled then
 			if plr:GetAttribute("PlayerArea") == "Lobby" then
 				local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
 				local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
@@ -522,7 +573,12 @@ task.spawn(function()
 				end
 			end
 		end
-		task.wait(10)
+		-- 3s, not 10: watched live with Loop pinned to level 8, the game
+		-- re-enabled auto-progression and jumped to level 11 on a wave clear
+		-- between polls, and a 10s gap left the account farming the wrong level
+		-- for most of that window before the pin caught it. 3s keeps the drift
+		-- to a couple of seconds at most.
+		task.wait(3)
 	end
 end)
 
@@ -572,7 +628,7 @@ FL:Toggle({Name = "Auto Farm Mob", Default = e.shFarmEnabled,
 FL:Toggle({Name = "Auto M1", Default = e.shM1Enabled,
 	Callback = function(v) e.shM1Enabled = v; sv() end}, "shM1Enabled")
 FL:Slider({
-	Name = "M1 Interval", Default = e.shM1Interval, Minimum = 0.75, Maximum = 3,
+	Name = "M1 Interval", Default = e.shM1Interval, Minimum = 0.01, Maximum = 2,
 	DisplayMethod = "Float", Precision = 2,
 	Callback = function(v) e.shM1Interval = v; sv() end,
 }, "shM1Interval")
@@ -580,6 +636,28 @@ FL:Toggle({Name = "Auto Collect Coin (Instant)", Default = e.shCollectEnabled,
 	Callback = function(v) e.shCollectEnabled = v; sv() end}, "shCollectEnabled")
 FL:Toggle({Name = "Auto Next Stage", Default = e.shNextStageEnabled,
 	Callback = function(v) e.shNextStageEnabled = v; sv() end}, "shNextStageEnabled")
+FL:Header({Text = "Loop Level"})
+FL:Toggle({Name = "Loop Level (stay on chosen level)", Default = e.shLoopLevelEnabled,
+	Callback = function(v) e.shLoopLevelEnabled = v; sv() end}, "shLoopLevelEnabled")
+-- Level list is built once at UI time from the highest level the account
+-- has ever unlocked (LifetimeUnlockedLevel survives rebirths; UnlockedLevel
+-- resets to 1 with each one), padded to at least 50 so the list still
+-- covers levels unlocked later in the same session. Picking a level the
+-- account hasn't unlocked yet is a harmless soft-no on SetCurrentLevel.
+local maxLevel = math.max(tonumber(plr:GetAttribute("LifetimeUnlockedLevel")) or 0,
+                          tonumber(plr:GetAttribute("UnlockedLevel")) or 0, 50)
+local LEVEL_OPTIONS = {}
+for i = 1, maxLevel do LEVEL_OPTIONS[i] = "Level " .. i end
+FL:Dropdown({
+	Name = "Loop Which Level", Multi = false, Required = true, Search = true,
+	Options = LEVEL_OPTIONS,
+	Default = math.clamp(math.floor(e.shLoopLevel), 1, maxLevel),   -- single-select Default is an INDEX
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		local n = picked and tonumber(tostring(picked):match("%d+"))
+		if n then e.shLoopLevel = n; sv() end
+	end,
+}, "shLoopLevel")
 
 local FR = Tabs.Farm:Section({Side = "Right"})
 FR:Header({Text = "Status"})
