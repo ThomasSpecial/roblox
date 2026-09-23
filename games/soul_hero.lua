@@ -110,7 +110,7 @@ local SK = {
 	"shFarmEnabled", "shM1Enabled", "shM1Interval", "shCollectEnabled",
 	"shOrbitEnabled", "shOrbitMode", "shOrbitSpeed", "shOrbitHeight", "shOrbitDistance",
 	"shEquipBestEnabled", "shSkillTreeEnabled",
-	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled",
+	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -148,10 +148,11 @@ if e.shSkillTreeEnabled == nil then e.shSkillTreeEnabled = true end
 if e.shQuestEnabled == nil then e.shQuestEnabled = true end
 if e.shIndexEnabled == nil then e.shIndexEnabled = true end
 if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
+if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
-local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, target = "-"}
+local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-"}
 
 -- ---------------------------------------------------------------- shared target tracking
 -- Auto Farm Mob, Auto M1, and Orbit all need "which enemy, and where is it"
@@ -174,7 +175,14 @@ local function refreshTarget()
 	for _, entry in pairs(entries) do
 		-- skip anything without a real hp reading -- bosses (BossIntroPending)
 		-- didn't carry one in testing; a mob mid-farm always did
-		if entry.hp and entry.hp.current and entry.hp.current > 0 and entry.enemyId then
+		-- Entries with no hp block are bosses (confirmed live) -- they used to be
+		-- skipped, which left Orbit/M1 with no target for the whole boss phase
+		-- of every level and let the ally heroes do all the boss work. Since M1
+		-- is Tool:Activate() and the SERVER picks what's in the weapon arc,
+		-- orbiting a boss is all that's needed to include it; a pre-intro boss
+		-- just answers BossIntroPending (soft no) until its intro finishes.
+		local alive = entry.enemyId and (entry.hp == nil or (entry.hp.current or 0) > 0)
+		if alive then
 			for _, m in ipairs(enemiesFolder:GetChildren()) do
 				if m.Name == entry.archetypeId then
 					local part = m:FindFirstChildWhichIsA("BasePart", true)
@@ -398,17 +406,29 @@ end)
 task.spawn(function()
 	while getgenv().__SH == G do
 		if e.shQuestEnabled then
+			-- ClaimQuestReward-RemoteFunction wants THREE args: (categoryId,
+			-- periodId, questId). Found by elimination live on 2026-09-23 with two
+			-- genuinely claimable weekly quests sitting there: every 1- and 2-arg
+			-- shape answered {ok=false, reason="invalid_request"}, and the sibling
+			-- ClaimQuestRewards(categoryId) answered "invalid_periods" -- the hint
+			-- that a period was the missing piece. periodId is right there on
+			-- each category in GetQuestState (e.g. "2026-W39" for Weekly,
+			-- "lifetime" for Special). Success returns {state={...}} (the full
+			-- refreshed quest state), NOT {ok=true} -- and the quest flipped to
+			-- claimed=true on the next read. Spaced 1s apart: a burst of claims
+			-- answers "rate_limited".
 			local ok, res = call("GetQuestState-RemoteFunction")
 			if ok and type(res) == "table" and res.categories then
-				for _, cat in pairs(res.categories) do
+				for catName, cat in pairs(res.categories) do
 					for _, q in ipairs(cat.quests or {}) do
 						if getgenv().__SH ~= G then break end
 						if q.completed and not q.claimed and q.id then
-							local cok, cres = call("ClaimQuestReward-RemoteFunction", q.id)
-							if cok and type(cres) == "table" and cres.ok then
+							local cok, cres = call("ClaimQuestReward-RemoteFunction",
+								cat.id or catName, cat.periodId, q.id)
+							if cok and type(cres) == "table" and (cres.state or cres.ok) then
 								stats.quests += 1
 							end
-							task.wait(0.2)
+							task.wait(1)
 						end
 					end
 				end
@@ -440,11 +460,69 @@ task.spawn(function()
 		if e.shRebirthEnabled then
 			local ok, res = call("GetRebirthState-RemoteFunction")
 			if ok and type(res) == "table" and res.canRebirth then
-				local rok = call("AttemptRebirth-RemoteFunction")
-				if rok then stats.rebirths += 1 end
+				-- AttemptRebirth answers a table, not a bare bool: {ok=true,...} on
+				-- success, or {ok=false, reason=..., retryable=..., unrecoverable=...}
+				-- when refused. Counting the bare pcall as a rebirth (the old code)
+				-- inflated "Rebirths" on every refusal. Real result of this loop in
+				-- one live session: rebirthCount 1 -> 5 on the account -- it works
+				-- whenever the game accepts. When the game refuses, canRebirth=true
+				-- alone is NOT the real gate: seen live as reason=
+				-- "rebirth_unrecoverable" (retryable=false) at level 35 in both the
+				-- Combat and Lobby areas, with no error text anywhere in the game's
+				-- own UI to explain it. Surface the reason on the status panel so
+				-- a refusal is visible instead of silently looking like "no-op".
+				local rok, rres = call("AttemptRebirth-RemoteFunction")
+				if rok and type(rres) == "table" then
+					if rres.ok then
+						stats.rebirths += 1
+						stats.rebirthNote = "ok"
+					else
+						stats.rebirthNote = tostring(rres.reason or "refused")
+					end
+				end
+			elseif ok and type(res) == "table" then
+				stats.rebirthNote = ("not ready (lv %s / need %s)"):format(tostring(res.currentLevel), tostring(res.nextRewardLevel))
 			end
 		end
 		task.wait(30)
+	end
+end)
+
+-- ---------------------------------------------------------------- Auto Next Stage
+-- Stage progression is a built-in game feature, not something to drive by
+-- hand: the "AutoProgressionEnabled" player attribute was already true on
+-- this account, and the level climbed 24 -> 35 during one live session
+-- with zero manual RequestAreaTransition/SetPlayerPartyStage calls -- the
+-- game advances on its own the moment a wave/boss clears. So this loop's
+-- real jobs are the two things that DO break progression:
+--   1. Re-assert SetAutoProgressionEnabled(true) if the attribute ever
+--      reads false (a game UI toggle / rebirth reset could flip it).
+--   2. Keep the character in the Combat area. My own area-transition
+--      probing bounced the account into the Lobby and progression halted
+--      there; RequestAreaTransition({source="Lobby",destination="Combat"})
+--      answers "invalid_button_transition" (not a button-driven hop), but
+--      standing on workspace.Lobby.CombatPortal's part re-enters Combat
+--      within a couple of seconds (confirmed live). Same fix works for a
+--      character that ends up in the lobby for any other reason (respawn,
+--      rebirth flow).
+task.spawn(function()
+	while getgenv().__SH == G do
+		if e.shNextStageEnabled then
+			if plr:GetAttribute("AutoProgressionEnabled") == false then
+				fire("SetAutoProgressionEnabled-RemoteEvent", true)
+			end
+			if plr:GetAttribute("PlayerArea") == "Lobby" then
+				local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
+				local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
+				local char = plr.Character
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				if part and hrp then
+					hrp.CFrame = part.CFrame + Vector3.new(0, 2, 0)
+					task.wait(4)
+				end
+			end
+		end
+		task.wait(10)
 	end
 end)
 
@@ -500,6 +578,8 @@ FL:Slider({
 }, "shM1Interval")
 FL:Toggle({Name = "Auto Collect Coin (Instant)", Default = e.shCollectEnabled,
 	Callback = function(v) e.shCollectEnabled = v; sv() end}, "shCollectEnabled")
+FL:Toggle({Name = "Auto Next Stage", Default = e.shNextStageEnabled,
+	Callback = function(v) e.shNextStageEnabled = v; sv() end}, "shNextStageEnabled")
 
 local FR = Tabs.Farm:Section({Side = "Right"})
 FR:Header({Text = "Status"})
@@ -578,8 +658,8 @@ task.spawn(function()
 				stats.target, stats.hits, stats.collected))
 		end)
 		pcall(function()
-			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d"):format(
-				stats.equips, stats.skillNodes, stats.quests, stats.index, stats.rebirths))
+			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)"):format(
+				stats.equips, stats.skillNodes, stats.quests, stats.index, stats.rebirths, stats.rebirthNote))
 		end)
 	end
 end)
