@@ -112,6 +112,7 @@ local SK = {
 	"shEquipBestEnabled", "shSkillTreeEnabled",
 	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
 	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeOrder", "shUpgradeRest",
+	"shRebirthMinLevel",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -146,6 +147,7 @@ if e.shSkillTreeEnabled == nil then e.shSkillTreeEnabled = true end
 if e.shQuestEnabled == nil then e.shQuestEnabled = true end
 if e.shIndexEnabled == nil then e.shIndexEnabled = true end
 if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
+if type(e.shRebirthMinLevel) ~= "number" then e.shRebirthMinLevel = 0 end   -- 0 = rebirth as soon as the game allows
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
@@ -599,7 +601,18 @@ end)
 -- ---------------------------------------------------------------- Auto Rebirth
 task.spawn(function()
 	while getgenv().__SH == G do
-		if e.shRebirthEnabled then
+		-- Stage gate: the game only unlocks rebirth after boss stages (10, 20,
+		-- 30 ... 100), and rebirthing at the first eligible boss wastes the
+		-- deeper-stage multiplier. shRebirthMinLevel is the player's pick of
+		-- which boss stage to hold out for; 0 means "as soon as the game
+		-- allows". CurrentLevel is the live player attribute (same one the
+		-- Loop Level / Next Stage loops read), so a rebirth reset drops it
+		-- back below the gate and the loop simply waits for the next climb.
+		local minLv = tonumber(e.shRebirthMinLevel) or 0
+		local curLv = tonumber(plr:GetAttribute("CurrentLevel")) or 0
+		if e.shRebirthEnabled and curLv < minLv then
+			stats.rebirthNote = ("waiting for stage %d (now %d)"):format(minLv, curLv)
+		elseif e.shRebirthEnabled then
 			local ok, res = call("GetRebirthState-RemoteFunction")
 			if ok and type(res) == "table" and res.canRebirth then
 				-- AttemptRebirth answers a table, not a bare bool: {ok=true,...} on
@@ -626,7 +639,10 @@ task.spawn(function()
 				stats.rebirthNote = ("not ready (lv %s / need %s)"):format(tostring(res.currentLevel), tostring(res.nextRewardLevel))
 			end
 		end
-		task.wait(30)
+		-- 10s, not 30: with a stage gate the eligible window opens the moment
+		-- the boss drops, and a 30s poll could sit on the far side of a level
+		-- change long enough to feel like "it's not rebirthing".
+		task.wait(10)
 	end
 end)
 
@@ -1058,7 +1074,33 @@ IL:Toggle({Name = "Auto Claim Index", Default = e.shIndexEnabled,
 	Callback = function(v) e.shIndexEnabled = v; sv() end}, "shIndexEnabled")
 IL:Toggle({Name = "Auto Rebirth", Default = e.shRebirthEnabled,
 	Callback = function(v) e.shRebirthEnabled = v; sv() end}, "shRebirthEnabled")
-IL:Label({Text = "Auto Rebirth only ever fires when the game itself\nreports canRebirth -- never forces one early."})
+-- Boss stages are every 10 levels (10, 20 ... 100) and rebirth only unlocks
+-- past one, so the picker is the boss list plus an "as soon as allowed" row.
+-- Stored as the level number (0 = ASAP); the Default is the option INDEX,
+-- so a saved level maps back through REBIRTH_STAGE_LEVELS on reload.
+local REBIRTH_STAGE_OPTIONS, REBIRTH_STAGE_LEVELS = {"As soon as allowed"}, {0}
+for lv = 10, 100, 10 do
+	REBIRTH_STAGE_OPTIONS[#REBIRTH_STAGE_OPTIONS + 1] = ("Stage %d"):format(lv)
+	REBIRTH_STAGE_LEVELS[#REBIRTH_STAGE_LEVELS + 1] = lv
+end
+local function rebirthStageIndex(level)
+	for i, lv in ipairs(REBIRTH_STAGE_LEVELS) do
+		if lv == level then return i end
+	end
+	return 1
+end
+IL:Dropdown({
+	Name = "Rebirth At Stage", Multi = false, Required = true, Search = true,
+	Options = REBIRTH_STAGE_OPTIONS,
+	Default = rebirthStageIndex(e.shRebirthMinLevel),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		if type(picked) ~= "string" then return end
+		e.shRebirthMinLevel = tonumber(picked:match("%d+")) or 0
+		sv()
+	end,
+}, "shRebirthMinLevel")
+IL:Label({Text = "Waits until CurrentLevel reaches the picked boss stage,\nthen rebirths the moment the game reports canRebirth.\n\"As soon as allowed\" = the first stage the game unlocks."})
 
 local IR = Tabs.Inventory:Section({Side = "Right"})
 IR:Header({Text = "Status"})
