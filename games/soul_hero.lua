@@ -749,6 +749,95 @@ end)
 -- through their own Acknowledge*HeroSummon remotes and shouldn't be hidden.
 local SKIP_GUIS = {"ZoneIntroGui", "AreaTransitionGui", "BossIntroGui"}
 local skipGuiWasEnabled = {}
+
+-- Event-driven skip, on top of the 0.5s poll below. The poll alone was
+-- reported as "the boss fade is still there": diffing every GuiObject
+-- during a live boss intro showed the intro is BossIntroGui's letterbox
+-- bars (BottomLetterbox/…) plus a camera cut (CameraType Scriptable, FOV
+-- tweened to ~55) -- both visible for up to a full poll interval before the
+-- loop caught them. Three things fire the instant BossIntroStarted arrives:
+--   1. press the game's OWN skip control (BossIntroGui…SkipButton) through
+--      its connected handlers -- the game then ends its cinematic the way
+--      it was designed to, restoring its own camera/FOV state cleanly;
+--   2. disable the intro ScreenGuis right away (no 0.5s gap);
+--   3. restore the camera on the CameraType change signal itself rather
+--      than on the next poll tick.
+local function pressGameSkip()
+	local pg = plr:FindFirstChild("PlayerGui")
+	local gui = pg and pg:FindFirstChild("BossIntroGui")
+	local btn = gui and gui:FindFirstChild("SkipButton", true)
+	if not (btn and getconnections and (btn:IsA("TextButton") or btn:IsA("ImageButton"))) then return false end
+	local pressed = false
+	for _, sig in ipairs({"Activated", "MouseButton1Click"}) do
+		local okc, conns = pcall(getconnections, btn[sig])
+		if okc and type(conns) == "table" then
+			for _, c in ipairs(conns) do
+				if pcall(function() if c.Function then c.Function() elseif c.Fire then c:Fire() end end) then pressed = true end
+			end
+		end
+	end
+	return pressed
+end
+local function hideIntroGuisNow()
+	local pg = plr:FindFirstChild("PlayerGui")
+	if not pg then return end
+	for _, name in ipairs(SKIP_GUIS) do
+		local g = pg:FindFirstChild(name)
+		if g and g:IsA("ScreenGui") and g.Enabled then skipGuiWasEnabled[name] = true g.Enabled = false end
+	end
+end
+local function restoreCameraNow()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+	cam.FieldOfView = 70
+end
+for _, evName in ipairs({"BossIntroStarted-RemoteEvent", "ZoneIntroStarted-RemoteEvent", "ZoneIntroClientStarted-RemoteEvent"}) do
+	local ev = net:FindFirstChild(evName)
+	if ev then
+		ev.OnClientEvent:Connect(function()
+			if getgenv().__SH ~= G or not e.shSkipAnim then return end
+			hideIntroGuisNow()
+			restoreCameraNow()
+			-- the skip button is created a moment after the event; try a few times
+			task.spawn(function()
+				for _ = 1, 8 do
+					if pressGameSkip() then break end
+					task.wait(0.1)
+				end
+				restoreCameraNow()
+			end)
+		end)
+	end
+end
+workspace.CurrentCamera:GetPropertyChangedSignal("CameraType"):Connect(function()
+	if getgenv().__SH == G and e.shSkipAnim and workspace.CurrentCamera.CameraType ~= Enum.CameraType.Custom then
+		task.defer(restoreCameraNow)
+	end
+end)
+-- The game turns BossIntroGui ON a moment *after* BossIntroStarted fires, so
+-- disabling it inside that event handler happened too early and the
+-- letterbox still showed for ~30 frames (measured at the level-55 boss:
+-- camera 0 frames non-Custom, FOV never below 70 -- the camera side was
+-- fixed -- but the GUI was Enabled for 30 frames until the 0.5s poll got
+-- it). Watching each intro GUI's own Enabled property closes that gap: the
+-- frame the game enables it, it's disabled again.
+local function guardIntroGui(g)
+	if not (g:IsA("ScreenGui") and table.find(SKIP_GUIS, g.Name)) then return end
+	g:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if getgenv().__SH == G and e.shSkipAnim and g.Enabled then
+			skipGuiWasEnabled[g.Name] = true
+			g.Enabled = false
+		end
+	end)
+end
+do
+	local pg = plr:FindFirstChild("PlayerGui")
+	if pg then
+		for _, g in ipairs(pg:GetChildren()) do guardIntroGui(g) end
+		pg.ChildAdded:Connect(guardIntroGui)
+	end
+end
 task.spawn(function()
 	while getgenv().__SH == G do
 		local pg = plr:FindFirstChild("PlayerGui")
