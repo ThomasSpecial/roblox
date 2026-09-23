@@ -110,6 +110,7 @@ local SK = {
 	"shFarmEnabled", "shM1Enabled", "shM1Interval", "shCollectEnabled",
 	"shOrbitEnabled", "shOrbitMode", "shOrbitSpeed", "shOrbitHeight", "shOrbitDistance",
 	"shEquipBestEnabled", "shSkillTreeEnabled",
+	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -135,6 +136,9 @@ if e.shOrbitHeight == nil then e.shOrbitHeight = 6 end
 if e.shOrbitDistance == nil then e.shOrbitDistance = 8 end
 if e.shEquipBestEnabled == nil then e.shEquipBestEnabled = true end
 if e.shSkillTreeEnabled == nil then e.shSkillTreeEnabled = true end
+if e.shQuestEnabled == nil then e.shQuestEnabled = true end
+if e.shIndexEnabled == nil then e.shIndexEnabled = true end
+if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
@@ -201,15 +205,49 @@ end)
 -- pathfinding, and is what actually gets Auto M1 close enough to land hits
 -- in the first place. "On Head" orbits above the target (shOrbitHeight adds
 -- on top of the target's own height); "On Foot" orbits at roughly ground
--- level next to it (shOrbitHeight is a small clearance instead). Smooth
--- per-frame CFrame deltas, not a teleport -- see the header note on why a
--- one-shot jump gets reverted but this doesn't.
+-- level next to it (shOrbitHeight is a small clearance instead).
+--
+-- First version just set hrp.CFrame on RenderStepped and looked visibly
+-- wrong -- the Humanoid's own walk/fall state machine was still fully
+-- active underneath and kept fighting the CFrame every frame (gravity
+-- pulling it back down, ground friction resisting the horizontal motion),
+-- producing jitter instead of a clean circle. Fixed by actually taking the
+-- character out of normal movement while orbiting is active:
+--   - Humanoid.PlatformStand = true suspends the walk/fall state machine
+--     entirely so nothing is fighting the CFrame writes.
+--   - HumanoidRootPart.CanCollide = false so flying through terrain/props
+--     near the target doesn't snag on them.
+--   - AssemblyLinearVelocity/AssemblyAngularVelocity zeroed every frame so
+--     no leftover physics momentum accumulates into drift.
+--   - RunService.Heartbeat instead of RenderStepped -- runs after physics
+--     simulation each step, the correct place for CFrame writes that need
+--     to stick (RenderStepped can visibly fight with that step on some
+--     frames).
+-- Both flags get restored to normal (PlatformStand = false, CanCollide =
+-- true) the moment orbiting stops, so walking/falling works normally again
+-- as soon as the toggle's off or no target is available.
 local orbitAngle = 0
-RunService.RenderStepped:Connect(function(dt)
-	if getgenv().__SH ~= G or not e.shOrbitEnabled or not currentTarget then return end
+local orbitFlying = false
+local function setOrbitFlight(hrp, hum, flying)
+	if orbitFlying == flying then return end
+	orbitFlying = flying
+	hum.PlatformStand = flying
+	hrp.CanCollide = not flying
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	if getgenv().__SH ~= G then return end
 	local char = plr.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return end
+	local hum = char and char:FindFirstChild("Humanoid")
+	if not (hrp and hum) then return end
+
+	local shouldFly = e.shOrbitEnabled and currentTarget ~= nil
+	if not shouldFly then
+		if orbitFlying then setOrbitFlight(hrp, hum, false) end
+		return
+	end
+	setOrbitFlight(hrp, hum, true)
 
 	orbitAngle = (orbitAngle + math.rad(e.shOrbitSpeed) * dt) % (2 * math.pi)
 	local dist = e.shOrbitDistance
@@ -217,6 +255,8 @@ RunService.RenderStepped:Connect(function(dt)
 	local offset = Vector3.new(math.cos(orbitAngle) * dist, height, math.sin(orbitAngle) * dist)
 	local pos = currentTarget.position + offset
 	hrp.CFrame = CFrame.new(pos, currentTarget.position)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
 end)
 
 -- ---------------------------------------------------------------- Auto Farm Mob / Auto M1
@@ -278,17 +318,19 @@ end)
 -- ---------------------------------------------------------------- Auto Claim Quest
 task.spawn(function()
 	while getgenv().__SH == G do
-		local ok, res = call("GetQuestState-RemoteFunction")
-		if ok and type(res) == "table" and res.categories then
-			for _, cat in pairs(res.categories) do
-				for _, q in ipairs(cat.quests or {}) do
-					if getgenv().__SH ~= G then break end
-					if q.completed and not q.claimed and q.id then
-						local cok, cres = call("ClaimQuestReward-RemoteFunction", q.id)
-						if cok and type(cres) == "table" and cres.ok then
-							stats.quests += 1
+		if e.shQuestEnabled then
+			local ok, res = call("GetQuestState-RemoteFunction")
+			if ok and type(res) == "table" and res.categories then
+				for _, cat in pairs(res.categories) do
+					for _, q in ipairs(cat.quests or {}) do
+						if getgenv().__SH ~= G then break end
+						if q.completed and not q.claimed and q.id then
+							local cok, cres = call("ClaimQuestReward-RemoteFunction", q.id)
+							if cok and type(cres) == "table" and cres.ok then
+								stats.quests += 1
+							end
+							task.wait(0.2)
 						end
-						task.wait(0.2)
 					end
 				end
 			end
@@ -303,9 +345,11 @@ end)
 -- risks nothing but wasted calls, but there's no confirmed win either).
 task.spawn(function()
 	while getgenv().__SH == G do
-		local ok, res = call("ClaimAllHeroIndexRewards-RemoteFunction")
-		if ok and type(res) == "table" and res.ok and (res.claimedCount or 0) > 0 then
-			stats.index += res.claimedCount
+		if e.shIndexEnabled then
+			local ok, res = call("ClaimAllHeroIndexRewards-RemoteFunction")
+			if ok and type(res) == "table" and res.ok and (res.claimedCount or 0) > 0 then
+				stats.index += res.claimedCount
+			end
 		end
 		task.wait(30)
 	end
@@ -314,10 +358,12 @@ end)
 -- ---------------------------------------------------------------- Auto Rebirth
 task.spawn(function()
 	while getgenv().__SH == G do
-		local ok, res = call("GetRebirthState-RemoteFunction")
-		if ok and type(res) == "table" and res.canRebirth then
-			local rok = call("AttemptRebirth-RemoteFunction")
-			if rok then stats.rebirths += 1 end
+		if e.shRebirthEnabled then
+			local ok, res = call("GetRebirthState-RemoteFunction")
+			if ok and type(res) == "table" and res.canRebirth then
+				local rok = call("AttemptRebirth-RemoteFunction")
+				if rok then stats.rebirths += 1 end
+			end
 		end
 		task.wait(30)
 	end
@@ -419,7 +465,13 @@ IL:Toggle({Name = "Auto Equip Best", Default = e.shEquipBestEnabled,
 IL:Header({Text = "Progression"})
 IL:Toggle({Name = "Auto Upgrade Skill Tree", Default = e.shSkillTreeEnabled,
 	Callback = function(v) e.shSkillTreeEnabled = v; sv() end}, "shSkillTreeEnabled")
-IL:Label({Text = "Also auto-claims Quests, Hero Index rewards, and\nRebirths when the game itself says they're ready --\nno separate toggles, always on alongside the others above."})
+IL:Toggle({Name = "Auto Claim Quest", Default = e.shQuestEnabled,
+	Callback = function(v) e.shQuestEnabled = v; sv() end}, "shQuestEnabled")
+IL:Toggle({Name = "Auto Claim Index", Default = e.shIndexEnabled,
+	Callback = function(v) e.shIndexEnabled = v; sv() end}, "shIndexEnabled")
+IL:Toggle({Name = "Auto Rebirth", Default = e.shRebirthEnabled,
+	Callback = function(v) e.shRebirthEnabled = v; sv() end}, "shRebirthEnabled")
+IL:Label({Text = "Auto Rebirth only ever fires when the game itself\nreports canRebirth -- never forces one early."})
 
 local IR = Tabs.Inventory:Section({Side = "Right"})
 IR:Header({Text = "Status"})
