@@ -111,7 +111,7 @@ local SK = {
 	"shOrbitEnabled", "shOrbitMode", "shOrbitSpeed", "shOrbitHeight", "shOrbitDistance",
 	"shEquipBestEnabled", "shSkillTreeEnabled",
 	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
-	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeRest",
+	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeOrder", "shUpgradeRest",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -151,6 +151,13 @@ if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
 if e.shSkipAnim == nil then e.shSkipAnim = true end
 if type(e.shUpgradePriority) ~= "table" then e.shUpgradePriority = {} end
+-- Ordered priority list (labels, slot 1 first). Replaces the unordered
+-- multi-select set: a set can't express "Damage first, THEN Coin", which is
+-- exactly what was asked for. Migrates once from the old set (in list
+-- order) so nothing already ticked is lost.
+if type(e.shUpgradeOrder) ~= "table" then e.shUpgradeOrder = {} end
+-- (the one-time migration from the old set lives below SKILL_FAMILIES,
+-- which isn't defined yet at this point in the file)
 if e.shUpgradeRest == nil then e.shUpgradeRest = true end
 
 -- Skill-tree families, as the server names them (rankByFamily keys from
@@ -182,6 +189,22 @@ local function setToArray(set)
 	local arr = {}
 	for k, v in pairs(set) do if v then arr[#arr + 1] = k end end
 	return arr
+end
+
+-- One-time migration: anything ticked in the old unordered "Upgrade
+-- Priority" set becomes the initial ordered list (in SKILL_FAMILIES order),
+-- so nothing already chosen is lost when the UI switched to ranked slots.
+if #e.shUpgradeOrder == 0 and next(e.shUpgradePriority) ~= nil then
+	for _, pair in ipairs(SKILL_FAMILIES) do
+		if e.shUpgradePriority[pair[1]] then e.shUpgradeOrder[#e.shUpgradeOrder + 1] = pair[1] end
+	end
+end
+local PRIORITY_SLOTS = 5
+local PRIORITY_OPTIONS = {"None"}
+for _, label in ipairs(SKILL_LABELS) do PRIORITY_OPTIONS[#PRIORITY_OPTIONS + 1] = label end
+-- keep the slot array fixed-length ("None" = empty) -- see the slot callback
+for i = 1, PRIORITY_SLOTS do
+	if type(e.shUpgradeOrder[i]) ~= "string" then e.shUpgradeOrder[i] = "None" end
 end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
@@ -490,14 +513,15 @@ end)
 task.spawn(function()
 	while getgenv().__SH == G do
 		if e.shSkillTreeEnabled then
-			local hasPriority = next(e.shUpgradePriority) ~= nil
+			local order = e.shUpgradeOrder
+			local hasPriority = type(order) == "table" and #order > 0
 			if hasPriority then
 				local ok, st = call("GetSkillTreeState-RemoteFunction")
 				local ranks = ok and type(st) == "table" and st.rankByFamily or {}
-				for _, pair in ipairs(SKILL_FAMILIES) do
+				for _, label in ipairs(order) do   -- slot 1 first, exactly as ranked in the UI
 					if getgenv().__SH ~= G then break end
-					local label, fam = pair[1], pair[2]
-					if e.shUpgradePriority[label] then
+					local fam = SKILL_LABEL_TO_FAMILY[label]
+					if fam then
 						local rank = tonumber(ranks[fam]) or 0
 						for _ = 1, 10 do   -- cap per pass; NotEnoughCoins/UnknownNode ends it early
 							local pok, pres = call("PurchaseSkillTreeNode-RemoteFunction", fam .. (rank + 1))
@@ -742,7 +766,26 @@ task.spawn(function()
 		end
 		if e.shSkipAnim then
 			local cam = workspace.CurrentCamera
-			if cam and cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+			if cam and cam.CameraType ~= Enum.CameraType.Custom then
+				-- Cutting a cinematic mid-tween leaves the camera wherever the
+				-- intro had dragged it: measured live after a boss intro was
+				-- skipped -- FieldOfView 58 (default 70) and the camera parked
+				-- 62 studs from the character, which reads as "the screen
+				-- zoomed". Handing the camera back isn't enough on its own; the
+				-- intro's own restore code never runs, so restore it here:
+				-- default FOV, and force the Custom camera's zoom back to a
+				-- normal third-person distance by pinning the zoom limits for
+				-- one frame (the only way to set Custom-camera zoom from a
+				-- script), then giving the player's limits back.
+				cam.CameraType = Enum.CameraType.Custom
+				cam.FieldOfView = 70
+				task.spawn(function()
+					local minZ, maxZ = plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance
+					plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance = 12, 12
+					task.wait(0.1)
+					plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance = minZ, maxZ
+				end)
+			end
 			local zc = net:FindFirstChild("ZoneIntroCompleted-RemoteEvent")
 			local zd = net:FindFirstChild("SetZoneIntroDeferred-RemoteEvent")
 			local zs = net:FindFirstChild("GetZoneIntroState-RemoteFunction")
@@ -850,7 +893,9 @@ OL:Toggle({Name = "Orbit and Fly Around Mob", Default = e.shOrbitEnabled,
 	Callback = function(v) e.shOrbitEnabled = v; sv() end}, "shOrbitEnabled")
 OL:Dropdown({
 	Name = "Orbit Mode", Multi = false, Required = true,
-	Options = {"On Head", "On Foot"}, Default = e.shOrbitMode,
+	-- single-select Default is an index, not the option string (a string left
+	-- the box blank on every reload and looked like the choice hadn't saved)
+	Options = {"On Head", "On Foot"}, Default = (e.shOrbitMode == "On Head") and 1 or 2,
 	Callback = function(v)
 		local picked = type(v) == "table" and v[1] or v
 		if picked then e.shOrbitMode = picked; sv() end
@@ -882,15 +927,40 @@ IL:Toggle({Name = "Auto Equip Best", Default = e.shEquipBestEnabled,
 IL:Header({Text = "Progression"})
 IL:Toggle({Name = "Auto Upgrade Skill Tree", Default = e.shSkillTreeEnabled,
 	Callback = function(v) e.shSkillTreeEnabled = v; sv() end}, "shSkillTreeEnabled")
-IL:Dropdown({
-	Name = "Upgrade Priority (bought first)", Multi = true, Search = true,
-	Options = SKILL_LABELS, Default = setToArray(e.shUpgradePriority),
-	Callback = function(sel)
-		local set = {}
-		for name, on in pairs(sel) do if on then set[name] = true end end
-		e.shUpgradePriority = set; sv()
-	end,
-}, "shUpgradePriority")
+-- Ranked slots instead of drag & drop (MacLib has no reorderable list
+-- widget): Priority 1 is bought first, then 2, and so on; "None" leaves a
+-- slot empty. Each pick is written straight into e.shUpgradeOrder at that
+-- slot and saved. MacLib single-select Default is an INDEX into Options
+-- (not the option string -- passing the string left the box blank on every
+-- reload, which read as "the dropdown doesn't save" even though the value
+-- itself had persisted), so the saved label is mapped back to its index.
+IL:Label({Text = "Priority slots: 1 is bought first, then 2, 3... Pick 'None' to leave a slot empty."})
+local function priorityIndex(label)
+	for i, opt in ipairs(PRIORITY_OPTIONS) do if opt == label then return i end end
+	return 1
+end
+for slot = 1, PRIORITY_SLOTS do
+	IL:Dropdown({
+		Name = ("Priority %d"):format(slot), Multi = false, Required = true, Search = true,
+		Options = PRIORITY_OPTIONS,
+		Default = priorityIndex(e.shUpgradeOrder[slot]),
+		Callback = function(v)
+			local picked = type(v) == "table" and v[1] or v
+			if type(picked) ~= "string" then return end
+			-- Slot-stable storage: the array always has exactly PRIORITY_SLOTS
+			-- entries, "None" marking an empty slot, so slot 3 in the UI is
+			-- always index 3 in the file. (Compacting on every change looked
+			-- neat but shifted later picks into earlier indices and then a
+			-- change to an earlier slot silently overwrote them.) The buy loop
+			-- skips "None" and duplicates itself.
+			for i = 1, PRIORITY_SLOTS do
+				if type(e.shUpgradeOrder[i]) ~= "string" then e.shUpgradeOrder[i] = "None" end
+			end
+			e.shUpgradeOrder[slot] = picked
+			sv()
+		end,
+	}, "shUpgradeOrder" .. slot)
+end
 IL:Toggle({Name = "Then buy everything else (Max Buy)", Default = e.shUpgradeRest,
 	Callback = function(v) e.shUpgradeRest = v; sv() end}, "shUpgradeRest")
 IL:Toggle({Name = "Auto Claim Quest", Default = e.shQuestEnabled,
