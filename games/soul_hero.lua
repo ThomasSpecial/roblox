@@ -246,61 +246,105 @@ local function bodyPartOf(model)
 	return best or model:FindFirstChildWhichIsA("BasePart", true)
 end
 
+-- Target selection is fully client-side and event-driven -- no remote in
+-- the hot path. Measured live (2026-09-24, level 70, ~1.1s per kill): the
+-- moment a mob dies the game DESTROYS its model out of
+-- workspace.Game.Enemies in the same tick its CombatState flips to Idle,
+-- and the next mob's model was already parented 0.3-0.7s BEFORE that. So
+-- "model is in the folder" == "alive", and every model carries the ledger
+-- ids as attributes (EnemyId="enemy_1470", ArchetypeId="zone3_a1",
+-- Name="Cryb") plus a HealthBarBillboard whose HealthLeft frame's X scale
+-- is the hp fraction. The old GetEnemyLedgerEntries-RemoteFunction poll
+-- (1s, plus a server round-trip) was the entire A->B delay; ChildRemoved
+-- on the folder fires the retarget in the same frame the kill lands.
+local enemiesFolder = nil
+local function hpFractionOf(model)
+	local hl = model:FindFirstChild("HealthLeft", true)
+	return hl and hl:IsA("GuiObject") and hl.Size.X.Scale or 1
+end
+
 local function refreshTarget()
-	local ok, entries = call("GetEnemyLedgerEntries-RemoteFunction")
-	if not ok or type(entries) ~= "table" then currentTarget = nil return end
-
-	local enemiesFolder = workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("Enemies")
-	if not enemiesFolder then currentTarget = nil return end
-
+	if not (enemiesFolder and enemiesFolder.Parent) then currentTarget = nil stats.target = "-" return end
 	local char = plr.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if not hrp then currentTarget = nil return end
 
 	local best, bestDist, bestPart
-	for _, entry in pairs(entries) do
-		-- skip anything without a real hp reading -- bosses (BossIntroPending)
-		-- didn't carry one in testing; a mob mid-farm always did
-		-- Boss entries DO carry hp (measured live: 62,814 / 108,289 / 380,874 on
-		-- the level 25/30/35 bosses) -- the earlier "bosses have no hp block"
-		-- read was wrong. The hp==nil allowance below is kept purely as a
-		-- safety net so a ledger entry that ever omits hp isn't silently
-		-- dropped as a target. Since M1 is Tool:Activate() and the SERVER picks
-		-- what's in the weapon arc, orbiting a boss is all that's needed to
-		-- fight it; a pre-intro boss answers BossIntroPending for the ~1.6s its
-		-- intro lasts, then hits land normally.
-		local alive = entry.enemyId and (entry.hp == nil or (entry.hp.current or 0) > 0)
-		if alive then
-			for _, m in ipairs(enemiesFolder:GetChildren()) do
-				if m.Name == entry.archetypeId then
-					local part = bodyPartOf(m)
-					if part then
-						local d = (hrp.Position - part.Position).Magnitude
-						if not bestDist or d < bestDist then
-							best, bestDist, bestPart = entry, d, part
-						end
-					end
-					break
+	for _, m in ipairs(enemiesFolder:GetChildren()) do
+		local enemyId = m:GetAttribute("EnemyId")
+		if enemyId and hpFractionOf(m) > 0 then
+			local part = bodyPartOf(m)
+			if part then
+				local d = (hrp.Position - part.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist, bestPart = m, d, part
 				end
 			end
 		end
 	end
 
 	if best then
-		currentTarget = {enemyId = best.enemyId, part = bestPart, position = bestPart.Position}
-		stats.target = tostring(best.archetypeId)
+		local id = best:GetAttribute("EnemyId")
+		if not (currentTarget and currentTarget.enemyId == id) then
+			currentTarget = {enemyId = id, part = bestPart, position = bestPart.Position}
+			stats.target = tostring(best:GetAttribute("Name") or best:GetAttribute("ArchetypeId") or best.Name)
+			e.__shTargetId = id   -- exposed for live probes only (currentTarget itself is local)
+		end
 	else
 		currentTarget = nil
 		stats.target = "-"
+		e.__shTargetId = nil
 	end
 end
 
-task.spawn(function()
-	while getgenv().__SH == G do
-		if e.shFarmEnabled or e.shOrbitEnabled then
-			pcall(refreshTarget)
+local function retargetNow()
+	if e.shFarmEnabled or e.shOrbitEnabled then pcall(refreshTarget) end
+end
+
+local function bindEnemiesFolder(folder)
+	enemiesFolder = folder
+	folder.ChildAdded:Connect(function()
+		if getgenv().__SH ~= G then return end
+		-- a spawn only matters when we have nothing to hit; otherwise the
+		-- nearest-mob pick stays put until the current one actually dies
+		if not currentTarget then retargetNow() end
+	end)
+	folder.ChildRemoved:Connect(function(m)
+		if getgenv().__SH ~= G then return end
+		if currentTarget and m:GetAttribute("EnemyId") == currentTarget.enemyId then
+			currentTarget = nil
+			retargetNow()
 		end
-		task.wait(1)
+	end)
+	retargetNow()
+end
+
+task.spawn(function()
+	-- the Game/Enemies folder is rebuilt on area transitions (Lobby <->
+	-- Combat), so keep re-binding to whichever instance is current
+	while getgenv().__SH == G do
+		local gameFolder = workspace:FindFirstChild("Game")
+		local folder = gameFolder and gameFolder:FindFirstChild("Enemies")
+		if folder and folder ~= enemiesFolder then bindEnemiesFolder(folder) end
+		-- 0.1s backstop only: catches a target whose hp bar hits 0 without
+		-- the model leaving yet, and the nearest-mob re-pick when the
+		-- character moves. The real switch is the ChildRemoved above.
+		if enemiesFolder and (e.shFarmEnabled or e.shOrbitEnabled) then
+			if currentTarget == nil then
+				retargetNow()
+			else
+				-- IsDescendantOf, not just p.Parent: when the whole Game/Enemies
+				-- folder is swapped on an area change the old model is detached
+				-- as a tree, so its parts still HAVE a parent (the dead model)
+				-- and a Parent check alone kept a ghost target alive.
+				local p = currentTarget.part
+				if not (p and p:IsDescendantOf(enemiesFolder)) or hpFractionOf(p.Parent) <= 0 then
+					currentTarget = nil
+					retargetNow()
+				end
+			end
+		end
+		task.wait(0.1)
 	end
 end)
 
@@ -677,6 +721,59 @@ end)
 -- pass; with Loop off and Next Stage on, it keeps auto-progression ON. It
 -- never touches the flag when both are off, so a setting made by hand in
 -- the game's own UI is left alone in that case.
+local function findNextStageButton()
+	local pg = plr:FindFirstChild("PlayerGui")
+	local screen = pg and pg:FindFirstChild("GameUI") and pg.GameUI:FindFirstChild("VictoryEndScreen", true)
+	local btn = screen and screen:FindFirstChild("NextStage", true)
+	if btn and (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return btn end
+	return nil
+end
+
+local function pressNextStage(btn)
+	if not (btn and btn.Visible and getconnections) then return false end
+	local pressed = false
+	for _, sig in ipairs({"Activated", "MouseButton1Click"}) do
+		local okc, conns = pcall(getconnections, btn[sig])
+		if okc and type(conns) == "table" then
+			for _, c in ipairs(conns) do
+				if pcall(function() if c.Function then c.Function() elseif c.Fire then c:Fire() end end) then pressed = true end
+			end
+		end
+	end
+	if pressed then stats.target = "pressed Next Stage" end
+	return pressed
+end
+
+-- The boss-victory park is the one place the run actually waits on us, so
+-- the Next Stage press gets its own fast path instead of riding the 3s
+-- progression loop below: the button's Visible flip is hooked directly
+-- (fires the same frame the VictoryEndScreen opens), with a 0.1s sweep
+-- underneath for a screen the game rebuilds and re-parents. After a press
+-- it holds 0.5s so a still-visible button during the server round-trip
+-- isn't hammered ten times a second.
+task.spawn(function()
+	local hookedBtn, hookedConn
+	local lastPress = 0
+	local function tryPress(btn)
+		if not (e.shNextStageEnabled or e.shLoopLevelEnabled) then return end
+		if os.clock() - lastPress < 0.5 then return end
+		if pcall(pressNextStage, btn) and btn.Visible then lastPress = os.clock() end
+	end
+	while getgenv().__SH == G do
+		local btn = findNextStageButton()
+		if btn and btn ~= hookedBtn then
+			if hookedConn then hookedConn:Disconnect() end
+			hookedBtn = btn
+			hookedConn = btn:GetPropertyChangedSignal("Visible"):Connect(function()
+				if getgenv().__SH == G and btn.Visible then tryPress(btn) end
+			end)
+		end
+		if btn and btn.Visible then tryPress(btn) end
+		task.wait(0.1)
+	end
+	if hookedConn then hookedConn:Disconnect() end
+end)
+
 task.spawn(function()
 	while getgenv().__SH == G do
 		local loopLevel = tonumber(e.shLoopLevel)
@@ -707,24 +804,9 @@ task.spawn(function()
 			-- exactly what the server expects. Confirmed: level 30 -> 31 within
 			-- 3s, pending result cleared, wave encounter active. Only the
 			-- VictoryEndScreen button is pressed -- DefeatEndScreen's is
-			-- "Revive & Continue" and is left alone on purpose.
-			pcall(function()
-				local pg = plr:FindFirstChild("PlayerGui")
-				local screen = pg and pg:FindFirstChild("GameUI") and pg.GameUI:FindFirstChild("VictoryEndScreen", true)
-				local btn = screen and screen:FindFirstChild("NextStage", true)
-				if btn and btn.Visible and (btn:IsA("TextButton") or btn:IsA("ImageButton")) and getconnections then
-					local pressed = false
-					for _, sig in ipairs({"Activated", "MouseButton1Click"}) do
-						local okc, conns = pcall(getconnections, btn[sig])
-						if okc and type(conns) == "table" then
-							for _, c in ipairs(conns) do
-								if pcall(function() if c.Function then c.Function() elseif c.Fire then c:Fire() end end) then pressed = true end
-							end
-						end
-					end
-					if pressed then stats.target = "pressed Next Stage" end
-				end
-			end)
+			-- "Revive & Continue" and is left alone on purpose. The press
+			-- itself now lives in the event-driven pressNextStage loop above;
+			-- this pass only handles the lobby bounce.
 			if plr:GetAttribute("PlayerArea") == "Lobby" then
 				local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
 				local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
@@ -736,12 +818,12 @@ task.spawn(function()
 				end
 			end
 		end
-		-- 3s, not 10: watched live with Loop pinned to level 8, the game
-		-- re-enabled auto-progression and jumped to level 11 on a wave clear
-		-- between polls, and a 10s gap left the account farming the wrong level
-		-- for most of that window before the pin caught it. 3s keeps the drift
-		-- to a couple of seconds at most.
-		task.wait(3)
+		-- 1s (was 10, then 3): watched live with Loop pinned to level 8, the
+		-- game re-enabled auto-progression and jumped to level 11 on a wave
+		-- clear between polls, and every second of gap is a second farming
+		-- the wrong level before the pin catches it. Both remotes here are
+		-- no-ops when the attributes already match, so 1s costs nothing.
+		task.wait(1)
 	end
 end)
 
