@@ -114,6 +114,7 @@ local SK = {
 	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeOrder", "shUpgradeRest",
 	"shRebirthMinLevel",
 	"shWorldBossEnabled", "shWorldBossPick",
+	"shEvolveHeroEnabled", "shHatchEnabled", "shHatchEggs", "shSkipIntroServer", "shDefeatContinue",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -154,6 +155,11 @@ if e.shWorldBossEnabled == nil then e.shWorldBossEnabled = true end
 -- Zephyr). Stored as an ARRAY of names -- the shape MacLib's multi-select
 -- Default wants back -- not a {name=true} set.
 if type(e.shWorldBossPick) ~= "table" then e.shWorldBossPick = {"Mink", "Lonku", "Zephyr"} end
+if e.shEvolveHeroEnabled == nil then e.shEvolveHeroEnabled = true end
+if e.shHatchEnabled == nil then e.shHatchEnabled = true end
+if type(e.shHatchEggs) ~= "table" then e.shHatchEggs = {} end   -- empty = "any egg, highest zone first"
+if e.shSkipIntroServer == nil then e.shSkipIntroServer = true end
+if e.shDefeatContinue == nil then e.shDefeatContinue = true end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
@@ -217,7 +223,8 @@ end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
-local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-", worldBoss = "-", worldBosses = 0}
+local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-", worldBoss = "-", worldBosses = 0,
+	evolveStarts = 0, evolveClaims = 0, evolveNote = "-", hatchStarts = 0, hatchClaims = 0, hatchNote = "-", defeats = 0}
 
 -- Set while the World Boss routine is moving the character between areas
 -- (join / return / portal walk). Orbit writes hrp.CFrame every frame and
@@ -748,6 +755,18 @@ local function findNextStageButton()
 	if btn and (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return btn end
 	return nil
 end
+-- DefeatEndScreen has two buttons: Buttons.NextStage is "Revive & Continue"
+-- -- a Robux product (3610976809, the client waits on
+-- PromptProductPurchaseFinished for it) and is never touched -- and
+-- Buttons.Return, "Return to last stage", which is the free way off the
+-- screen. Without a press the run parks on the defeat screen forever.
+local function findDefeatReturnButton()
+	local pg = plr:FindFirstChild("PlayerGui")
+	local screen = pg and pg:FindFirstChild("GameUI") and pg.GameUI:FindFirstChild("DefeatEndScreen", true)
+	local btn = screen and screen:FindFirstChild("Return", true)
+	if btn and (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return btn end
+	return nil
+end
 
 local function pressNextStage(btn)
 	if not (btn and btn.Visible and getconnections) then return false end
@@ -789,6 +808,16 @@ task.spawn(function()
 			end)
 		end
 		if btn and btn.Visible then tryPress(btn) end
+		if e.shDefeatContinue then
+			local rb = findDefeatReturnButton()
+			if rb and rb.Visible and os.clock() - lastPress >= 0.5 then
+				if pcall(pressNextStage, rb) then
+					lastPress = os.clock()
+					stats.defeats += 1
+					stats.target = "defeat -> returned to stage"
+				end
+			end
+		end
 		task.wait(0.1)
 	end
 	if hookedConn then hookedConn:Disconnect() end
@@ -1040,6 +1069,189 @@ task.spawn(function()
 	end
 end)
 
+-- ---------------------------------------------------------------- Auto Evolve Hero
+-- Hero "evolution" is a timed awakening. Read out of the live client:
+--   - HeroIndexService:getState().awakeningsByKey[stackKey] = {state=
+--     "not_started"|"in_progress"|(ready), completesAt, durationSeconds,
+--     remainingSeconds, tier="awakened"|"perfected"}. An entry only exists
+--     once the hero has enough summons (index nextMilestoneCount, e.g. 10
+--     copies of a Mythic) -- so the map IS the eligibility list.
+--   - StartHeroAwakening-RemoteFunction(stackKey) starts the timer (Rare
+--     10 min, Epic 2 h, Legendary 8 h, Mythic/Secret 20 h; perfecting is
+--     longer). ClaimHeroEvolution-RemoteFunction(stackKey) finishes it and
+--     is the "Claim!" button the Backpack shows when it's done.
+-- Both go through the game's HeroIndexService wrappers so its cached state
+-- (and the Backpack badge) update from the same reply.
+local function heroIndexService()
+	local ps = plr:FindFirstChild("PlayerScripts")
+	local cm = ps and ps:FindFirstChild("Client")
+	if not (cm and cm:IsA("ModuleScript")) then return nil end
+	local ok, C = pcall(require, cm)
+	return ok and type(C) == "table" and C or nil
+end
+
+task.spawn(function()
+	local lastRefresh = 0
+	while getgenv().__SH == G do
+		if e.shEvolveHeroEnabled then
+			pcall(function()
+				local C = heroIndexService()
+				local svc = C and C.HeroIndexService
+				if not svc then stats.evolveNote = "service n/a" return end
+				if os.clock() - lastRefresh > 60 then
+					lastRefresh = os.clock()
+					pcall(function() svc:refresh() end)
+				end
+				local st = svc:getState()
+				local map = type(st) == "table" and st.awakeningsByKey
+				if type(map) ~= "table" then stats.evolveNote = "no data" return end
+				local now = os.time()
+				local pending, soonest = 0, nil
+				for key, a in pairs(map) do
+					if type(a) ~= "table" then continue end
+					local stackKey = a.stackKey or key
+					local ready = (a.state ~= "not_started" and a.state ~= "in_progress")
+						or (type(a.completesAt) == "number" and a.completesAt <= now)
+					if a.state == "not_started" then
+						local res = svc:startAwakening(stackKey)
+						if type(res) == "table" and res.ok then
+							stats.evolveStarts += 1
+							stats.evolveNote = "started " .. tostring(stackKey)
+						else
+							stats.evolveNote = ("start %s: %s"):format(tostring(stackKey), tostring(type(res) == "table" and res.reason or res))
+						end
+						task.wait(1)
+					elseif ready then
+						local res = svc:claimEvolution(stackKey)
+						if type(res) == "table" and res.ok then
+							stats.evolveClaims += 1
+							stats.evolveNote = "claimed " .. tostring(stackKey)
+						else
+							stats.evolveNote = ("claim %s: %s"):format(tostring(stackKey), tostring(type(res) == "table" and res.reason or res))
+						end
+						task.wait(1)
+					else
+						pending += 1
+						local left = type(a.completesAt) == "number" and (a.completesAt - now) or nil
+						if left and (not soonest or left < soonest) then soonest = left end
+					end
+				end
+				if pending > 0 and soonest then
+					stats.evolveNote = ("%d in progress, next in %dh %02dm"):format(pending, soonest // 3600, (soonest % 3600) // 60)
+				elseif pending == 0 and stats.evolveNote:sub(1, 7) ~= "started" and stats.evolveNote:sub(1, 7) ~= "claimed" then
+					stats.evolveNote = "nothing eligible"
+				end
+			end)
+		end
+		task.wait(10)
+	end
+end)
+
+-- ---------------------------------------------------------------- Auto Hatch
+-- GetPetEggState-RemoteFunction -> {eggs={ {id="zone3_egg", displayName=
+-- "Cave Egg", zoneNumber, quantity, hatchDurationSeconds=14400}, ... },
+-- hatchery={ ["1"]={eggId, startedAt, completesAt}, ... }, serverNow}.
+-- Three hatchery slots (the game's own error text: "All three hatchery
+-- slots are occupied"). StartEggHatch-RemoteFunction(eggId) fills a free
+-- slot; ClaimEggHatch-RemoteFunction(slotKey) collects a finished one and
+-- answers {ok=true, evidence={petId,...}}. Both are invoked directly rather
+-- than through PetService:_action so the client's EggHatchRevealService
+-- (a tap-to-crack reveal) never gets queued -- the pet lands in the
+-- inventory either way, and PetEggStateChanged still refreshes the state.
+local EGG_OPTIONS = {}   -- display names, highest zone first
+local eggIdByName = {}
+local function petState()
+	local ok, st = call("GetPetEggState-RemoteFunction")
+	return ok and type(st) == "table" and st or nil
+end
+local function refreshEggOptions(st)
+	local eggs = st and st.eggs
+	if type(eggs) ~= "table" then return end
+	local list = {}
+	for _, egg in pairs(eggs) do
+		if type(egg) == "table" and egg.id and egg.displayName then list[#list + 1] = egg end
+	end
+	table.sort(list, function(a, b) return (a.zoneNumber or 0) > (b.zoneNumber or 0) end)
+	table.clear(EGG_OPTIONS)
+	for _, egg in ipairs(list) do
+		EGG_OPTIONS[#EGG_OPTIONS + 1] = egg.displayName
+		eggIdByName[egg.displayName] = egg.id
+	end
+end
+refreshEggOptions(petState())
+local function hatchWanted(egg)
+	local pick = e.shHatchEggs
+	if type(pick) ~= "table" or #pick == 0 then return true end
+	for _, name in ipairs(pick) do
+		if name == egg.displayName or name == egg.id then return true end
+	end
+	return false
+end
+
+task.spawn(function()
+	while getgenv().__SH == G do
+		if e.shHatchEnabled then
+			pcall(function()
+				local st = petState()
+				if not st then stats.hatchNote = "no data" return end
+				if #EGG_OPTIONS == 0 then refreshEggOptions(st) end
+				local now = tonumber(st.serverNow) or os.time()
+				local hatchery = type(st.hatchery) == "table" and st.hatchery or {}
+				local occupied, soonest = 0, nil
+				for slot, h in pairs(hatchery) do
+					if type(h) == "table" and h.eggId then
+						if type(h.completesAt) == "number" and h.completesAt <= now then
+							local ok, res = call("ClaimEggHatch-RemoteFunction", tostring(slot))
+							if ok and type(res) == "table" and res.ok then
+								stats.hatchClaims += 1
+								stats.hatchNote = "claimed slot " .. tostring(slot)
+								task.wait(0.5)
+							else
+								occupied += 1
+								stats.hatchNote = ("claim slot %s: %s"):format(tostring(slot), tostring(type(res) == "table" and res.error or res))
+							end
+						else
+							occupied += 1
+							local left = type(h.completesAt) == "number" and (h.completesAt - now) or nil
+							if left and (not soonest or left < soonest) then soonest = left end
+						end
+					end
+				end
+				-- fill free slots: highest-zone wanted egg with stock first
+				local free = 3 - occupied
+				if free > 0 then
+					local eggs = {}
+					for _, egg in pairs(st.eggs or {}) do
+						if type(egg) == "table" and egg.id and (tonumber(egg.quantity) or 0) > 0 and hatchWanted(egg) then eggs[#eggs + 1] = egg end
+					end
+					table.sort(eggs, function(a, b) return (a.zoneNumber or 0) > (b.zoneNumber or 0) end)
+					local i = 1
+					while free > 0 and eggs[i] do
+						local egg = eggs[i]
+						local ok, res = call("StartEggHatch-RemoteFunction", egg.id)
+						if ok and type(res) == "table" and res.ok then
+							stats.hatchStarts += 1
+							stats.hatchNote = "started " .. tostring(egg.displayName)
+							free -= 1
+							egg.quantity = (tonumber(egg.quantity) or 1) - 1
+							if egg.quantity <= 0 then i += 1 end
+							task.wait(0.5)
+						else
+							local err = type(res) == "table" and tostring(res.error) or tostring(res)
+							stats.hatchNote = ("start %s: %s"):format(tostring(egg.displayName), err)
+							if err == "HatcheryFull" then break end
+							i += 1
+						end
+					end
+				elseif soonest then
+					stats.hatchNote = ("3/3 hatching, next in %dh %02dm"):format(soonest // 3600, (soonest % 3600) // 60)
+				end
+			end)
+		end
+		task.wait(5)
+	end
+end)
+
 -- ---------------------------------------------------------------- Auto Skip Animation
 -- Measured live before building this: the SERVER has essentially no
 -- end-of-level delay -- StageCleared, the CurrentLevel attribute change, and
@@ -1103,11 +1315,31 @@ local function restoreCameraNow()
 	if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
 	cam.FieldOfView = 70
 end
+-- Server-side half of the skip. The client normally reports an intro as
+-- finished only once its cinematic has played out: BossIntroServiceClient
+-- fires BossIntroCompleted {introId} at the end of the boss intro and
+-- ZoneIntroServiceClient fires ZoneIntroCompleted {introId, completionMode}
+-- for zone intros -- and the same client code fires them IMMEDIATELY when
+-- a hero reveal is open (its own "skip" path). Doing that on every intro
+-- tells the server we're done the same tick the intro starts, so it has no
+-- reason to hold the encounter for the intro window on our account.
+local function completeIntroOnServer(evName, payload)
+	if type(payload) ~= "table" or type(payload.introId) ~= "string" or payload.introId == "" then return end
+	if evName:find("^BossIntro") then
+		local done = net:FindFirstChild("BossIntroCompleted-RemoteEvent")
+		if done then pcall(function() done:FireServer({introId = payload.introId}) end) end
+	else
+		local done = net:FindFirstChild("ZoneIntroCompleted-RemoteEvent")
+		if done then pcall(function() done:FireServer({introId = payload.introId, completionMode = "interrupted"}) end) end
+	end
+end
 for _, evName in ipairs({"BossIntroStarted-RemoteEvent", "ZoneIntroStarted-RemoteEvent", "ZoneIntroClientStarted-RemoteEvent"}) do
 	local ev = net:FindFirstChild(evName)
 	if ev then
-		ev.OnClientEvent:Connect(function()
-			if getgenv().__SH ~= G or not e.shSkipAnim then return end
+		ev.OnClientEvent:Connect(function(payload)
+			if getgenv().__SH ~= G then return end
+			if e.shSkipIntroServer then completeIntroOnServer(evName, payload) end
+			if not e.shSkipAnim then return end
 			hideIntroGuisNow()
 			restoreCameraNow()
 			-- the skip button is created a moment after the event; try a few times
@@ -1186,15 +1418,21 @@ task.spawn(function()
 					plr.CameraMinZoomDistance, plr.CameraMaxZoomDistance = minZ, maxZ
 				end)
 			end
-			local zc = net:FindFirstChild("ZoneIntroCompleted-RemoteEvent")
-			local zd = net:FindFirstChild("SetZoneIntroDeferred-RemoteEvent")
+		end
+		-- Backstop for an intro that was already running when the script
+		-- loaded (no Started event to catch): ask the server what's in
+		-- flight and complete it. Both state remotes answer phase="intro"
+		-- with the introId while one is active.
+		if e.shSkipIntroServer then
 			local zs = net:FindFirstChild("GetZoneIntroState-RemoteFunction")
-			if zs and zc then
+			if zs then
 				local ok, st = pcall(function() return zs:InvokeServer() end)
-				if ok and type(st) == "table" and (st.active or st.isActive or st.introId) then
-					pcall(function() zc:FireServer(st.introId or st) end)
-					if zd then pcall(function() zd:FireServer(true) end) end
-				end
+				if ok and type(st) == "table" and st.phase == "intro" then completeIntroOnServer("ZoneIntro", st) end
+			end
+			local bs = net:FindFirstChild("GetBossEncounterState-RemoteFunction")
+			if bs then
+				local ok, st = pcall(function() return bs:InvokeServer() end)
+				if ok and type(st) == "table" and st.phase == "intro" then completeIntroOnServer("BossIntro", st) end
 			end
 		end
 		task.wait(0.5)
@@ -1304,6 +1542,12 @@ FL:Label({Text = "When a picked boss spawns (every hour) the farm drops\nwhat it
 FL:Header({Text = "Animation"})
 FL:Toggle({Name = "Auto Skip Animation", Default = e.shSkipAnim,
 	Callback = function(v) e.shSkipAnim = v; sv() end}, "shSkipAnim")
+FL:Toggle({Name = "Skip Boss Intro (server)", Default = e.shSkipIntroServer,
+	Callback = function(v) e.shSkipIntroServer = v; sv() end}, "shSkipIntroServer")
+FL:Label({Text = "Reports every boss / zone intro as finished the tick it\nstarts (BossIntroCompleted / ZoneIntroCompleted), so the\nserver doesn't hold the encounter for the intro window."})
+FL:Toggle({Name = "Auto Continue After Defeat", Default = e.shDefeatContinue,
+	Callback = function(v) e.shDefeatContinue = v; sv() end}, "shDefeatContinue")
+FL:Label({Text = "Presses \"Return to last stage\" on the defeat screen. The\n\"Revive & Continue\" button is a Robux product and is\nnever pressed."})
 FL:Label({Text = "Hides the stage-clear / zone-intro / boss-intro cinematics\nand hands the camera back. Server-side there's no delay to\nskip -- the next level starts the same tick a stage clears."})
 
 local FR = Tabs.Farm:Section({Side = "Right"})
@@ -1420,6 +1664,32 @@ IL:Dropdown({
 	end,
 }, "shRebirthMinLevel")
 IL:Label({Text = "Waits until CurrentLevel reaches the picked boss stage,\nthen rebirths the moment the game reports canRebirth.\n\"As soon as allowed\" = the first stage the game unlocks."})
+IL:Header({Text = "Hero Evolution"})
+IL:Toggle({Name = "Auto Evolve Hero", Default = e.shEvolveHeroEnabled,
+	Callback = function(v) e.shEvolveHeroEnabled = v; sv() end}, "shEvolveHeroEnabled")
+IL:Label({Text = "Starts every awakening the game lists as eligible and\nclaims each one the moment its timer ends (the Backpack's\n\"Claim!\" button) -- no reveal to tap through."})
+IL:Header({Text = "Eggs"})
+IL:Toggle({Name = "Auto Hatch", Default = e.shHatchEnabled,
+	Callback = function(v) e.shHatchEnabled = v; sv() end}, "shHatchEnabled")
+IL:Dropdown({
+	Name = "Which Eggs", Multi = true, Required = false,
+	Options = #EGG_OPTIONS > 0 and EGG_OPTIONS or {"Village Egg", "Forest Egg", "Cave Egg", "Bandit Kingdom Egg", "Titanridge Mountains Egg", "Vikings Territory Egg", "Fallen Crown Castle Egg"},
+	Default = e.shHatchEggs,   -- multi-select Default is an array of names
+	Callback = function(v)
+		local picked = {}
+		if type(v) == "table" then
+			for _, name in ipairs(EGG_OPTIONS) do
+				if v[name] == true then picked[#picked + 1] = name end
+			end
+			for _, name in ipairs(v) do
+				if type(name) == "string" and not table.find(picked, name) then picked[#picked + 1] = name end
+			end
+		end
+		e.shHatchEggs = picked
+		sv()
+	end,
+}, "shHatchEggs")
+IL:Label({Text = "Keeps all 3 hatchery slots busy (highest-zone egg first)\nand claims each egg the moment it finishes. Empty pick =\nany egg you own."})
 
 local IR = Tabs.Inventory:Section({Side = "Right"})
 IR:Header({Text = "Status"})
@@ -1447,8 +1717,9 @@ task.spawn(function()
 				stats.target, stats.hits, stats.collected, stats.worldBoss))
 		end)
 		pcall(function()
-			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)"):format(
-				stats.equips, stats.skillNodes, stats.quests, stats.index, stats.rebirths, stats.rebirthNote))
+			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)\nEvolve: %d started / %d claimed (%s)\nHatch: %d started / %d claimed (%s)"):format(
+				stats.equips, stats.skillNodes, stats.quests, stats.index, stats.rebirths, stats.rebirthNote,
+				stats.evolveStarts, stats.evolveClaims, stats.evolveNote, stats.hatchStarts, stats.hatchClaims, stats.hatchNote))
 		end)
 	end
 end)
