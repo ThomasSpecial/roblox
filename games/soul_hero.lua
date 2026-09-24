@@ -1882,8 +1882,11 @@ IL:Toggle({Name = "Auto Rebirth", Default = e.shRebirthEnabled,
 -- past one, so the picker is the boss list plus an "as soon as allowed" row.
 -- Stored as the level number (0 = ASAP); the Default is the option INDEX,
 -- so a saved level maps back through REBIRTH_STAGE_LEVELS on reload.
+-- Runs go well past 100 (level 145 seen live in one session), so the list
+-- covers every 10th stage up to 1,000 -- the game's own "Limitless" title
+-- is for reaching stage 1,000. Search is on, so typing "250" finds it.
 local REBIRTH_STAGE_OPTIONS, REBIRTH_STAGE_LEVELS = {"As soon as allowed"}, {0}
-for lv = 10, 100, 10 do
+for lv = 10, 1000, 10 do
 	REBIRTH_STAGE_OPTIONS[#REBIRTH_STAGE_OPTIONS + 1] = ("Stage %d"):format(lv)
 	REBIRTH_STAGE_LEVELS[#REBIRTH_STAGE_LEVELS + 1] = lv
 end
