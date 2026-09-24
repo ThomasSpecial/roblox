@@ -115,6 +115,7 @@ local SK = {
 	"shRebirthMinLevel",
 	"shWorldBossEnabled", "shWorldBossPick",
 	"shEvolveHeroEnabled", "shHatchEnabled", "shHatchEggs", "shSkipIntroServer", "shDefeatContinue",
+	"shWbTitleId", "shFarmTitleId",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -160,6 +161,8 @@ if e.shHatchEnabled == nil then e.shHatchEnabled = true end
 if type(e.shHatchEggs) ~= "table" then e.shHatchEggs = {} end   -- empty = "any egg, highest zone first"
 if e.shSkipIntroServer == nil then e.shSkipIntroServer = true end
 if e.shDefeatContinue == nil then e.shDefeatContinue = true end
+if type(e.shWbTitleId) ~= "string" then e.shWbTitleId = "" end       -- "" = leave the title alone
+if type(e.shFarmTitleId) ~= "string" then e.shFarmTitleId = "" end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
@@ -231,6 +234,36 @@ local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, 
 -- would fight the server's own teleport into the arena, so it stands down
 -- while this is up.
 local wbHold = false
+-- os.clock() deadline: while in the future, orbit must not write the
+-- character's CFrame. Set by the placement watchdog whenever the server is
+-- moving the character itself (zone change, area change, respawn) -- see
+-- the "Placement / fall watchdog" section for why fighting that teleport
+-- is exactly how the character ended up falling out of the map.
+local placementHoldUntil = 0
+-- Active combat zone geometry. workspace.ZoneWorld.Zone<n>.PlayBox holds
+-- InvisibleBarriers (Floor 120x2x120 + four 75-stud walls) and a
+-- CombatSpawn part -- but ONLY for the zone the player is currently in;
+-- the other zones' folders are empty, and every zone sits at completely
+-- different world coordinates (Zone4 floor at 40000,19,10001; Zone5 spawn
+-- at 10000,23,20001). "Zone" is the live player attribute.
+local function zonePlayBox()
+	local zw = workspace:FindFirstChild("ZoneWorld")
+	local z = zw and zw:FindFirstChild("Zone" .. tostring(plr:GetAttribute("Zone")))
+	return z and z:FindFirstChild("PlayBox")
+end
+local function zoneFloor()
+	local pb = zonePlayBox()
+	local ib = pb and pb:FindFirstChild("InvisibleBarriers")
+	local f = ib and ib:FindFirstChild("Floor")
+	return (f and f:IsA("BasePart")) and f or nil
+end
+local function zoneSpawn()
+	local pb = zonePlayBox()
+	local cs = pb and pb:FindFirstChild("CombatSpawn")
+	if cs and cs:IsA("BasePart") then return cs.Position + Vector3.new(0, 3, 0) end
+	local f = zoneFloor()
+	return f and (f.Position + Vector3.new(0, 4, 0)) or nil
+end
 -- The arena's own enemy folder once found (the boss model lives wherever
 -- the game parents it; discovered by EnemyId attribute, see the World Boss
 -- section). nil outside the arena.
@@ -418,7 +451,7 @@ RunService.Heartbeat:Connect(function(dt)
 	local hum = char and char:FindFirstChild("Humanoid")
 	if not (hrp and hum) then return end
 
-	local shouldFly = e.shOrbitEnabled and currentTarget ~= nil and not wbHold
+	local shouldFly = e.shOrbitEnabled and currentTarget ~= nil and not wbHold and os.clock() >= placementHoldUntil
 	if not shouldFly then
 		if orbitFlying then setOrbitFlight(hrp, hum, false) end
 		return
@@ -453,6 +486,19 @@ RunService.Heartbeat:Connect(function(dt)
 	-- level at the target, which can fail the arc check even at correct
 	-- range. Facing level at the target keeps the cone aimed where it
 	-- actually needs to be.
+	-- Never orbit outside the active zone's PlayBox: the InvisibleBarriers
+	-- walls sit 59 studs out from the floor centre and the floor itself is
+	-- the only thing under the character, so a mob hugging a wall would
+	-- otherwise put the orbit ring (CanCollide off) on the far side of it.
+	local floor = zoneFloor()
+	if floor then
+		local half = floor.Size.X / 2 - 4
+		local c = floor.Position
+		pos = Vector3.new(
+			math.clamp(pos.X, c.X - half, c.X + half),
+			math.clamp(pos.Y, c.Y + 2, c.Y + 60),
+			math.clamp(pos.Z, c.Z - half, c.Z + half))
+	end
 	local lookAt = Vector3.new(center.X, pos.Y, center.Z)
 	hrp.CFrame = CFrame.new(pos, lookAt)
 	hrp.AssemblyLinearVelocity = Vector3.zero
@@ -988,6 +1034,51 @@ local function walkCombatPortal()
 	return true
 end
 
+-- Titles: SetEquippedTitle-RemoteEvent takes the bare title id (what the
+-- Titles modal fires). Ownership comes from the game's data replica --
+-- require(Shared.Packages.DataService).client:get({"OwnedTitles"}) is a
+-- map id -> {grantedAt} -- and names/buffs from Shared.Config.TitleConfig
+-- (Definitions[id] = {displayName, buffKind, buffPercent}, Order = ids).
+-- Two picks: one worn while inside the world-boss arena (the
+-- worldBossDamage titles exist for exactly that), one restored on the way
+-- back. "" leaves the title untouched.
+local TITLE_OPTIONS, TITLE_IDS = {"None"}, {""}
+local function loadTitleOptions()
+	local RS = game:GetService("ReplicatedStorage")
+	local ok, tc = pcall(function() return require(RS.Shared.Config.TitleConfig) end)
+	if not (ok and type(tc) == "table" and type(tc.Definitions) == "table") then return end
+	local owned = nil
+	pcall(function() owned = require(RS.Shared.Packages.DataService).client:get({"OwnedTitles"}) end)
+	local ids = {}
+	if type(tc.Order) == "table" and #tc.Order > 0 then
+		for _, id in ipairs(tc.Order) do ids[#ids + 1] = id end
+	else
+		for id in pairs(tc.Definitions) do ids[#ids + 1] = id end
+		table.sort(ids)
+	end
+	for _, id in ipairs(ids) do
+		local d = tc.Definitions[id]
+		local have = type(owned) ~= "table" or owned[id] ~= nil
+		if d and have then
+			local buff = d.buffPercent and d.buffKind and (" (+%s%% %s)"):format(tostring(d.buffPercent), tostring(d.buffKind)) or ""
+			TITLE_OPTIONS[#TITLE_OPTIONS + 1] = tostring(d.displayName or id) .. buff
+			TITLE_IDS[#TITLE_IDS + 1] = id
+		end
+	end
+end
+pcall(loadTitleOptions)
+local function titleIndexOf(id)
+	for i, v in ipairs(TITLE_IDS) do if v == id then return i end end
+	return 1
+end
+local function equipTitle(id)
+	if type(id) ~= "string" or id == "" then return end
+	if plr:GetAttribute("EquippedTitleId") == id then return end
+	fire("SetEquippedTitle-RemoteEvent", id)
+end
+-- farm title is the resting state: put it on at load unless we're mid-boss
+if plr:GetAttribute("PlayerArea") ~= "ServerBoss" then pcall(equipTitle, e.shFarmTitleId) end
+
 local wbJoinedEvent = nil
 task.spawn(function()
 	while getgenv().__SH == G do
@@ -1027,6 +1118,7 @@ task.spawn(function()
 					wbHold = false
 					stats.worldBosses += 1
 					stats.worldBoss = ("returned (%d done)"):format(stats.worldBosses)
+					pcall(equipTitle, e.shFarmTitleId)
 					return
 				end
 
@@ -1041,6 +1133,7 @@ task.spawn(function()
 					if ok and waitArea("ServerBoss", 20) then
 						arenaFolder = nil
 						stats.worldBoss = "in arena: " .. wbNameOf(snap.bossId)
+						pcall(equipTitle, e.shWbTitleId)
 					else
 						-- refused (not eligible / fence rejected) -- don't spam it,
 						-- the eventId guard above holds until the next boss
@@ -1065,6 +1158,129 @@ task.spawn(function()
 		elseif wbHold then
 			wbHold = false
 		end
+		task.wait(1)
+	end
+end)
+
+-- ---------------------------------------------------------------- Placement / fall watchdog
+-- Root cause of "after a long farm the character falls out of the map and
+-- the run stops / the mobs vanish", read out of the live client:
+--   - Every zone (10 levels) is a separate PlayBox at different world
+--     coordinates, and only the active zone has its floor/walls instanced.
+--     On a zone change the SERVER teleports the character to the new
+--     CombatSpawn, then waits for the client to acknowledge the placement
+--     (PlayerAreaServiceClient fires AcknowledgeWorldContextPlacement only
+--     once HumanoidRootPart is within tolerance of expectedPosition).
+--   - Orbit was still writing hrp.CFrame every frame around the OLD zone's
+--     last mob, so the client (which owns the character) kept dragging it
+--     back to the old coordinates -- where the floor had just been
+--     destroyed. Collision came back the moment the old mobs were removed,
+--     the character fell to FallenPartsDestroyHeight (-500) and died, and
+--     the placement was never acknowledged, so the new zone never started
+--     spawning: both symptoms, one cause.
+-- Fix, in order of preference:
+--   1. stop writing CFrame (placementHoldUntil) the instant the server
+--      signals it is moving us -- Zone / PlayerArea / WorldContextCommit
+--      attribute changes and CharacterAdded -- and drop the stale target;
+--   2. clamp the orbit ring inside the active PlayBox (in the orbit loop);
+--   3. a 1s watchdog: below the floor -> teleport to the zone's CombatSpawn;
+--      in the Lobby with farm on -> walk the portal; no enemies in Combat
+--      for 20s -> re-stand on CombatSpawn (re-triggers the placement
+--      ack), 45s -> bounce Lobby -> Combat.
+local function holdPlacement(seconds)
+	placementHoldUntil = math.max(placementHoldUntil, os.clock() + seconds)
+	currentTarget = nil
+	e.__shTargetId = nil
+end
+for _, attr in ipairs({"Zone", "PlayerArea", "WorldContextCommit", "WorldContextRevision"}) do
+	plr:GetAttributeChangedSignal(attr):Connect(function()
+		if getgenv().__SH == G then holdPlacement(2.5) end
+	end)
+end
+plr.CharacterAdded:Connect(function()
+	if getgenv().__SH ~= G then return end
+	-- new Humanoid, flags start clean: forget the old one's flight state so
+	-- setOrbitFlight re-applies PlatformStand/CanCollide instead of assuming
+	orbitFlying = false
+	holdPlacement(4)
+end)
+
+local function standOn(pos)
+	local char = plr.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChild("Humanoid")
+	if not (hrp and pos) then return false end
+	if hum then hum.PlatformStand = false end
+	hrp.CanCollide = true
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+	hrp.CFrame = CFrame.new(pos)
+	return true
+end
+
+task.spawn(function()
+	local noEnemySince = nil
+	local lastRescue = 0
+	while getgenv().__SH == G do
+		pcall(function()
+			if not (e.shFarmEnabled or e.shOrbitEnabled) or wbHold then noEnemySince = nil return end
+			local area = plr:GetAttribute("PlayerArea")
+			local char = plr.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChild("Humanoid")
+			if not (hrp and hum) or hum.Health <= 0 then return end
+
+			if area == "Lobby" then
+				noEnemySince = nil
+				if os.clock() - lastRescue > 5 then
+					lastRescue = os.clock()
+					holdPlacement(3)
+					walkCombatPortal()
+					stats.target = "lobby -> portal"
+				end
+				return
+			end
+			if area ~= "Combat" then noEnemySince = nil return end
+
+			-- fell out: under the zone floor, or under everything
+			local floor = zoneFloor()
+			local floorY = floor and floor.Position.Y or 0
+			if hrp.Position.Y < floorY - 25 or hrp.Position.Y < -150 then
+				local spot = zoneSpawn() or (floor and floor.Position + Vector3.new(0, 4, 0))
+				if spot and os.clock() - lastRescue > 2 then
+					lastRescue = os.clock()
+					holdPlacement(1.5)
+					standOn(spot)
+					stats.target = "fell -> respawned in zone"
+				end
+				return
+			end
+
+			-- stalled encounter: no enemies at all for a while
+			local count = enemiesFolder and enemiesFolder.Parent and #enemiesFolder:GetChildren() or 0
+			if count > 0 then noEnemySince = nil return end
+			noEnemySince = noEnemySince or os.clock()
+			local stalled = os.clock() - noEnemySince
+			if stalled > 45 and os.clock() - lastRescue > 30 then
+				lastRescue = os.clock()
+				noEnemySince = nil
+				stats.target = "stalled 45s -> lobby bounce"
+				holdPlacement(6)
+				local C = nil
+				pcall(function() C = require(plr.PlayerScripts.Client) end)
+				if C and C.PlayerAreaService then
+					pcall(function() C.PlayerAreaService:requestTransition("Lobby", "TopbarLeaveButton") end)
+				end
+			elseif stalled > 20 and os.clock() - lastRescue > 10 then
+				lastRescue = os.clock()
+				local spot = zoneSpawn()
+				if spot then
+					stats.target = "stalled 20s -> re-stand on spawn"
+					holdPlacement(2)
+					standOn(spot)
+				end
+			end
+		end)
 		task.wait(1)
 	end
 end)
@@ -1539,6 +1755,31 @@ FL:Dropdown({
 	end,
 }, "shWorldBossPick")
 FL:Label({Text = "When a picked boss spawns (every hour) the farm drops\nwhat it's doing, joins the arena, fights with the same\norbit + M1, then walks back to Combat and resumes."})
+FL:Dropdown({
+	Name = "Title During World Boss", Multi = false, Required = true, Search = true,
+	Options = TITLE_OPTIONS,
+	Default = titleIndexOf(e.shWbTitleId),   -- single-select Default is an INDEX
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		local idx = table.find(TITLE_OPTIONS, picked)
+		if idx then e.shWbTitleId = TITLE_IDS[idx] or ""; sv() end
+	end,
+}, "shWbTitleId")
+FL:Dropdown({
+	Name = "Title After World Boss", Multi = false, Required = true, Search = true,
+	Options = TITLE_OPTIONS,
+	Default = titleIndexOf(e.shFarmTitleId),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		local idx = table.find(TITLE_OPTIONS, picked)
+		if idx then
+			e.shFarmTitleId = TITLE_IDS[idx] or ""
+			sv()
+			if plr:GetAttribute("PlayerArea") ~= "ServerBoss" then pcall(equipTitle, e.shFarmTitleId) end
+		end
+	end,
+}, "shFarmTitleId")
+FL:Label({Text = "Only titles you own are listed, with their equipped buff.\nThe first is worn inside the arena, the second is put back\non the way out (and is your everyday farm title)."})
 FL:Header({Text = "Animation"})
 FL:Toggle({Name = "Auto Skip Animation", Default = e.shSkipAnim,
 	Callback = function(v) e.shSkipAnim = v; sv() end}, "shSkipAnim")
