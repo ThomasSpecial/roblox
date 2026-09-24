@@ -153,7 +153,7 @@ local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
 	"osSellEggs", "osSellRarity", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
-	"osTrain", "osTrainRing", "osClaimBonus", "osBuyDumbbell", "osBuyStaff",
+	"osTrain", "osTrainRing", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
 	"osPotions", "osPotionTrain", "osPotionCash", "osPotionLuck",
@@ -180,7 +180,7 @@ def("osSellEggs", false); def("osSellRarity", "Common - Rare")
 if type(e.osSellMutations) ~= "table" then e.osSellMutations = {"NORMAL"} end
 if type(e.osSellSizes) ~= "table" then e.osSellSizes = {} end
 def("osHatch", true); def("osEquipBest", true); def("osSellAnimals", false); def("osOfflineCash", true)
-def("osTrain", true); def("osTrainRing", true); def("osClaimBonus", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
+def("osTrain", true); def("osTrainRing", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
 def("osUpPlot", true); def("osUpSpeed", true); def("osUpCarry", true); def("osRebirth", false); def("osRebirthTarget", 0)
 def("osPlaytime", true); def("osDaily", true); def("osFreeShop", true); def("osSpin", true); def("osGroup", true)
 def("osSeasonPass", true); def("osQuests", true)
@@ -190,6 +190,7 @@ def("osAntiAFK", true); def("osAutoReconnect", true)
 
 local stats = {waves = 0, eggsTaken = 0, lastEgg = "-", eggsSold = 0, placed = 0, hatched = 0,
 	trains = 0, ringStarts = 0, bonuses = 0, buys = 0, upgrades = 0, rebirths = 0, claims = 0, note = "-"}
+e.__osStats = stats   -- exposed for live probes only
 
 -- ---------------------------------------------------------------- egg tables
 -- Rarity rank order is the one the game's egg list uses; eggType ids come
@@ -562,8 +563,12 @@ task.spawn(function()
 		task.wait(2)
 	end
 end)
--- x2 bonus: the server announces one on TrainingService.RE.SpawnBonus(bonusId);
--- ClaimBonus(bonusId) takes it. Claimed the moment it lands.
+-- x2 bonus (the purple hand button that pops up around the screen while
+-- you're in the ring): the server announces each one on
+-- TrainingService.RE.SpawnBonus(bonusId) -- measured live, three in ~25s
+-- of ring time -- and the button's click is just ClaimBonus(bonusId). So
+-- the claim is fired straight from the event, no screen position to
+-- chase, and it belongs to Ring mode: on whenever the ring toggle is.
 task.spawn(function()
 	local sig = nil
 	for _ = 1, 120 do
@@ -574,10 +579,11 @@ task.spawn(function()
 	if not sig then return end
 	local last = nil
 	sig.OnClientEvent:Connect(function(bonusId)
-		if getgenv().__OS ~= G or not e.osClaimBonus or not bonusId or bonusId == last then return end
+		if getgenv().__OS ~= G or not e.osTrainRing or not bonusId or bonusId == last then return end
 		last = bonusId
 		task.wait(0.05)
-		if call("TrainingService", "ClaimBonus", bonusId) then stats.bonuses += 1 end
+		local ok, res = call("TrainingService", "ClaimBonus", bonusId)
+		if ok and res ~= false then stats.bonuses += 1 end
 	end)
 end)
 
@@ -826,10 +832,9 @@ local seaStatusLbl = SR:Label({Text = "Starting..."})
 local PL = Tabs.Power:Section({Side = "Left"})
 PL:Header({Text = "Training"})
 PL:Toggle({Name = "Auto Train Power (silent)", Default = e.osTrain, Callback = function(v) e.osTrain = v; sv(); if not v and not e.osTrainRing then task.spawn(stopTraining) end end}, "osTrain")
-PL:Toggle({Name = "Auto Train in Ring (stand on plot)", Default = e.osTrainRing, Callback = function(v) e.osTrainRing = v; sv(); if not v then task.spawn(ringStop) end end}, "osTrainRing")
-PL:Label({Text = "Silent = fires the server's StartTraining in the background,\nwalk anywhere. Ring = the game's own dumbbell stand on your\nplot (locks you there). Both can run at once."})
+PL:Toggle({Name = "Auto Train in Ring + Auto x2 Bonus", Default = e.osTrainRing, Callback = function(v) e.osTrainRing = v; sv(); if not v then task.spawn(ringStop) end end}, "osTrainRing")
+PL:Label({Text = "Silent = fires the server's StartTraining in the background,\nwalk anywhere. Ring = the game's own dumbbell stand on your\nplot (locks you there) and every x2 hand button that pops up\nis claimed the instant the server spawns it. Both can run at once."})
 PL:Button({Name = "Stop Training Now", Callback = function() task.spawn(function() ringStop() stopTraining() end) end})
-PL:Toggle({Name = "Auto Claim x2 Bonus", Default = e.osClaimBonus, Callback = function(v) e.osClaimBonus = v; sv() end}, "osClaimBonus")
 PL:Header({Text = "Gear"})
 PL:Toggle({Name = "Auto Buy & Equip Best Dumbbell", Default = e.osBuyDumbbell, Callback = function(v) e.osBuyDumbbell = v; sv() end}, "osBuyDumbbell")
 PL:Toggle({Name = "Auto Buy & Equip Best Staff", Default = e.osBuyStaff, Callback = function(v) e.osBuyStaff = v; sv() end}, "osBuyStaff")
