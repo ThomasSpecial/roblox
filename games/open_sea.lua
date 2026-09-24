@@ -152,7 +152,7 @@ end
 local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
-	"osSellEggs", "osSellRarity", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
+	"osSellEggs", "osSellRarity", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
 	"osTrain", "osTrainRing", "osClaimBonus", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
@@ -174,6 +174,11 @@ local function def(k, v) if e[k] == nil then e[k] = v end end
 def("osWave", true); def("osHuntBoss", true); def("osMinRarity", 1); def("osSpecificEgg", "All")
 def("osMutations", true); def("osWaveDelay", 2)
 def("osSellEggs", false); def("osSellRarity", "Common - Rare")
+-- multi-select filters on top of rarity: an egg is only sold when its
+-- mutation AND size are both in the picks (arrays of names, the shape
+-- MacLib's multi Default wants back). Empty pick = that filter is off.
+if type(e.osSellMutations) ~= "table" then e.osSellMutations = {"NORMAL"} end
+if type(e.osSellSizes) ~= "table" then e.osSellSizes = {} end
 def("osHatch", true); def("osEquipBest", true); def("osSellAnimals", false); def("osOfflineCash", true)
 def("osTrain", true); def("osTrainRing", true); def("osClaimBonus", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
 def("osUpPlot", true); def("osUpSpeed", true); def("osUpCarry", true); def("osRebirth", false); def("osRebirthTarget", 0)
@@ -218,6 +223,33 @@ for i, r in ipairs(RARITIES) do MIN_RARITY_OPTIONS[i] = (i == 1) and "All (Commo
 local SELL_OPTIONS = {"Common - Rare", "Common - Epic", "Common - Legendary"}
 for _, r in ipairs(RARITIES) do SELL_OPTIONS[#SELL_OPTIONS + 1] = r end
 local function rankOf(eggType) return RARITY_RANK[EGG_RARITY[eggType] or "Common"] or 1 end
+-- Mutation / size vocab, read from the game's own configs (inventory eggs
+-- carry innerEntity.mutation -- nil meaning NORMAL -- and innerEntity.size).
+-- Seen live: mutation GOLD/DIAMOND/RAINBOW/RADIOACTIVE, size baby/big.
+local MUTATION_OPTIONS = {"NORMAL", "GOLD", "DIAMOND", "RAINBOW", "RADIOACTIVE"}
+local SIZE_OPTIONS = {"baby", "big", "huge"}
+pcall(function()
+	local mc = cfg("MutationConfig")
+	if type(mc) == "table" then
+		local t = {}
+		for k in pairs(mc) do if type(k) == "string" then t[#t + 1] = k end end
+		table.sort(t)
+		if #t > 0 then MUTATION_OPTIONS = t end
+	end
+	local sc = cfg("SizeConfig")
+	if type(sc) == "table" and type(sc.SIZES) == "table" then
+		local t = {}
+		for k, v in pairs(sc.SIZES) do
+			if type(k) == "string" then t[#t + 1] = k elseif type(v) == "string" then t[#t + 1] = v elseif type(v) == "table" and type(v.id or v.name) == "string" then t[#t + 1] = v.id or v.name end
+		end
+		if #t > 0 then SIZE_OPTIONS = t end
+	end
+end)
+local function inPick(pick, value)
+	if type(pick) ~= "table" or #pick == 0 then return true end
+	for _, v in ipairs(pick) do if v == value then return true end end
+	return false
+end
 
 -- ---------------------------------------------------------------- plot helpers
 local function myPlot()
@@ -334,6 +366,10 @@ local function sellEggs()
 		if it.itemType == "Egg" and it.innerEntity and it.innerEntity.eggType then
 			local r = EGG_RARITY[it.innerEntity.eggType] or "Common"
 			local want = maxRank and (RARITY_RANK[r] or 1) <= maxRank or (not maxRank and r == pick)
+			local mutation = it.innerEntity.mutation or "NORMAL"
+			local size = it.innerEntity.size or "baby"
+			if want and not inPick(e.osSellMutations, mutation) then want = false end
+			if want and not inPick(e.osSellSizes, size) then want = false end
 			if want then
 				if call("InventoryService", "SellEgg", id) then sold += 1 end
 				task.wait(0.05)
@@ -749,6 +785,26 @@ SL:Dropdown({
 		if type(picked) == "string" then e.osSellRarity = picked; sv() end
 	end,
 }, "osSellRarity")
+local function multiPick(v, options)
+	-- MacLib hands a {name=true} set for multi-select; store an ordered array
+	local picked = {}
+	if type(v) == "table" then
+		for _, name in ipairs(options) do if v[name] == true then picked[#picked + 1] = name end end
+		for _, name in ipairs(v) do if type(name) == "string" and not table.find(picked, name) then picked[#picked + 1] = name end end
+	end
+	return picked
+end
+SL:Dropdown({
+	Name = "Sell Mutations", Multi = true, Required = false,
+	Options = MUTATION_OPTIONS, Default = e.osSellMutations,
+	Callback = function(v) e.osSellMutations = multiPick(v, MUTATION_OPTIONS); sv() end,
+}, "osSellMutations")
+SL:Dropdown({
+	Name = "Sell Sizes", Multi = true, Required = false,
+	Options = SIZE_OPTIONS, Default = e.osSellSizes,
+	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS); sv() end,
+}, "osSellSizes")
+SL:Label({Text = "An egg sells only when rarity AND mutation AND size all match.\nEmpty mutation/size pick = no filter on that. Default keeps every\nmutated egg (only NORMAL is sold)."})
 SL:Toggle({Name = "Auto Sell Eggs (by rarity)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
 SL:Button({Name = "Sell Selected Rarity Now", Callback = function()
 	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, tostring(e.osSellRarity))) end)
