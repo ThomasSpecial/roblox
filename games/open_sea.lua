@@ -152,7 +152,7 @@ end
 local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
-	"osSellEggs", "osSellRarity", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
+	"osSellEggs", "osSellRarities", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
 	"osTrain", "osTrainRing", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
@@ -173,7 +173,23 @@ end)
 local function def(k, v) if e[k] == nil then e[k] = v end end
 def("osWave", true); def("osHuntBoss", true); def("osMinRarity", 1); def("osSpecificEgg", "All")
 def("osMutations", true); def("osWaveDelay", 2)
-def("osSellEggs", false); def("osSellRarity", "Common - Rare")
+def("osSellEggs", false)
+-- Rarities to sell: multi-select, stored as an array of rarity names. An
+-- EMPTY pick sells nothing (the one filter where "empty = everything"
+-- would be a disaster). Old single-pick saves ("Common - Rare" etc.) are
+-- migrated into the equivalent set.
+if type(e.osSellRarities) ~= "table" then
+	local old = e.osSellRarity
+	local upto = (old == "Common - Rare" and 3) or (old == "Common - Epic" and 4) or (old == "Common - Legendary" and 5) or nil
+	if upto then
+		e.osSellRarities = {}
+		for i = 1, upto do e.osSellRarities[i] = ({"Common", "Uncommon", "Rare", "Epic", "Legendary"})[i] end
+	elseif type(old) == "string" and old ~= "" then
+		e.osSellRarities = {old}
+	else
+		e.osSellRarities = {"Common", "Uncommon", "Rare"}
+	end
+end
 -- multi-select filters on top of rarity: an egg is only sold when its
 -- mutation AND size are both in the picks (arrays of names, the shape
 -- MacLib's multi Default wants back). Empty pick = that filter is off.
@@ -221,7 +237,7 @@ local EGG_NAME_OPTIONS, EGG_ID_BY_NAME = {"All"}, {}
 for _, p in ipairs(EGG_LIST) do EGG_NAME_OPTIONS[#EGG_NAME_OPTIONS + 1] = p[1]; EGG_ID_BY_NAME[p[1]] = p[2] end
 local MIN_RARITY_OPTIONS = {}
 for i, r in ipairs(RARITIES) do MIN_RARITY_OPTIONS[i] = (i == 1) and "All (Common+)" or (r .. "+") end
-local SELL_OPTIONS = {"Common - Rare", "Common - Epic", "Common - Legendary"}
+local SELL_OPTIONS = {}
 for _, r in ipairs(RARITIES) do SELL_OPTIONS[#SELL_OPTIONS + 1] = r end
 local function rankOf(eggType) return RARITY_RANK[EGG_RARITY[eggType] or "Common"] or 1 end
 -- Mutation / size vocab, read from the game's own configs (inventory eggs
@@ -377,13 +393,13 @@ end)
 local function sellEggs()
 	local d = pdata()
 	if not (d and d.Inventory) then return 0 end
-	local pick = e.osSellRarity
-	local maxRank = (pick == "Common - Rare" and 3) or (pick == "Common - Epic" and 4) or (pick == "Common - Legendary" and 5) or nil
+	local picks = type(e.osSellRarities) == "table" and e.osSellRarities or {}
+	if #picks == 0 then return 0 end
 	local sold = 0
 	for id, it in pairs(d.Inventory) do
 		if it.itemType == "Egg" and it.innerEntity and it.innerEntity.eggType then
 			local r = EGG_RARITY[it.innerEntity.eggType] or "Common"
-			local want = maxRank and (RARITY_RANK[r] or 1) <= maxRank or (not maxRank and r == pick)
+			local want = table.find(picks, r) ~= nil
 			local mutation = it.innerEntity.mutation or "NORMAL"
 			local size = it.innerEntity.size or "baby"
 			if want and not inPick(e.osSellMutations, mutation) then want = false end
@@ -800,14 +816,6 @@ SL:Slider({
 	Callback = function(v) e.osWaveDelay = v; sv() end,
 }, "osWaveDelay")
 SL:Header({Text = "Sell Eggs"})
-SL:Dropdown({
-	Name = "Sell Rarity", Multi = false, Required = true, Search = true,
-	Options = SELL_OPTIONS, Default = indexOf(SELL_OPTIONS, e.osSellRarity),
-	Callback = function(v)
-		local picked = type(v) == "table" and v[1] or v
-		if type(picked) == "string" then e.osSellRarity = picked; sv() end
-	end,
-}, "osSellRarity")
 local function multiPick(v, options, idByLabel)
 	-- MacLib hands a {label=true} set for multi-select; store the ids as an
 	-- ordered array (label -> id through the map built from the config)
@@ -824,6 +832,11 @@ local function multiPick(v, options, idByLabel)
 	return picked
 end
 SL:Dropdown({
+	Name = "Sell Rarities", Multi = true, Required = false, Search = true,
+	Options = SELL_OPTIONS, Default = e.osSellRarities,
+	Callback = function(v) e.osSellRarities = multiPick(v, SELL_OPTIONS, {}); sv() end,
+}, "osSellRarities")
+SL:Dropdown({
 	Name = "Sell Mutations", Multi = true, Required = false,
 	Options = MUTATION_OPTIONS, Default = idsToLabels(e.osSellMutations, MUTATION_LABEL_BY_ID),
 	Callback = function(v) e.osSellMutations = multiPick(v, MUTATION_OPTIONS, MUTATION_ID_BY_LABEL); sv() end,
@@ -833,10 +846,10 @@ SL:Dropdown({
 	Options = SIZE_OPTIONS, Default = idsToLabels(e.osSellSizes, SIZE_LABEL_BY_ID),
 	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS, SIZE_ID_BY_LABEL); sv() end,
 }, "osSellSizes")
-SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\nAn egg sells only when rarity AND mutation AND size all match.\nEmpty mutation/size pick = no filter on that. Default keeps every\nmutated egg (only Normal is sold)."})
-SL:Toggle({Name = "Auto Sell Eggs (by rarity)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
-SL:Button({Name = "Sell Selected Rarity Now", Callback = function()
-	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, tostring(e.osSellRarity))) end)
+SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\nAn egg sells only when its rarity is picked AND mutation AND size\nmatch. Empty rarity pick sells nothing; empty mutation/size pick =\nno filter on that. Default keeps every mutated egg (only Normal sold)."})
+SL:Toggle({Name = "Auto Sell Eggs (by picks)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
+SL:Button({Name = "Sell Picked Eggs Now", Callback = function()
+	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, table.concat(e.osSellRarities or {}, ", "))) end)
 end})
 SL:Header({Text = "Hatchery & Plot"})
 SL:Toggle({Name = "Auto Hatch Eggs (place + hatch)", Default = e.osHatch, Callback = function(v) e.osHatch = v; sv() end}, "osHatch")
