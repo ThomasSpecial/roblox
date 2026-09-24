@@ -30,6 +30,10 @@ local PLACE_SCRIPTS = {
     [87075726814250]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/defend_your_town.lua", -- Defend Your Town
     [80519520593681]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/tapborne_heroes.lua",  -- Tapborne Heroes
     [99388466709359]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/soul_hero.lua",        -- [IDLE] Soul Hero
+    -- Third-party build ("2K Script", Fluent UI), pinned to the author's gist so
+    -- it tracks whatever they publish. Read before adding: fetches only the
+    -- Fluent UI library, writes its own config/logo files, no outbound requests.
+    [88047783411976]  = "https://gist.githubusercontent.com/hxrendontcry/fed525eebcba8d55c79d98d7035d823e/raw",    -- Open Sea For Animals
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
