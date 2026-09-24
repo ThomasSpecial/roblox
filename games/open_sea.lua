@@ -153,7 +153,7 @@ local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
 	"osSellEggs", "osSellRarity", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
-	"osTrain", "osClaimBonus", "osBuyDumbbell", "osBuyStaff",
+	"osTrain", "osTrainRing", "osClaimBonus", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
 	"osPotions", "osPotionTrain", "osPotionCash", "osPotionLuck",
@@ -175,7 +175,7 @@ def("osWave", true); def("osHuntBoss", true); def("osMinRarity", 1); def("osSpec
 def("osMutations", true); def("osWaveDelay", 2)
 def("osSellEggs", false); def("osSellRarity", "Common - Rare")
 def("osHatch", true); def("osEquipBest", true); def("osSellAnimals", false); def("osOfflineCash", true)
-def("osTrain", true); def("osClaimBonus", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
+def("osTrain", true); def("osTrainRing", true); def("osClaimBonus", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
 def("osUpPlot", true); def("osUpSpeed", true); def("osUpCarry", true); def("osRebirth", false); def("osRebirthTarget", 0)
 def("osPlaytime", true); def("osDaily", true); def("osFreeShop", true); def("osSpin", true); def("osGroup", true)
 def("osSeasonPass", true); def("osQuests", true)
@@ -184,7 +184,7 @@ def("osSpeedEnabled", false); def("osSpeedValue", 46)
 def("osAntiAFK", true); def("osAutoReconnect", true)
 
 local stats = {waves = 0, eggsTaken = 0, lastEgg = "-", eggsSold = 0, placed = 0, hatched = 0,
-	trains = 0, bonuses = 0, buys = 0, upgrades = 0, rebirths = 0, claims = 0, note = "-"}
+	trains = 0, ringStarts = 0, bonuses = 0, buys = 0, upgrades = 0, rebirths = 0, claims = 0, note = "-"}
 
 -- ---------------------------------------------------------------- egg tables
 -- Rarity rank order is the one the game's egg list uses; eggType ids come
@@ -239,7 +239,15 @@ local function myPlot()
 	end
 	return nil
 end
+local function trainingController()
+	local ok, tc = pcall(function() return Knit.GetController("TrainingController") end)
+	return ok and tc or nil
+end
 local function teleport(cf)
+	-- the ring's PreSimulation hook snaps the character back onto the
+	-- StandPart every frame while training, so leave the ring first
+	local tc = trainingController()
+	if tc and tc.IsTraining and tc:IsTraining() then pcall(function() tc:StopTraining(true) end) task.wait(0.1) end
 	local char = plr.Character
 	if char and char.PrimaryPart then pcall(function() char:PivotTo(cf) end) end
 end
@@ -468,9 +476,43 @@ local function buyBestTool(cfgTable, ownedKey, equippedKey, service, buyName, eq
 		call(service, equipName, bestOwned)
 	end
 end
+-- Ring mode: the game's own training. workspace.TrainingArea (ZonePart +
+-- StandPart) sits on the player's plot; walking into ZonePart makes
+-- TrainingPlaceholderComponent call TrainingController:StartTraining(
+-- StandPart), which pivots the character onto the stand, pins it there
+-- (PreSimulation snap-back), sets WalkSpeed 0, invokes the server's
+-- StartTraining once and runs the dumbbell animation/gain popups until a
+-- jump calls StopTraining. Calling the controller directly with the same
+-- StandPart is exactly the zone-enter path minus the walk. Runs alongside
+-- the silent loop above by design -- the silent StartTraining invokes are
+-- idempotent on the server while a session is already open.
+local function ringStand()
+	local ta = workspace:FindFirstChild("TrainingArea")
+	local sp = ta and ta:FindFirstChild("StandPart")
+	if sp and sp:IsA("BasePart") then return sp end
+	local plot = myPlot()
+	local ph = plot and plot:FindFirstChild("TrainingAreaPlaceholder", true)
+	return (ph and ph:IsA("BasePart")) and ph or nil
+end
+local function ringTrain()
+	local tc = trainingController()
+	if not (tc and tc.StartTraining) then return end
+	if tc.IsTraining and tc:IsTraining() then return end
+	if plr:GetAttribute("IsWaveActive") then return end
+	local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+	local stand = ringStand()
+	if not stand then return end
+	if pcall(function() tc:StartTraining(stand) end) then stats.ringStarts += 1 end
+end
+local function ringStop()
+	local tc = trainingController()
+	if tc and tc.IsTraining and tc:IsTraining() then pcall(function() tc:StopTraining(true) end) end
+end
 task.spawn(function()
 	while getgenv().__OS == G do
 		pcall(function()
+			if e.osTrainRing then ringTrain() end
 			if e.osTrain then train() end
 			if e.osBuyDumbbell then
 				local tc = cfg("TrainToolConfig")
@@ -727,8 +769,10 @@ local seaStatusLbl = SR:Label({Text = "Starting..."})
 -- ----- Power -----
 local PL = Tabs.Power:Section({Side = "Left"})
 PL:Header({Text = "Training"})
-PL:Toggle({Name = "Auto Train Power", Default = e.osTrain, Callback = function(v) e.osTrain = v; sv(); if not v then task.spawn(stopTraining) end end}, "osTrain")
-PL:Button({Name = "Stop Training Now", Callback = function() task.spawn(stopTraining) end})
+PL:Toggle({Name = "Auto Train Power (silent)", Default = e.osTrain, Callback = function(v) e.osTrain = v; sv(); if not v and not e.osTrainRing then task.spawn(stopTraining) end end}, "osTrain")
+PL:Toggle({Name = "Auto Train in Ring (stand on plot)", Default = e.osTrainRing, Callback = function(v) e.osTrainRing = v; sv(); if not v then task.spawn(ringStop) end end}, "osTrainRing")
+PL:Label({Text = "Silent = fires the server's StartTraining in the background,\nwalk anywhere. Ring = the game's own dumbbell stand on your\nplot (locks you there). Both can run at once."})
+PL:Button({Name = "Stop Training Now", Callback = function() task.spawn(function() ringStop() stopTraining() end) end})
 PL:Toggle({Name = "Auto Claim x2 Bonus", Default = e.osClaimBonus, Callback = function(v) e.osClaimBonus = v; sv() end}, "osClaimBonus")
 PL:Header({Text = "Gear"})
 PL:Toggle({Name = "Auto Buy & Equip Best Dumbbell", Default = e.osBuyDumbbell, Callback = function(v) e.osBuyDumbbell = v; sv() end}, "osBuyDumbbell")
@@ -871,8 +915,10 @@ task.spawn(function()
 		end)
 		pcall(function()
 			local d = pdata()
-			powerStatusLbl:UpdateName(("Power: %s | Rebirth: %s\nTrain calls: %d | x2 bonuses: %d\nGear bought: %d | Upgrades: %d | Rebirths: %d\nRewards claimed: %d"):format(
-				fmt(d and d.Power), tostring(d and d.Rebirth or "?"), stats.trains, stats.bonuses, stats.buys, stats.upgrades, stats.rebirths, stats.claims))
+			local tc = trainingController()
+			local ring = (tc and tc.IsTraining and tc:IsTraining()) and "in ring" or "idle"
+			powerStatusLbl:UpdateName(("Power: %s | Rebirth: %s\nSilent train calls: %d | Ring: %s (%d starts)\nx2 bonuses: %d | Gear bought: %d\nUpgrades: %d | Rebirths: %d | Rewards claimed: %d"):format(
+				fmt(d and d.Power), tostring(d and d.Rebirth or "?"), stats.trains, ring, stats.ringStarts, stats.bonuses, stats.buys, stats.upgrades, stats.rebirths, stats.claims))
 		end)
 	end
 end)
