@@ -113,6 +113,7 @@ local SK = {
 	"shQuestEnabled", "shIndexEnabled", "shRebirthEnabled", "shNextStageEnabled",
 	"shLoopLevelEnabled", "shLoopLevel", "shSkipAnim", "shUpgradePriority", "shUpgradeOrder", "shUpgradeRest",
 	"shRebirthMinLevel",
+	"shWorldBossEnabled", "shWorldBossPick",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -148,6 +149,11 @@ if e.shQuestEnabled == nil then e.shQuestEnabled = true end
 if e.shIndexEnabled == nil then e.shIndexEnabled = true end
 if e.shRebirthEnabled == nil then e.shRebirthEnabled = true end
 if type(e.shRebirthMinLevel) ~= "number" then e.shRebirthMinLevel = 0 end   -- 0 = rebirth as soon as the game allows
+if e.shWorldBossEnabled == nil then e.shWorldBossEnabled = true end
+-- Which world bosses to drop everything for, by display name (Mink / Lonku /
+-- Zephyr). Stored as an ARRAY of names -- the shape MacLib's multi-select
+-- Default wants back -- not a {name=true} set.
+if type(e.shWorldBossPick) ~= "table" then e.shWorldBossPick = {"Mink", "Lonku", "Zephyr"} end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
@@ -211,7 +217,17 @@ end
 if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
-local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-"}
+local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-", worldBoss = "-", worldBosses = 0}
+
+-- Set while the World Boss routine is moving the character between areas
+-- (join / return / portal walk). Orbit writes hrp.CFrame every frame and
+-- would fight the server's own teleport into the arena, so it stands down
+-- while this is up.
+local wbHold = false
+-- The arena's own enemy folder once found (the boss model lives wherever
+-- the game parents it; discovered by EnemyId attribute, see the World Boss
+-- section). nil outside the arena.
+local arenaFolder = nil
 
 -- ---------------------------------------------------------------- shared target tracking
 -- Auto Farm Mob, Auto M1, and Orbit all need "which enemy, and where is it"
@@ -325,6 +341,10 @@ task.spawn(function()
 	while getgenv().__SH == G do
 		local gameFolder = workspace:FindFirstChild("Game")
 		local folder = gameFolder and gameFolder:FindFirstChild("Enemies")
+		-- inside the world-boss arena, follow the arena's folder instead
+		if arenaFolder and arenaFolder.Parent and plr:GetAttribute("PlayerArea") == "ServerBoss" then
+			folder = arenaFolder
+		end
 		if folder and folder ~= enemiesFolder then bindEnemiesFolder(folder) end
 		-- 0.1s backstop only: catches a target whose hp bar hits 0 without
 		-- the model leaving yet, and the nearest-mob re-pick when the
@@ -391,7 +411,7 @@ RunService.Heartbeat:Connect(function(dt)
 	local hum = char and char:FindFirstChild("Humanoid")
 	if not (hrp and hum) then return end
 
-	local shouldFly = e.shOrbitEnabled and currentTarget ~= nil
+	local shouldFly = e.shOrbitEnabled and currentTarget ~= nil and not wbHold
 	if not shouldFly then
 		if orbitFlying then setOrbitFlight(hrp, hum, false) end
 		return
@@ -807,7 +827,7 @@ task.spawn(function()
 			-- "Revive & Continue" and is left alone on purpose. The press
 			-- itself now lives in the event-driven pressNextStage loop above;
 			-- this pass only handles the lobby bounce.
-			if plr:GetAttribute("PlayerArea") == "Lobby" then
+			if plr:GetAttribute("PlayerArea") == "Lobby" and not wbHold then
 				local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
 				local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
 				local char = plr.Character
@@ -823,6 +843,199 @@ task.spawn(function()
 		-- clear between polls, and every second of gap is a second farming
 		-- the wrong level before the pin catches it. Both remotes here are
 		-- no-ops when the attributes already match, so 1s costs nothing.
+		task.wait(1)
+	end
+end)
+
+-- ---------------------------------------------------------------- Auto World Boss
+-- "World Boss" in the UI is "ServerBoss" in the code. Everything below was
+-- read out of the live client (2026-09-24):
+--   - Roster: ReplicatedStorage.Shared.Config.ServerBossConfig.Bosses --
+--     mink (lv50 ref, 15k coins), lonku (lv90, 30k), zephyr (lv130, 50k);
+--     one spawns every ScheduleIntervalSeconds=3600, fight lasts
+--     EncounterSeconds=600, then ResultSeconds=30.
+--   - State: GetServerBossSnapshot-RemoteFunction / ServerBossSnapshotChanged
+--     -RemoteEvent -> {phase="Idle"|"Active"|"Result", bossId, eventId,
+--     endsAt, introEndsAt, nextReservation={bossId,startAt}}. The game's
+--     own client service (require(PlayerScripts.Client).ServerBossService)
+--     caches it and exposes getSnapshot()/getChangedSignal().
+--   - Join = ServerBossService:join() -> PlayerAreaService:requestTransition(
+--     "ServerBoss","WorldBossJoin") -> RequestJoinServerBoss-RemoteEvent
+--     {destination, source, requestId=GUID}. Return = :returnToLobby() ->
+--     RequestReturnFromServerBoss. Both are driven through the game's own
+--     service rather than the raw remotes so its presentation fence /
+--     WorldContext placement handshake (AcknowledgeWorldContextPlacement)
+--     stays in sync -- firing the remote directly leaves the client's area
+--     service believing it's still in Combat.
+--   - AreaConfig.canBeginClientTransition: Combat->ServerBoss and
+--     Lobby->ServerBoss are allowed, ServerBoss->Lobby allowed,
+--     ServerBoss->Combat is NOT -- so the way home is arena -> Lobby ->
+--     CombatPortal -> Combat, same portal walk the Next Stage loop uses.
+-- Flow: boss goes Active and its name is in shWorldBossPick -> hold orbit,
+-- join, wait for PlayerArea=="ServerBoss", find the arena's enemy folder
+-- (the boss carries EnemyId/ArchetypeId="world_<id>" attributes like every
+-- other mob, so the normal targeting + orbit + M1 handle the fight) ->
+-- when the phase leaves Active (kill or 10-min escape) return to Lobby,
+-- walk the portal, release the hold. Farming resumes on its own.
+local WB_BOSSES = {{id = "mink", name = "Mink"}, {id = "lonku", name = "Lonku"}, {id = "zephyr", name = "Zephyr"}}
+pcall(function()
+	local cfg = require(game:GetService("ReplicatedStorage").Shared.Config.ServerBossConfig)
+	local order, out = cfg.BossOrder or {}, {}
+	for i = 1, 10 do
+		local id = order[i] or order[tostring(i)]
+		local b = id and cfg.Bosses and cfg.Bosses[id]
+		if b then out[#out + 1] = {id = b.id or id, name = b.displayName or id} end
+	end
+	if #out > 0 then WB_BOSSES = out end
+end)
+local WB_NAMES = {}
+for _, b in ipairs(WB_BOSSES) do WB_NAMES[#WB_NAMES + 1] = b.name end
+
+local function wbNameOf(bossId)
+	for _, b in ipairs(WB_BOSSES) do if b.id == bossId then return b.name end end
+	return tostring(bossId)
+end
+local function wbWanted(bossId)
+	local name = wbNameOf(bossId)
+	for _, v in ipairs(e.shWorldBossPick or {}) do
+		if v == name or v == bossId then return true end
+	end
+	return false
+end
+
+local function wbServices()
+	local ps = plr:FindFirstChild("PlayerScripts")
+	local cm = ps and ps:FindFirstChild("Client")
+	if not (cm and cm:IsA("ModuleScript")) then return nil end
+	local ok, C = pcall(require, cm)
+	if ok and type(C) == "table" and C.ServerBossService then return C end
+	return nil
+end
+local function wbSnapshot(C)
+	local ok, snap = pcall(function() return C.ServerBossService:getSnapshot() end)
+	if ok and type(snap) == "table" then return snap end
+	local ok2, snap2 = call("GetServerBossSnapshot-RemoteFunction")
+	return ok2 and type(snap2) == "table" and snap2 or nil
+end
+local function wbActive(snap)
+	return snap and snap.enabled ~= false and snap.phase == "Active"
+		and (type(snap.endsAt) ~= "number" or snap.endsAt > os.time())
+end
+local function waitArea(want, timeout)
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		if plr:GetAttribute("PlayerArea") == want then return true end
+		task.wait(0.1)
+	end
+	return plr:GetAttribute("PlayerArea") == want
+end
+-- The arena parents the boss somewhere other than Game/Enemies (folder is
+-- rebuilt per area). Find it by the EnemyId attribute every mob carries.
+local function findArenaFolder()
+	local gf = workspace:FindFirstChild("Game")
+	local ge = gf and gf:FindFirstChild("Enemies")
+	if ge then
+		for _, m in ipairs(ge:GetChildren()) do
+			if m:GetAttribute("EnemyId") then return ge end
+		end
+	end
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Model") and d:GetAttribute("EnemyId") and tostring(d:GetAttribute("ArchetypeId") or ""):find("^world_") then
+			return d.Parent
+		end
+	end
+	return nil
+end
+local function walkCombatPortal()
+	local portal = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("CombatPortal")
+	local part = portal and portal:FindFirstChildWhichIsA("BasePart", true)
+	local char = plr.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChild("Humanoid")
+	if not (part and hrp) then return false end
+	if hum then hum.PlatformStand = false end
+	hrp.CanCollide = true
+	hrp.CFrame = part.CFrame + Vector3.new(0, 2, 0)
+	return true
+end
+
+local wbJoinedEvent = nil
+task.spawn(function()
+	while getgenv().__SH == G do
+		if e.shWorldBossEnabled then
+			pcall(function()
+				local C = wbServices()
+				if not C then stats.worldBoss = "service n/a" return end
+				local snap = wbSnapshot(C)
+				if not snap then stats.worldBoss = "no snapshot" return end
+				local area = plr:GetAttribute("PlayerArea")
+				local active = wbActive(snap)
+
+				if area == "ServerBoss" then
+					if active then
+						stats.worldBoss = ("fighting %s (%s left)"):format(wbNameOf(snap.bossId),
+							type(snap.endsAt) == "number" and ("%ds"):format(math.max(0, snap.endsAt - os.time())) or "?")
+						if not (arenaFolder and arenaFolder.Parent) then
+							arenaFolder = findArenaFolder()
+						end
+						-- boss is placed: let orbit/M1 take over
+						if arenaFolder and currentTarget then wbHold = false end
+						return
+					end
+					-- Result / Idle while still inside: leave. A short beat first
+					-- so the server's reward grant (it happens on the phase flip)
+					-- is never raced by our return request.
+					stats.worldBoss = "done, returning"
+					wbHold = true
+					task.wait(2)
+					pcall(function() C.ServerBossService:returnToLobby() end)
+					if waitArea("Lobby", 15) then
+						task.wait(0.5)
+						walkCombatPortal()
+						waitArea("Combat", 15)
+					end
+					arenaFolder = nil
+					wbHold = false
+					stats.worldBosses += 1
+					stats.worldBoss = ("returned (%d done)"):format(stats.worldBosses)
+					return
+				end
+
+				-- Transition states: just wait them out.
+				if area ~= "Combat" and area ~= "Lobby" then return end
+
+				if active and wbWanted(snap.bossId) and wbJoinedEvent ~= snap.eventId then
+					stats.worldBoss = "joining " .. wbNameOf(snap.bossId)
+					wbHold = true
+					wbJoinedEvent = snap.eventId
+					local ok = pcall(function() C.ServerBossService:join() end)
+					if ok and waitArea("ServerBoss", 20) then
+						arenaFolder = nil
+						stats.worldBoss = "in arena: " .. wbNameOf(snap.bossId)
+					else
+						-- refused (not eligible / fence rejected) -- don't spam it,
+						-- the eventId guard above holds until the next boss
+						stats.worldBoss = "join refused: " .. wbNameOf(snap.bossId)
+						wbHold = false
+					end
+					return
+				end
+
+				if active then
+					stats.worldBoss = ("%s active (skipped, not picked)"):format(wbNameOf(snap.bossId))
+				else
+					local nr = snap.nextReservation
+					if type(nr) == "table" and type(nr.startAt) == "number" then
+						local left = math.max(0, nr.startAt - os.time())
+						stats.worldBoss = ("next %s in %dm %02ds"):format(wbNameOf(nr.bossId), left // 60, left % 60)
+					else
+						stats.worldBoss = "idle"
+					end
+				end
+			end)
+		elseif wbHold then
+			wbHold = false
+		end
 		task.wait(1)
 	end
 end)
@@ -1064,6 +1277,30 @@ FL:Dropdown({
 		if n then e.shLoopLevel = n; sv() end
 	end,
 }, "shLoopLevel")
+FL:Header({Text = "World Boss"})
+FL:Toggle({Name = "Auto World Boss", Default = e.shWorldBossEnabled,
+	Callback = function(v) e.shWorldBossEnabled = v; sv() end}, "shWorldBossEnabled")
+FL:Dropdown({
+	Name = "Which Bosses", Multi = true, Required = false,
+	Options = WB_NAMES,
+	Default = e.shWorldBossPick,   -- multi-select Default is an array of names
+	Callback = function(v)
+		-- MacLib hands a {name=true} set for multi-select; keep the saved
+		-- shape as an ordered array so the Default round-trips on reload
+		local picked = {}
+		if type(v) == "table" then
+			for _, name in ipairs(WB_NAMES) do
+				if v[name] == true then picked[#picked + 1] = name end
+			end
+			for _, name in ipairs(v) do
+				if type(name) == "string" and not table.find(picked, name) then picked[#picked + 1] = name end
+			end
+		end
+		e.shWorldBossPick = picked
+		sv()
+	end,
+}, "shWorldBossPick")
+FL:Label({Text = "When a picked boss spawns (every hour) the farm drops\nwhat it's doing, joins the arena, fights with the same\norbit + M1, then walks back to Combat and resumes."})
 FL:Header({Text = "Animation"})
 FL:Toggle({Name = "Auto Skip Animation", Default = e.shSkipAnim,
 	Callback = function(v) e.shSkipAnim = v; sv() end}, "shSkipAnim")
@@ -1206,8 +1443,8 @@ task.spawn(function()
 	while getgenv().__SH == G do
 		task.wait(1)
 		pcall(function()
-			farmStatusLbl:UpdateName(("Target: %s\nHits: %d\nCoins collected: %d"):format(
-				stats.target, stats.hits, stats.collected))
+			farmStatusLbl:UpdateName(("Target: %s\nHits: %d\nCoins collected: %d\nWorld Boss: %s"):format(
+				stats.target, stats.hits, stats.collected, stats.worldBoss))
 		end)
 		pcall(function()
 			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)"):format(
