@@ -227,25 +227,42 @@ local function rankOf(eggType) return RARITY_RANK[EGG_RARITY[eggType] or "Common
 -- Mutation / size vocab, read from the game's own configs (inventory eggs
 -- carry innerEntity.mutation -- nil meaning NORMAL -- and innerEntity.size).
 -- Seen live: mutation GOLD/DIAMOND/RAINBOW/RADIOACTIVE, size baby/big.
-local MUTATION_OPTIONS = {"NORMAL", "GOLD", "DIAMOND", "RAINBOW", "RADIOACTIVE"}
-local SIZE_OPTIONS = {"baby", "big", "huge"}
-pcall(function()
-	local mc = cfg("MutationConfig")
-	if type(mc) == "table" then
-		local t = {}
-		for k in pairs(mc) do if type(k) == "string" then t[#t + 1] = k end end
-		table.sort(t)
-		if #t > 0 then MUTATION_OPTIONS = t end
-	end
-	local sc = cfg("SizeConfig")
-	if type(sc) == "table" and type(sc.SIZES) == "table" then
-		local t = {}
-		for k, v in pairs(sc.SIZES) do
-			if type(k) == "string" then t[#t + 1] = k elseif type(v) == "string" then t[#t + 1] = v elseif type(v) == "table" and type(v.id or v.name) == "string" then t[#t + 1] = v.id or v.name end
+-- Option labels carry the game's own cashMulti so the pick reads as
+-- "Diamond (x1.5)"; the id ("DIAMOND") is what gets stored and compared.
+-- Read live from MutationConfig / SizeConfig.SIZES: NORMAL x1, GOLD x1.25,
+-- DIAMOND x1.5, RADIOACTIVE x1.75, RAINBOW x2; baby x1, big x1.25, huge x1.5.
+local MUTATION_OPTIONS, MUTATION_ID_BY_LABEL, MUTATION_LABEL_BY_ID = {}, {}, {}
+local SIZE_OPTIONS, SIZE_ID_BY_LABEL, SIZE_LABEL_BY_ID = {}, {}, {}
+local function buildOptions(defs, fallback, options, idByLabel, labelById)
+	local list = {}
+	if type(defs) == "table" then
+		for k, v in pairs(defs) do
+			if type(v) == "table" then
+				local id = (type(v.id) == "string" and v.id) or (type(k) == "string" and k) or nil
+				if id then list[#list + 1] = {id = id, name = tostring(v.name or id), mult = tonumber(v.cashMulti) or 1} end
+			end
 		end
-		if #t > 0 then SIZE_OPTIONS = t end
 	end
-end)
+	if #list == 0 then for _, f in ipairs(fallback) do list[#list + 1] = f end end
+	table.sort(list, function(a, b) if a.mult ~= b.mult then return a.mult < b.mult end return a.name < b.name end)
+	for _, it in ipairs(list) do
+		local label = ("%s (x%s)"):format(it.name, tostring(it.mult))
+		options[#options + 1] = label
+		idByLabel[label] = it.id
+		labelById[it.id] = label
+	end
+end
+local mcfg = cfg("MutationConfig")
+buildOptions(mcfg, {{id = "NORMAL", name = "Normal", mult = 1}, {id = "GOLD", name = "Gold", mult = 1.25}, {id = "DIAMOND", name = "Diamond", mult = 1.5},
+	{id = "RADIOACTIVE", name = "Radioactive", mult = 1.75}, {id = "RAINBOW", name = "Rainbow", mult = 2}}, MUTATION_OPTIONS, MUTATION_ID_BY_LABEL, MUTATION_LABEL_BY_ID)
+local scfg = cfg("SizeConfig")
+buildOptions(type(scfg) == "table" and scfg.SIZES or nil, {{id = "baby", name = "Baby", mult = 1}, {id = "big", name = "Big", mult = 1.25}, {id = "huge", name = "Huge", mult = 1.5}},
+	SIZE_OPTIONS, SIZE_ID_BY_LABEL, SIZE_LABEL_BY_ID)
+local function idsToLabels(ids, labelById)
+	local out = {}
+	for _, id in ipairs(type(ids) == "table" and ids or {}) do if labelById[id] then out[#out + 1] = labelById[id] end end
+	return out
+end
 local function inPick(pick, value)
 	if type(pick) ~= "table" or #pick == 0 then return true end
 	for _, v in ipairs(pick) do if v == value then return true end end
@@ -791,26 +808,32 @@ SL:Dropdown({
 		if type(picked) == "string" then e.osSellRarity = picked; sv() end
 	end,
 }, "osSellRarity")
-local function multiPick(v, options)
-	-- MacLib hands a {name=true} set for multi-select; store an ordered array
+local function multiPick(v, options, idByLabel)
+	-- MacLib hands a {label=true} set for multi-select; store the ids as an
+	-- ordered array (label -> id through the map built from the config)
 	local picked = {}
 	if type(v) == "table" then
-		for _, name in ipairs(options) do if v[name] == true then picked[#picked + 1] = name end end
-		for _, name in ipairs(v) do if type(name) == "string" and not table.find(picked, name) then picked[#picked + 1] = name end end
+		for _, label in ipairs(options) do if v[label] == true then picked[#picked + 1] = idByLabel[label] or label end end
+		for _, label in ipairs(v) do
+			if type(label) == "string" then
+				local id = idByLabel[label] or label
+				if not table.find(picked, id) then picked[#picked + 1] = id end
+			end
+		end
 	end
 	return picked
 end
 SL:Dropdown({
 	Name = "Sell Mutations", Multi = true, Required = false,
-	Options = MUTATION_OPTIONS, Default = e.osSellMutations,
-	Callback = function(v) e.osSellMutations = multiPick(v, MUTATION_OPTIONS); sv() end,
+	Options = MUTATION_OPTIONS, Default = idsToLabels(e.osSellMutations, MUTATION_LABEL_BY_ID),
+	Callback = function(v) e.osSellMutations = multiPick(v, MUTATION_OPTIONS, MUTATION_ID_BY_LABEL); sv() end,
 }, "osSellMutations")
 SL:Dropdown({
 	Name = "Sell Sizes", Multi = true, Required = false,
-	Options = SIZE_OPTIONS, Default = e.osSellSizes,
-	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS); sv() end,
+	Options = SIZE_OPTIONS, Default = idsToLabels(e.osSellSizes, SIZE_LABEL_BY_ID),
+	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS, SIZE_ID_BY_LABEL); sv() end,
 }, "osSellSizes")
-SL:Label({Text = "An egg sells only when rarity AND mutation AND size all match.\nEmpty mutation/size pick = no filter on that. Default keeps every\nmutated egg (only NORMAL is sold)."})
+SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\nAn egg sells only when rarity AND mutation AND size all match.\nEmpty mutation/size pick = no filter on that. Default keeps every\nmutated egg (only Normal is sold)."})
 SL:Toggle({Name = "Auto Sell Eggs (by rarity)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
 SL:Button({Name = "Sell Selected Rarity Now", Callback = function()
 	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, tostring(e.osSellRarity))) end)
