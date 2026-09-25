@@ -116,6 +116,7 @@ local SK = {
 	"shWorldBossEnabled", "shWorldBossPick",
 	"shEvolveHeroEnabled", "shHatchEnabled", "shHatchEggs", "shSkipIntroServer", "shDefeatContinue",
 	"shWbTitleId", "shFarmTitleId",
+	"shSummonEnabled", "shSummonBanner", "shSummonCount", "shSummonKeepSouls", "shSummonTitleId", "shSummonAfterTitleId",
 	"shAntiAFK", "shAutoReconnect",
 }
 pcall(function() if not isfolder("SoulHero") then makefolder("SoulHero") end end)
@@ -163,6 +164,16 @@ if e.shSkipIntroServer == nil then e.shSkipIntroServer = true end
 if e.shDefeatContinue == nil then e.shDefeatContinue = true end
 if type(e.shWbTitleId) ~= "string" then e.shWbTitleId = "" end       -- "" = leave the title alone
 if type(e.shFarmTitleId) ~= "string" then e.shFarmTitleId = "" end
+-- Auto Summon: spends Souls, so opt-in. Banner ids are the game's own
+-- ("quick" = the 10-minute Quick Banner, 25 souls; "lucky" = the hourly
+-- Lucky Banner, 200 souls). Count: the server accepts exactly 1 or 10
+-- (11, 20, 50, 100 all answer invalid_roll_count -- tested live).
+if e.shSummonEnabled == nil then e.shSummonEnabled = false end
+if type(e.shSummonBanner) ~= "string" then e.shSummonBanner = "quick" end
+if e.shSummonCount ~= 1 and e.shSummonCount ~= 10 then e.shSummonCount = 10 end
+if type(e.shSummonKeepSouls) ~= "number" then e.shSummonKeepSouls = 0 end
+if type(e.shSummonTitleId) ~= "string" then e.shSummonTitleId = "" end
+if type(e.shSummonAfterTitleId) ~= "string" then e.shSummonAfterTitleId = "" end
 if e.shNextStageEnabled == nil then e.shNextStageEnabled = true end
 if e.shLoopLevelEnabled == nil then e.shLoopLevelEnabled = false end
 if type(e.shLoopLevel) ~= "number" then e.shLoopLevel = 1 end
@@ -227,7 +238,9 @@ if e.shAntiAFK == nil then e.shAntiAFK = true end
 if e.shAutoReconnect == nil then e.shAutoReconnect = true end
 
 local stats = {hits = 0, collected = 0, equips = 0, skillNodes = 0, quests = 0, index = 0, rebirths = 0, rebirthNote = "-", target = "-", worldBoss = "-", worldBosses = 0,
-	evolveStarts = 0, evolveClaims = 0, evolveNote = "-", hatchStarts = 0, hatchClaims = 0, hatchNote = "-", defeats = 0}
+	evolveStarts = 0, evolveClaims = 0, evolveNote = "-", hatchStarts = 0, hatchClaims = 0, hatchNote = "-", defeats = 0,
+	summons = 0, summonNote = "-"}
+e.__shStats = stats   -- exposed for live probes only
 
 -- Set while the World Boss routine is moving the character between areas
 -- (join / return / portal walk). Orbit writes hrp.CFrame every frame and
@@ -1162,6 +1175,137 @@ task.spawn(function()
 	end
 end)
 
+-- ---------------------------------------------------------------- Auto Summon
+-- Measured live (2026-09-25): RollHeroBanner-RemoteFunction(bannerId,
+-- count, rotationId, selectionVersion) answers in ~85ms with {ok,
+-- transactionId, count, ...}; the roll then sits as a pending summon until
+-- each result is acknowledged -- AcknowledgeHeroSummon-RemoteFunction(
+-- transactionId, index) per index (the last one answers complete=true).
+-- That is exactly what the reveal screen does at the end of its animation;
+-- firing the acks straight after the roll, all ten in parallel, is the
+-- whole "fastest" trick: a x10 roll lands and clears in ~0.2s instead of
+-- the reveal's several seconds. AcknowledgeAllHeroSummons(transactionId)
+-- answers invalid_acknowledgement for banner rolls (it is the pack-
+-- purchase path), so per-index it is. Rapid rolls answer rate_limited --
+-- backed off 1s when seen. rotationId/selectionVersion come from
+-- GetHeroBanners and change when a banner rotates (Quick every 10 min,
+-- Lucky hourly), so the banner list is refreshed on any refusal.
+-- The reveal ScreenGui (HeroRollRevealGui) is disabled for the duration
+-- so the game's own reveal doesn't play over the farm, and re-enabled
+-- when summoning stops. Titles: one worn while summoning (the summonLuck
+-- ones exist for exactly this), one put back when the run ends -- same
+-- shape as the world-boss pair.
+local SUMMON_BANNERS = {{"Quick (Normal)", "quick"}, {"Lucky", "lucky"}}
+local bannerCache, bannerCacheAt = nil, 0
+local function getBanner(id, force)
+	if force or not bannerCache or os.clock() - bannerCacheAt > 30 then
+		local ok, list = call("GetHeroBanners-RemoteFunction")
+		if ok and type(list) == "table" then bannerCache, bannerCacheAt = list, os.clock() end
+	end
+	if type(bannerCache) ~= "table" then return nil end
+	for _, b in pairs(bannerCache) do
+		if type(b) == "table" and b.id == id then
+			if type(b.endsAt) == "number" and b.endsAt <= os.time() and not force then return getBanner(id, true) end
+			return b
+		end
+	end
+	return nil
+end
+-- The reveal service flips HeroRollRevealGui.Enabled back on for every
+-- HeroBannerRolled it receives, so a one-shot disable lasted one roll
+-- (seen live). While summoning, a guard on the Enabled property pins it
+-- off; the guard is dropped and the GUI restored when the run stops.
+-- Three ways of keeping HeroRollRevealGui.Enabled false all still drew the
+-- reveal for a frame per roll (the game re-enables it from a hook that
+-- runs after even a RenderPriority.Last binding: 26 of 279 frames). So
+-- while summoning the ScreenGui is parked in a folder under Lighting --
+-- a ScreenGui only draws under PlayerGui, and the reveal service keeps
+-- its reference and carries on toggling it harmlessly (5s burst with it
+-- parked: 60 summons, zero new console errors). Parented back on stop.
+local revealHolder = nil
+local revealGui = nil
+local function setRevealGui(enabled)
+	local pg = plr:FindFirstChild("PlayerGui")
+	revealGui = revealGui or (pg and pg:FindFirstChild("HeroRollRevealGui"))
+	if not (revealGui and revealGui:IsA("ScreenGui")) then return end
+	if enabled then
+		if pg and revealGui.Parent ~= pg then revealGui.Parent = pg end
+	else
+		if not (revealHolder and revealHolder.Parent) then
+			revealHolder = Instance.new("Folder")
+			revealHolder.Name = "__shRevealHolder"
+			revealHolder.Parent = game:GetService("Lighting")
+		end
+		if revealGui.Parent ~= revealHolder then revealGui.Parent = revealHolder end
+	end
+end
+local function ackSummon(transactionId, count)
+	local done = 0
+	for i = 1, count do
+		task.spawn(function()
+			call("AcknowledgeHeroSummon-RemoteFunction", transactionId, i)
+			done += 1
+		end)
+	end
+	local t0 = os.clock()
+	while done < count and os.clock() - t0 < 5 do task.wait(0.03) end
+end
+task.spawn(function()
+	local summoning = false
+	local function stopRun()
+		if not summoning then return end
+		summoning = false
+		setRevealGui(true)
+		pcall(equipTitle, e.shSummonAfterTitleId)
+	end
+	while getgenv().__SH == G do
+		if e.shSummonEnabled then
+			pcall(function()
+				local b = getBanner(e.shSummonBanner)
+				if not b then stats.summonNote = "banner n/a" task.wait(2) return end
+				if b.unlocked == false or b.enabled == false then stats.summonNote = "banner locked" stopRun() task.wait(5) return end
+				local count = (e.shSummonCount == 1) and 1 or 10
+				local cost = (tonumber(b.cost and b.cost.amount) or 0) * count
+				local souls = tonumber(plr:GetAttribute("Souls")) or 0
+				local keep = tonumber(e.shSummonKeepSouls) or 0
+				if souls - cost < keep then
+					stats.summonNote = ("paused: keeping %d souls (have %d, x%d costs %d)"):format(keep, souls, count, cost)
+					stopRun()
+					task.wait(3)
+					return
+				end
+				if not summoning then
+					summoning = true
+					setRevealGui(false)
+					pcall(equipTitle, e.shSummonTitleId)
+				end
+				local ok, res = call("RollHeroBanner-RemoteFunction", b.id, count, b.rotationId, b.selectionVersion)
+				if ok and type(res) == "table" and res.ok then
+					local n = tonumber(res.count) or count
+					stats.summons += n
+					stats.summonNote = ("rolling %s x%d (%d total)"):format(tostring(b.shortName or b.id), n, stats.summons)
+					if res.transactionId then ackSummon(res.transactionId, n) end
+				else
+					local reason = type(res) == "table" and tostring(res.reason) or tostring(res)
+					stats.summonNote = "refused: " .. reason
+					if reason == "rate_limited" then
+						task.wait(1)
+					else
+						-- rotation rolled over / stale version / anything else:
+						-- refetch the banner and try again on the next pass
+						getBanner(e.shSummonBanner, true)
+						task.wait(1)
+					end
+				end
+			end)
+		else
+			stopRun()
+			task.wait(1)
+		end
+	end
+	stopRun()
+end)
+
 -- ---------------------------------------------------------------- Placement / fall watchdog
 -- Root cause of "after a long farm the character falls out of the map and
 -- the run stops / the mobs vanish", read out of the live client:
@@ -1934,6 +2078,57 @@ IL:Dropdown({
 	end,
 }, "shHatchEggs")
 IL:Label({Text = "Keeps all 3 hatchery slots busy (highest-zone egg first)\nand claims each egg the moment it finishes. Empty pick =\nany egg you own."})
+IL:Header({Text = "Summon"})
+IL:Toggle({Name = "Auto Summon (spends Souls)", Default = e.shSummonEnabled,
+	Callback = function(v) e.shSummonEnabled = v; sv() end}, "shSummonEnabled")
+local SUMMON_BANNER_LABELS = {}
+for i, b in ipairs(SUMMON_BANNERS) do SUMMON_BANNER_LABELS[i] = b[1] end
+local function summonBannerIndex()
+	for i, b in ipairs(SUMMON_BANNERS) do if b[2] == e.shSummonBanner then return i end end
+	return 1
+end
+IL:Dropdown({
+	Name = "Banner", Multi = false, Required = true,
+	Options = SUMMON_BANNER_LABELS, Default = summonBannerIndex(),   -- single-select Default is an INDEX
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		for _, b in ipairs(SUMMON_BANNERS) do if b[1] == picked then e.shSummonBanner = b[2]; sv() end end
+	end,
+}, "shSummonBanner")
+IL:Dropdown({
+	Name = "Rolls Per Summon", Multi = false, Required = true,
+	Options = {"x1", "x10"}, Default = (e.shSummonCount == 1) and 1 or 2,
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		e.shSummonCount = (picked == "x1") and 1 or 10
+		sv()
+	end,
+}, "shSummonCount")
+IL:Input({
+	Name = "Keep At Least (souls)", Placeholder = "0 = spend everything",
+	Default = tostring(e.shSummonKeepSouls),
+	AcceptedCharacters = function(t) return (tostring(t):gsub("%D", "")) end,
+	Callback = function(t) e.shSummonKeepSouls = tonumber(t) or 0; sv() end,
+}, "shSummonKeepSouls")
+IL:Dropdown({
+	Name = "Title While Summoning", Multi = false, Required = true, Search = true,
+	Options = TITLE_OPTIONS, Default = titleIndexOf(e.shSummonTitleId),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		local idx = table.find(TITLE_OPTIONS, picked)
+		if idx then e.shSummonTitleId = TITLE_IDS[idx] or ""; sv() end
+	end,
+}, "shSummonTitleId")
+IL:Dropdown({
+	Name = "Title After Summoning", Multi = false, Required = true, Search = true,
+	Options = TITLE_OPTIONS, Default = titleIndexOf(e.shSummonAfterTitleId),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		local idx = table.find(TITLE_OPTIONS, picked)
+		if idx then e.shSummonAfterTitleId = TITLE_IDS[idx] or ""; sv() end
+	end,
+}, "shSummonAfterTitleId")
+IL:Label({Text = "Rolls back-to-back as fast as the server answers (x10 lands\nand clears in ~0.2s, no reveal), until Souls would drop under\nthe number above -- then pauses and resumes on its own. The\nserver only accepts x1 or x10 per roll."})
 
 local IR = Tabs.Inventory:Section({Side = "Right"})
 IR:Header({Text = "Status"})
@@ -1961,9 +2156,10 @@ task.spawn(function()
 				stats.target, stats.hits, stats.collected, stats.worldBoss))
 		end)
 		pcall(function()
-			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)\nEvolve: %d started / %d claimed (%s)\nHatch: %d started / %d claimed (%s)"):format(
+			invStatusLbl:UpdateName(("Equips: %d\nSkill nodes bought: %d\nQuests claimed: %d\nIndex claims: %d\nRebirths: %d (%s)\nEvolve: %d started / %d claimed (%s)\nHatch: %d started / %d claimed (%s)\nSummons: %d (%s)"):format(
 				stats.equips, stats.skillNodes, stats.quests, stats.index, stats.rebirths, stats.rebirthNote,
-				stats.evolveStarts, stats.evolveClaims, stats.evolveNote, stats.hatchStarts, stats.hatchClaims, stats.hatchNote))
+				stats.evolveStarts, stats.evolveClaims, stats.evolveNote, stats.hatchStarts, stats.hatchClaims, stats.hatchNote,
+				stats.summons, stats.summonNote))
 		end)
 	end
 end)
