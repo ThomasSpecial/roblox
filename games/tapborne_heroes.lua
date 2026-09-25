@@ -76,7 +76,7 @@ local SK = {
     "thUpgradeCategories","thMigratedV2","thAutoReconnect","thBossEnabled",
     "thSkillsEnabled","thReserveEnabled","thReserveQualities",
     "thExpeditionEnabled","thExpeditionRarities","thExpeditionDuration",
-    "thFrenzyEnabled","thRebirthEnabled","thRebirthMinStage",
+    "thFrenzyEnabled","thFrenzyMinDiamonds","thRebirthEnabled","thRebirthMinStage",
     "thSkyChestEnabled","thEquipBestEnabled","thExtrasEnabled",
 }
 
@@ -150,6 +150,10 @@ if e.thExpeditionEnabled == nil then e.thExpeditionEnabled = true end
 if type(e.thExpeditionRarities) ~= "table" then e.thExpeditionRarities = {} end   -- empty = Auto Select Best
 if type(e.thExpeditionDuration) ~= "string" then e.thExpeditionDuration = "Standard" end
 if e.thFrenzyEnabled   == nil then e.thFrenzyEnabled   = false end   -- spends diamonds: opt-in
+-- Diamond floor for the Frenzy buyer: a buy only happens while (diamonds -
+-- price) stays at or above this. Under it the buyer pauses by itself and
+-- resumes on its own once diamonds climb back over -- no toggling needed.
+if type(e.thFrenzyMinDiamonds) ~= "number" then e.thFrenzyMinDiamonds = 0 end
 if e.thRebirthEnabled  == nil then e.thRebirthEnabled  = false end   -- resets the run: opt-in
 if type(e.thRebirthMinStage) ~= "number" then e.thRebirthMinStage = 0 end
 if e.thSkyChestEnabled == nil then e.thSkyChestEnabled = true end
@@ -720,12 +724,22 @@ task.spawn(function()
             pcall(function()
                 local left = frenzyLeft()
                 if left == nil then stats.frenzy = "manager n/a" return end
-                if left > 5 then stats.frenzy = ("%ds left (%d buys)"):format(left, stats.frenzyBuys) return end
                 local S = SH()
                 local dia = 0
                 pcall(function() dia = S.ClientPlayerManager:GetPlayerDiamond() or 0 end)
                 local price = frenzyPrice()
+                local floor = tonumber(e.thFrenzyMinDiamonds) or 0
+                local underFloor = dia - price < floor
+                if left > 5 then
+                    stats.frenzy = ("%ds left (%d buys)%s"):format(left, stats.frenzyBuys,
+                        underFloor and (" | next buy paused: keeping %d"):format(floor) or "")
+                    return
+                end
                 if dia < price then stats.frenzy = ("need %d diamonds (have %d)"):format(price, dia) return end
+                if underFloor then
+                    stats.frenzy = ("paused: keeping %d diamonds (have %d, buy costs %d)"):format(floor, dia, price)
+                    return
+                end
                 local ok, res = req(Msg.C2S_BuyStoreUtilityWithDiamond, FRENZY_PRODUCT)
                 if ok and res ~= false then
                     stats.frenzyBuys += 1
@@ -1058,7 +1072,16 @@ L:Toggle({
     Default=e.thFrenzyEnabled,
     Callback=function(v) e.thFrenzyEnabled=v; sv() end
 }, "thFrenzyEnabled")
-L:Label({Text="Re-buys the moment the Frenzy timer runs out. Spends\ndiamonds every ~90s while on -- opt-in on purpose."})
+L:Input({
+    Name="Keep At Least (diamonds)", Placeholder="0 = spend everything",
+    Default=tostring(e.thFrenzyMinDiamonds),
+    AcceptedCharacters=function(t) return (tostring(t):gsub("%D", "")) end,
+    Callback=function(t)
+        e.thFrenzyMinDiamonds = tonumber(t) or 0
+        sv()
+    end,
+}, "thFrenzyMinDiamonds")
+L:Label({Text="Re-buys the moment the Frenzy timer runs out (opt-in: spends\ndiamonds every ~90s). Buying pauses by itself once a buy would\ndrop diamonds under the number above, and resumes on its own\nwhen you have that much plus one buy again."})
 
 L:Header({Text="Rebirth"})
 L:Toggle({
