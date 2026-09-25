@@ -152,7 +152,8 @@ end
 local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
-	"osSellEggs", "osSellRarities", "osSellUpToEgg", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
+	"osSellEggs", "osSellRarities", "osSellUpToEgg", "osSellMutations", "osSellSizes",
+	"osKeepEgg", "osKeepMutations", "osKeepSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
 	"osTrain", "osTrainRing", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
@@ -195,6 +196,12 @@ end
 -- MacLib's multi Default wants back). Empty pick = that filter is off.
 if type(e.osSellMutations) ~= "table" then e.osSellMutations = {"NORMAL"} end
 if type(e.osSellUpToEgg) ~= "string" then e.osSellUpToEgg = "None" end   -- "None" = use the rarity picks
+-- Keep rule: an exception on top of the sell rules. An egg that is this egg
+-- or higher AND has one of the kept mutations AND one of the kept sizes is
+-- never sold, whatever the sell picks say. "None" = no exception.
+if type(e.osKeepEgg) ~= "string" then e.osKeepEgg = "None" end
+if type(e.osKeepMutations) ~= "table" then e.osKeepMutations = {} end
+if type(e.osKeepSizes) ~= "table" then e.osKeepSizes = {} end
 if type(e.osSellSizes) ~= "table" then e.osSellSizes = {} end
 def("osHatch", true); def("osEquipBest", true); def("osSellAnimals", false); def("osOfflineCash", true)
 def("osTrain", true); def("osTrainRing", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
@@ -428,6 +435,12 @@ local function sellEggs()
 			local size = it.innerEntity.size or "baby"
 			if want and not inPick(e.osSellMutations, mutation) then want = false end
 			if want and not inPick(e.osSellSizes, size) then want = false end
+			-- keep exception: "this egg and up" + kept mutation + kept size
+			local keepId = EGG_ID_BY_NAME[e.osKeepEgg]
+			if want and keepId and eggTier(eggType) >= eggTier(keepId)
+				and inPick(e.osKeepMutations, mutation) and inPick(e.osKeepSizes, size) then
+				want = false
+			end
 			if want then
 				if call("InventoryService", "SellEgg", id) then sold += 1 end
 				task.wait(0.05)
@@ -952,6 +965,30 @@ SL:Dropdown({
 	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS, SIZE_ID_BY_LABEL); sv() end,
 }, "osSellSizes")
 SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\n\"Sell This Egg And Below\" picks by the game's tier ladder (Polarbear\n= everything up to Polarbear) and overrides the rarity picks; None =\nuse rarities. Mutation AND size must still match. Empty mutation/size\npick = no filter. Default keeps every mutated egg (only Normal sold)."})
+SL:Header({Text = "Keep (never sell)"})
+local KEEP_EGG_OPTIONS = {"None"}
+for _, p in ipairs(EGG_LIST) do KEEP_EGG_OPTIONS[#KEEP_EGG_OPTIONS + 1] = p[1] end
+SL:Dropdown({
+	Name = "Keep This Egg And Up", Multi = false, Required = true, Search = true,
+	Options = KEEP_EGG_OPTIONS, Default = indexOf(KEEP_EGG_OPTIONS, e.osKeepEgg),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		if type(picked) ~= "string" then return end
+		e.osKeepEgg = EGG_ID_BY_NAME[picked] and picked or "None"
+		sv()
+	end,
+}, "osKeepEgg")
+SL:Dropdown({
+	Name = "Keep Mutations", Multi = true, Required = false,
+	Options = MUTATION_OPTIONS, Default = idsToLabels(e.osKeepMutations, MUTATION_LABEL_BY_ID),
+	Callback = function(v) e.osKeepMutations = multiPick(v, MUTATION_OPTIONS, MUTATION_ID_BY_LABEL); sv() end,
+}, "osKeepMutations")
+SL:Dropdown({
+	Name = "Keep Sizes", Multi = true, Required = false,
+	Options = SIZE_OPTIONS, Default = idsToLabels(e.osKeepSizes, SIZE_LABEL_BY_ID),
+	Callback = function(v) e.osKeepSizes = multiPick(v, SIZE_OPTIONS, SIZE_ID_BY_LABEL); sv() end,
+}, "osKeepSizes")
+SL:Label({Text = "Exception on top of the sell rules: an egg that is the kept egg or\nhigher AND has a kept mutation AND a kept size is never sold.\nEmpty mutation/size pick = any. E.g. sell everything but Gorilla+\nRainbow Big/Huge: Sell = Dragon, Keep = Gorilla / Rainbow / Big+Huge."})
 SL:Toggle({Name = "Auto Sell Eggs (by picks)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
 SL:Button({Name = "Sell Picked Eggs Now", Callback = function()
 	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, table.concat(e.osSellRarities or {}, ", "))) end)
