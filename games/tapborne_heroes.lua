@@ -74,7 +74,10 @@ local SK = {
     "thDungeonEnabled","thDungeonSelected","thDailyEnabled",
     "thAchievementEnabled","thAntiAFK","thUpgradeEnabled",
     "thUpgradeCategories","thMigratedV2","thAutoReconnect","thBossEnabled",
-    "thSkillsEnabled","thReserveEnabled","thReserveQualities"
+    "thSkillsEnabled","thReserveEnabled","thReserveQualities",
+    "thExpeditionEnabled","thExpeditionRarities","thExpeditionDuration",
+    "thFrenzyEnabled","thRebirthEnabled","thRebirthMinStage",
+    "thSkyChestEnabled","thEquipBestEnabled","thExtrasEnabled",
 }
 
 local ok3, DungeonCfg = pcall(function() return require(RS.Configs.Dungeon) end)
@@ -134,6 +137,24 @@ if e.thBossEnabled     == nil then e.thBossEnabled     = true end
 if e.thSkillsEnabled   == nil then e.thSkillsEnabled   = true end
 local UPGRADE_CATS = {"Player Level","Heroes","Skills"}
 if type(e.thUpgradeCategories) ~= "table" then e.thUpgradeCategories = {} end
+-- Expedition / store / rebirth / extras (added 2026-09-25). Rarity names
+-- here are the game's own RarityConfigs order (GameSettings): 1 Common,
+-- 2 Rare, 3 Epic, 4 Legendary, 5 Mythical, 6 Supreme, 7 Ultimate -- that
+-- is what hero instances carry as Rarity and what the Expedition UI
+-- shows, distinct from the Tavern quality list used by Recruit above.
+local EXP_RARITY_NAMES = {"Common","Rare","Epic","Legendary","Mythical","Supreme","Ultimate"}
+local EXP_RARITY_ID = {}
+for i, n in ipairs(EXP_RARITY_NAMES) do EXP_RARITY_ID[n] = i end
+local EXP_DURATIONS = {{"4h (Short)","Short"},{"8h (Standard)","Standard"},{"12h (Long)","Long"}}
+if e.thExpeditionEnabled == nil then e.thExpeditionEnabled = true end
+if type(e.thExpeditionRarities) ~= "table" then e.thExpeditionRarities = {} end   -- empty = Auto Select Best
+if type(e.thExpeditionDuration) ~= "string" then e.thExpeditionDuration = "Standard" end
+if e.thFrenzyEnabled   == nil then e.thFrenzyEnabled   = false end   -- spends diamonds: opt-in
+if e.thRebirthEnabled  == nil then e.thRebirthEnabled  = false end   -- resets the run: opt-in
+if type(e.thRebirthMinStage) ~= "number" then e.thRebirthMinStage = 0 end
+if e.thSkyChestEnabled == nil then e.thSkyChestEnabled = true end
+if e.thEquipBestEnabled == nil then e.thEquipBestEnabled = true end
+if e.thExtrasEnabled   == nil then e.thExtrasEnabled   = true end
 
 if not e.thMigratedV2 then
     for _, name in ipairs({"Common","Uncommon","Rare","Epic","Legendary","Mythic","Mythic+"}) do
@@ -149,7 +170,17 @@ if not e.thMigratedV2 then
     sv()
 end
 
-local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-", skills=0}
+local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-", skills=0,
+    expedition="-", expeditions=0, frenzy="-", frenzyBuys=0, rebirth="-", rebirths=0, chests=0, chestHits=0, extras=0, extrasNote="-"}
+e.__thStats = stats   -- exposed for live probes only
+
+-- The game's client managers live on the shared table (ClientExpeditionManager,
+-- ClientPlayerManager, ClientSkyChestManager, ...). Driving them instead of
+-- the raw msgs keeps their request ids / pending flags in sync with the UI.
+local function SH()
+    local ok, s = pcall(function() return (getrenv and getrenv().shared) or shared end)
+    return (ok and type(s) == "table") and s or nil
+end
 
 -- Sliding window for real-time taps/sec display
 local tapTimes = {}
@@ -577,6 +608,285 @@ task.spawn(function()
     end
 end)
 
+-- ---------------------------------------------------------------- Auto Expedition
+-- Everything here goes through shared.ClientExpeditionManager (read out of
+-- the live client): GetSnapshot() -> {Status="Running"|"Completed"|"Claiming"
+-- |nil, CanClaim, CanStart, Ready, Available, RemainingSeconds, Duration},
+-- SetDuration("Short"|"Standard"|"Long") = 4h/8h/12h, AutoSelect() (the
+-- game's own "Auto" button: best 5 idle heroes by Rarity>Tier>Dps>Level),
+-- Clear() + ToggleHero(instanceId) for a hand-picked team of 5,
+-- RequestStartExpedition() -> C2S_ExpeditionStart {RequestId,
+-- HeroInstanceIds, Duration}, RequestClaimExpedition() -> C2S_ExpeditionClaim
+-- once EndsAt has passed. Hero instances sit in _state.Instances with
+-- {InstanceId, Rarity 1-7, Tier, Level, Dps, Active}; Active ones are the
+-- deployed party and are never sent. RequestFinishNow is a Robux product
+-- (FinishProductId) and is never called -- the loop simply waits.
+local function expeditionTeam(em, picks)
+    local inst = em._state and em._state.Instances
+    if type(inst) ~= "table" then return {} end
+    local cand = {}
+    for _, h in ipairs(inst) do
+        if h.Active ~= true and picks[h.Rarity] and not em:IsHeroOnExpedition(h.InstanceId) then
+            cand[#cand + 1] = h
+        end
+    end
+    table.sort(cand, function(a, b)
+        if (a.Rarity or 0) ~= (b.Rarity or 0) then return (a.Rarity or 0) > (b.Rarity or 0) end
+        if (a.Tier or 0) ~= (b.Tier or 0) then return (a.Tier or 0) > (b.Tier or 0) end
+        if (tonumber(a.Dps) or 0) ~= (tonumber(b.Dps) or 0) then return (tonumber(a.Dps) or 0) > (tonumber(b.Dps) or 0) end
+        return (a.Level or 0) > (b.Level or 0)
+    end)
+    return cand
+end
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thExpeditionEnabled then
+            pcall(function()
+                local S = SH()
+                local em = S and S.ClientExpeditionManager
+                if not em then stats.expedition = "manager n/a" return end
+                local snap = em:GetSnapshot()
+                if type(snap) ~= "table" then return end
+                if not (snap.Loaded and snap.ServerLoaded) then
+                    em:RequestData()
+                    stats.expedition = "syncing"
+                    return
+                end
+                if snap.CanClaim or snap.Status == "Completed" then
+                    local ok = em:RequestClaimExpedition()
+                    if ok then stats.expeditions += 1 stats.expedition = ("claimed (%d)"):format(stats.expeditions) end
+                    return
+                end
+                if snap.Status == "Running" then
+                    local left = tonumber(snap.RemainingSeconds) or 0
+                    stats.expedition = ("running %s, %dh %02dm left"):format(tostring(snap.Duration), left // 3600, (left % 3600) // 60)
+                    return
+                end
+                if snap.Status == "Claiming" or snap.Pending or snap.ClaimPending then return end
+                if snap.Available ~= true then stats.expedition = "not available" return end
+                -- idle: build the team and go
+                em:SetDuration(e.thExpeditionDuration)
+                local picks = {}
+                for name, on in pairs(e.thExpeditionRarities) do if on and EXP_RARITY_ID[name] then picks[EXP_RARITY_ID[name]] = true end end
+                local usedAuto = true
+                if next(picks) then
+                    local cand = expeditionTeam(em, picks)
+                    if #cand >= 5 then
+                        em:Clear()
+                        for i = 1, 5 do em:ToggleHero(cand[i].InstanceId) end
+                        usedAuto = false
+                    end
+                end
+                if usedAuto then em:AutoSelect() end
+                local snap2 = em:GetSnapshot()
+                if snap2.Ready and snap2.CanStart ~= false then
+                    local ok, why = em:RequestStartExpedition()
+                    stats.expedition = ok and ("started %s (%s)"):format(tostring(e.thExpeditionDuration), usedAuto and "auto" or "picked")
+                        or ("start refused: " .. tostring(why))
+                else
+                    stats.expedition = "team not ready"
+                end
+            end)
+        end
+        task.wait(20)
+    end
+end)
+
+-- ---------------------------------------------------------------- Auto Buy Tap Frenzy (diamonds)
+-- Store "Tap Frenzy" = product 3629007156 (GameSettings.TapFrenzy: +90s of
+-- 20 auto-taps/s per buy, buys stack onto the timer). Diamond price comes
+-- from ClientConfigManager.Product:Get(id).diamond (140 on this build);
+-- C2S_BuyStoreUtilityWithDiamond(productId) is the store button. The live
+-- timer is ClientPlayerManager:GetTapTempBuffs()["Product:TapFrenzy"]
+-- .LeftTime -- re-bought when it drops under 5s (or is gone).
+local FRENZY_PRODUCT = 3629007156
+local function frenzyLeft()
+    local S = SH()
+    local pm = S and S.ClientPlayerManager
+    if not pm then return nil end
+    local ok, buffs = pcall(function() return pm:GetTapTempBuffs() end)
+    local b = ok and type(buffs) == "table" and buffs["Product:TapFrenzy"] or nil
+    return b and tonumber(b.LeftTime) or 0
+end
+local function frenzyPrice()
+    local S = SH()
+    local ok, p = pcall(function() return S.ClientConfigManager.Product:Get(FRENZY_PRODUCT) end)
+    local price = ok and type(p) == "table" and tonumber(p.diamond) or nil
+    return price or 140
+end
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thFrenzyEnabled then
+            pcall(function()
+                local left = frenzyLeft()
+                if left == nil then stats.frenzy = "manager n/a" return end
+                if left > 5 then stats.frenzy = ("%ds left (%d buys)"):format(left, stats.frenzyBuys) return end
+                local S = SH()
+                local dia = 0
+                pcall(function() dia = S.ClientPlayerManager:GetPlayerDiamond() or 0 end)
+                local price = frenzyPrice()
+                if dia < price then stats.frenzy = ("need %d diamonds (have %d)"):format(price, dia) return end
+                local ok, res = req(Msg.C2S_BuyStoreUtilityWithDiamond, FRENZY_PRODUCT)
+                if ok and res ~= false then
+                    stats.frenzyBuys += 1
+                    stats.frenzy = ("bought (%d)"):format(stats.frenzyBuys)
+                    task.wait(3)
+                else
+                    stats.frenzy = "buy refused"
+                end
+            end)
+        end
+        task.wait(5)
+    end
+end)
+
+-- ---------------------------------------------------------------- Auto Rebirth
+-- C2S_TapRequestRebirthInfo -> S2C_TapRebirthInfo {CanRebirth, Stage,
+-- HighestStage, TotalHeroLevel, NeedHeroLevel, RebirthCount}; the confirm
+-- button is C2S_TapConfirmRebirth (no args), result on S2C_TapRebirthResult.
+-- Gated on the game's own CanRebirth AND a minimum current Stage so a run
+-- isn't reset the moment the hero-level requirement is met.
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thRebirthEnabled then
+            pcall(function()
+                req(Msg.C2S_TapRequestRebirthInfo)
+                task.wait(0.7)
+                local info = latest[Msg.S2C_TapRebirthInfo] and latest[Msg.S2C_TapRebirthInfo][1]
+                if type(info) ~= "table" then stats.rebirth = "no info" return end
+                local stage = tonumber(info.Stage) or 0
+                local minStage = tonumber(e.thRebirthMinStage) or 0
+                if not info.CanRebirth then
+                    stats.rebirth = ("not ready (hero lv %s / need %s)"):format(tostring(info.TotalHeroLevel), tostring(info.NeedHeroLevel))
+                elseif stage < minStage then
+                    stats.rebirth = ("waiting for stage %d (now %d)"):format(minStage, stage)
+                else
+                    local ok, res = req(Msg.C2S_TapConfirmRebirth)
+                    task.wait(1)
+                    local r = latest[Msg.S2C_TapRebirthResult] and latest[Msg.S2C_TapRebirthResult][1]
+                    if ok and res ~= false then
+                        stats.rebirths += 1
+                        stats.rebirth = ("rebirthed (%d)%s"):format(stats.rebirths, type(r) == "table" and r.Info and (" count=" .. tostring(r.Info.RebirthCount)) or "")
+                    else
+                        stats.rebirth = "refused"
+                    end
+                end
+            end)
+        end
+        task.wait(10)
+    end
+end)
+
+-- ---------------------------------------------------------------- Auto Sky Chest
+-- S2C_TapSkyChestSpawn {ChestUid, ...} announces the flying chest; the
+-- game's own click handler is C2S_TapHitSkyChest(ChestUid) once per tap.
+-- Hit it every 0.2s from the spawn event until S2C_TapSkyChestRemoved /
+-- Reward lands (or 80 hits, whichever first).
+local chestGen = 0
+local function hitChest(uid)
+    chestGen += 1
+    local myGen = chestGen
+    local hits = 0
+    task.spawn(function()
+        while getgenv().__TH == G and e.thSkyChestEnabled and chestGen == myGen and hits < 80 do
+            local S = SH()
+            local mgr = S and S.ClientSkyChestManager
+            if mgr and mgr.ActiveChest == nil then break end
+            local ok, res = req(Msg.C2S_TapHitSkyChest, uid)
+            if not ok or res == false then break end
+            hits += 1
+            stats.chestHits += 1
+            task.wait(0.2)
+        end
+    end)
+end
+sn.OnClientEvent:Connect(function(payload)
+    if getgenv().__TH ~= G then return end
+    local m = payload and payload[1]
+    if not (m and m.msgID) then return end
+    if m.msgID == Msg.S2C_TapSkyChestSpawn and e.thSkyChestEnabled then
+        local d = m.msgData and m.msgData[1]
+        local uid = type(d) == "table" and d.ChestUid or d
+        if uid then hitChest(uid) end
+    elseif m.msgID == Msg.S2C_TapSkyChestRemoved then
+        chestGen += 1
+    elseif m.msgID == Msg.S2C_TapSkyChestReward then
+        stats.chests += 1
+        chestGen += 1
+    elseif m.msgID == Msg.S2C_OfflineRewardData and e.thExtrasEnabled then
+        -- the free "claim" path of the offline-reward popup (the paid
+        -- multiplier is a Robux product and is never touched)
+        task.delay(1, function() if req(Msg.C2S_ClaimOfflineReward) then stats.extras += 1 stats.extrasNote = "offline reward" end end)
+    end
+end)
+task.spawn(function()
+    -- a chest already up when the script loads
+    task.wait(2)
+    local S = SH()
+    local mgr = S and S.ClientSkyChestManager
+    local c = mgr and mgr.ActiveChest
+    if c and c.ChestUid and e.thSkyChestEnabled then hitChest(c.ChestUid) end
+end)
+
+-- ---------------------------------------------------------------- Auto Equip Best Heroes
+-- C2S_TapAutoEquipHeroes is the Heroes tab's "Auto" deploy button (server
+-- picks the party). Re-run every minute so new recruits get slotted.
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thEquipBestEnabled then req(Msg.C2S_TapAutoEquipHeroes) end
+        task.wait(60)
+    end
+end)
+
+-- ---------------------------------------------------------------- Auto Claim Extras
+-- Online gift (ClientOnlineGiftManager.State {Claimed, ReadyAtServerTime}
+-- -> C2S_ClaimOnlineGift), seven-day login gift (GetLoginRewardInfo()
+-- {RewardsCanClaimed[i], RewardsClaimed[i]} -> C2S_ClaimSevenDayGift(i)),
+-- mail attachments (C2S_MailRequestData -> S2C_MailData {Mails} ->
+-- C2S_MailClaim(id)). Offline reward is handled on its data event above.
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thExtrasEnabled then
+            pcall(function()
+                local S = SH()
+                if not S then return end
+                local og = S.ClientOnlineGiftManager
+                if og and type(og.State) == "table" and og.State.Claimed ~= true and og.GetRemaining and og:GetRemaining() <= 0 then
+                    if req(Msg.C2S_ClaimOnlineGift) then stats.extras += 1 stats.extrasNote = "online gift" end
+                end
+                local sd = S.ClientSevenDayManager
+                local info = sd and sd.GetLoginRewardInfo and sd:GetLoginRewardInfo()
+                if type(info) == "table" then
+                    local can, done = info.RewardsCanClaimed or {}, info.RewardsClaimed or {}
+                    for i = 1, 7 do
+                        if can[i] == true and done[i] ~= true then
+                            if req(Msg.C2S_ClaimSevenDayGift, i) then stats.extras += 1 stats.extrasNote = "7-day gift " .. i end
+                            task.wait(0.5)
+                        end
+                    end
+                end
+                req(Msg.C2S_MailRequestData)
+                task.wait(1)
+                local md = latest[Msg.S2C_MailData] and latest[Msg.S2C_MailData][1]
+                local mails = type(md) == "table" and md.Mails
+                if type(mails) == "table" then
+                    for _, mail in pairs(mails) do
+                        if type(mail) == "table" then
+                            local id = mail.Id or mail.MailId or mail.Uid or mail.id
+                            local has = mail.Attachments or mail.Rewards or mail.Items or mail.HasAttachment
+                            if id and has and mail.Claimed ~= true and mail.Status ~= "Claimed" then
+                                if req(Msg.C2S_MailClaim, id) then stats.extras += 1 stats.extrasNote = "mail" end
+                                task.wait(0.5)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+        task.wait(60)
+    end
+end)
+
 -- ---------------------------------------------------------------- Anti-AFK
 local VirtualUser = game:GetService("VirtualUser")
 plr.Idled:Connect(function()
@@ -709,7 +1019,91 @@ L:Dropdown({
     end,
 }, "thDungeonSelected")
 
+L:Header({Text="Expedition"})
+L:Toggle({
+    Name="Auto Expedition (claim + restart loop)",
+    Default=e.thExpeditionEnabled,
+    Callback=function(v) e.thExpeditionEnabled=v; sv() end
+}, "thExpeditionEnabled")
+L:Dropdown({
+    Name="Expedition Rarities (empty = Auto Select Best)", Multi=true, Search=false,
+    Options=EXP_RARITY_NAMES, Default=setToArray(e.thExpeditionRarities),
+    Callback=function(sel)
+        local set={}
+        for name in pairs(sel) do set[name]=true end
+        e.thExpeditionRarities=set; sv()
+    end,
+}, "thExpeditionRarities")
+local EXP_DUR_LABELS = {}
+for i, d in ipairs(EXP_DURATIONS) do EXP_DUR_LABELS[i] = d[1] end
+local function expDurIndex()
+    for i, d in ipairs(EXP_DURATIONS) do if d[2] == e.thExpeditionDuration then return i end end
+    return 2
+end
+L:Dropdown({
+    Name="Expedition Duration", Multi=false, Required=true,
+    Options=EXP_DUR_LABELS, Default=expDurIndex(),   -- single-select Default is an INDEX
+    Callback=function(v)
+        local picked = type(v)=="table" and v[1] or v
+        for _, d in ipairs(EXP_DURATIONS) do
+            if d[1] == picked then e.thExpeditionDuration = d[2]; sv() end
+        end
+    end,
+}, "thExpeditionDuration")
+L:Label({Text="Picks the 5 best idle heroes of the chosen rarities (or the\ngame's own Auto Select when nothing is picked), starts the run,\nclaims it when the timer ends and starts the next one."})
+
+L:Header({Text="Store"})
+L:Toggle({
+    Name="Auto Buy Tap Frenzy (diamonds, 90s each)",
+    Default=e.thFrenzyEnabled,
+    Callback=function(v) e.thFrenzyEnabled=v; sv() end
+}, "thFrenzyEnabled")
+L:Label({Text="Re-buys the moment the Frenzy timer runs out. Spends\ndiamonds every ~90s while on -- opt-in on purpose."})
+
+L:Header({Text="Rebirth"})
+L:Toggle({
+    Name="Auto Rebirth",
+    Default=e.thRebirthEnabled,
+    Callback=function(v) e.thRebirthEnabled=v; sv() end
+}, "thRebirthEnabled")
+local REBIRTH_STAGE_OPTIONS, REBIRTH_STAGE_LEVELS = {"As soon as allowed"}, {0}
+for lv = 10, 1000, 10 do
+    REBIRTH_STAGE_OPTIONS[#REBIRTH_STAGE_OPTIONS + 1] = ("Stage %d"):format(lv)
+    REBIRTH_STAGE_LEVELS[#REBIRTH_STAGE_LEVELS + 1] = lv
+end
+local function rebirthStageIndex(level)
+    for i, lv in ipairs(REBIRTH_STAGE_LEVELS) do if lv == level then return i end end
+    return 1
+end
+L:Dropdown({
+    Name="Rebirth At Stage", Multi=false, Required=true, Search=true,
+    Options=REBIRTH_STAGE_OPTIONS, Default=rebirthStageIndex(e.thRebirthMinStage),
+    Callback=function(v)
+        local picked = type(v)=="table" and v[1] or v
+        if type(picked) ~= "string" then return end
+        e.thRebirthMinStage = tonumber(picked:match("%d+")) or 0
+        sv()
+    end,
+}, "thRebirthMinStage")
+L:Label({Text="Fires only when the game reports CanRebirth AND the current\nstage is at or past the pick."})
+
 local R = Tabs.Farm:Section({Side="Right"})
+R:Header({Text="Extras"})
+R:Toggle({
+    Name="Auto Sky Chest",
+    Default=e.thSkyChestEnabled,
+    Callback=function(v) e.thSkyChestEnabled=v; sv() end
+}, "thSkyChestEnabled")
+R:Toggle({
+    Name="Auto Equip Best Heroes",
+    Default=e.thEquipBestEnabled,
+    Callback=function(v) e.thEquipBestEnabled=v; sv() end
+}, "thEquipBestEnabled")
+R:Toggle({
+    Name="Auto Claim Online / 7-Day / Mail / Offline",
+    Default=e.thExtrasEnabled,
+    Callback=function(v) e.thExtrasEnabled=v; sv() end
+}, "thExtrasEnabled")
 R:Header({Text="Dailies"})
 R:Toggle({
     Name="Auto Daily Reward + Tasks",
@@ -757,9 +1151,14 @@ task.spawn(function()
                 "Upgrades: %d\n" ..
                 "Dungeon: %s\n" ..
                 "Daily: %s\n" ..
-                "Achievements: %d"
+                "Achievements: %d\n" ..
+                "Expedition: %s\n" ..
+                "Tap Frenzy: %s\n" ..
+                "Rebirth: %s\n" ..
+                "Sky chests: %d (%d hits) | Extras: %d (%s)"
             ):format(rate, stats.taps, stats.boss, stats.skills, stats.recruits, stats.upgrades,
-                     stats.dungeon, stats.daily, stats.achievements))
+                     stats.dungeon, stats.daily, stats.achievements,
+                     stats.expedition, stats.frenzy, stats.rebirth, stats.chests, stats.chestHits, stats.extras, stats.extrasNote))
         end)
     end
 end)
