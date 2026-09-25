@@ -756,29 +756,72 @@ plr.Idled:Connect(function()
 		VirtualUser:ClickButton2(Vector2.new())
 	end
 end)
--- Idled only answers Roblox's own 20-minute idle kick. This place kicked a
--- ring-parked account (WalkSpeed 0, no input for hours) and then hopped it
--- to a new server through its reconnect flow -- that is the game's own
--- idle tracking, which Idled never sees. A real key event (F15: unbound in
--- Roblox and in this game) every 30s plus a one-pixel mouse nudge counts
--- as input for both.
+-- Three layers, because three different things can decide you're AFK:
+--   1. Roblox's own 20-minute idle kick -- answered by plr.Idled above
+--      (VirtualUser click), the standard fix.
+--   2. Anything client-side that watches input -- a real F15 key event
+--      (unbound in Roblox and in this game) plus a one-pixel mouse nudge
+--      every 30s.
+--   3. The SERVER, which sees none of that. It only sees what replicates:
+--      the character's position. Read out of Chekkadeiz's Roblox log:
+--      the game teleported the account to a fresh server at 19:04 and
+--      again at 19:44 (~40 min apart) with no kick/disconnect line before
+--      either -- a server-side idle sweep. The character had not moved a
+--      stud in that time (wave sniping is remote-only, the ring pins it,
+--      and no client script in this place tracks idle at all -- searched).
+--      So every 5 minutes the character takes a real step: out of the
+--      ring if it's in one (the ring loop puts it straight back), a few
+--      studs and back otherwise, plus a jump. That is what a human at the
+--      keyboard looks like to a server.
+local VIM = game:GetService("VirtualInputManager")
+local function inputNudge()
+	VIM:SendKeyEvent(true, Enum.KeyCode.F15, false, game)
+	task.wait(0.05)
+	VIM:SendKeyEvent(false, Enum.KeyCode.F15, false, game)
+	local cam = workspace.CurrentCamera
+	if cam then
+		VirtualUser:CaptureController()
+		VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2 + 1, cam.ViewportSize.Y / 2))
+		task.wait(0.1)
+		VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2))
+	end
+end
+local function afkStep()
+	local char = plr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and hrp) or hum.Health <= 0 then return false end
+	if plr:GetAttribute("IsWaveActive") then return false end   -- mid-wave: don't yank the character
+	local tc = trainingController()
+	local wasInRing = tc and tc.IsTraining and tc:IsTraining()
+	if wasInRing then
+		pcall(function() tc:StopTraining(true) end)   -- StopTraining itself shoves the character 12 studs out
+		task.wait(0.4)
+	end
+	if hum.WalkSpeed <= 0 then hum.WalkSpeed = 16 end
+	local start = hrp.Position
+	local dir = hrp.CFrame.LookVector
+	hum:MoveTo(start + dir * 4)
+	task.wait(1.2)
+	hum.Jump = true
+	task.wait(0.8)
+	hum:MoveTo(start)
+	task.wait(1.2)
+	stats.note = ("afk step %s"):format(os.date("%H:%M"))
+	-- ring mode re-enters on its own next tick (IsTraining false now)
+	return true
+end
+e.__osAfkStep = afkStep   -- exposed for live probes only
 task.spawn(function()
-	local VIM = game:GetService("VirtualInputManager")
+	local lastStep = os.clock()
 	while getgenv().__OS == G do
 		task.wait(30)
 		if e.osAntiAFK then
-			pcall(function()
-				VIM:SendKeyEvent(true, Enum.KeyCode.F15, false, game)
-				task.wait(0.05)
-				VIM:SendKeyEvent(false, Enum.KeyCode.F15, false, game)
-				local cam = workspace.CurrentCamera
-				if cam then
-					VirtualUser:CaptureController()
-					VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2 + 1, cam.ViewportSize.Y / 2))
-					task.wait(0.1)
-					VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2))
-				end
-			end)
+			pcall(inputNudge)
+			if os.clock() - lastStep >= 300 then
+				lastStep = os.clock()
+				pcall(afkStep)
+			end
 		end
 	end
 end)
