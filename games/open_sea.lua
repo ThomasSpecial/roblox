@@ -152,7 +152,7 @@ end
 local SF = "OpenSea/state.json"
 local SK = {
 	"osWave", "osHuntBoss", "osMinRarity", "osSpecificEgg", "osMutations", "osWaveDelay",
-	"osSellEggs", "osSellRarities", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
+	"osSellEggs", "osSellRarities", "osSellUpToEgg", "osSellMutations", "osSellSizes", "osHatch", "osEquipBest", "osSellAnimals", "osOfflineCash",
 	"osTrain", "osTrainRing", "osBuyDumbbell", "osBuyStaff",
 	"osUpPlot", "osUpSpeed", "osUpCarry", "osRebirth", "osRebirthTarget",
 	"osPlaytime", "osDaily", "osFreeShop", "osSpin", "osGroup", "osSeasonPass", "osQuests",
@@ -194,6 +194,7 @@ end
 -- mutation AND size are both in the picks (arrays of names, the shape
 -- MacLib's multi Default wants back). Empty pick = that filter is off.
 if type(e.osSellMutations) ~= "table" then e.osSellMutations = {"NORMAL"} end
+if type(e.osSellUpToEgg) ~= "string" then e.osSellUpToEgg = "None" end   -- "None" = use the rarity picks
 if type(e.osSellSizes) ~= "table" then e.osSellSizes = {} end
 def("osHatch", true); def("osEquipBest", true); def("osSellAnimals", false); def("osOfflineCash", true)
 def("osTrain", true); def("osTrainRing", true); def("osBuyDumbbell", true); def("osBuyStaff", true)
@@ -240,6 +241,18 @@ for i, r in ipairs(RARITIES) do MIN_RARITY_OPTIONS[i] = (i == 1) and "All (Commo
 local SELL_OPTIONS = {}
 for _, r in ipairs(RARITIES) do SELL_OPTIONS[#SELL_OPTIONS + 1] = r end
 local function rankOf(eggType) return RARITY_RANK[EGG_RARITY[eggType] or "Common"] or 1 end
+-- Egg TIER is the game's own ladder (EggsConfig.EGGS[id].tier): basic 1 ...
+-- mouse 11, polarbear 12, seal 13, gorilla 14, ocean 16, deer 17, sleepy 18,
+-- glacial 19, mamut/volt 100, dragon 105 -- finer than the rarity buckets
+-- (three different eggs are all "SPECIAL"), so "this egg and up / and
+-- below" is decided on tier. Falls back to the rarity rank if the config
+-- can't be read.
+local function eggTier(eggType)
+	local ec = cfg("EggsConfig")
+	local rec = ec and type(ec.EGGS) == "table" and ec.EGGS[eggType]
+	local t = rec and tonumber(rec.tier)
+	return t or rankOf(eggType)
+end
 -- Mutation / size vocab, read from the game's own configs (inventory eggs
 -- carry innerEntity.mutation -- nil meaning NORMAL -- and innerEntity.size).
 -- Seen live: mutation GOLD/DIAMOND/RAINBOW/RADIOACTIVE, size baby/big.
@@ -333,7 +346,8 @@ local function bestSpawn(spawns)
 		if eggType then
 			local rank = rankOf(eggType)
 			local isBoss = (s.bossId ~= nil) or eggType == "dragon_egg" or eggType == "polarbear_egg" or eggType == "mouse_egg"
-			if (specific == nil or eggType == specific) and rank >= minRank then
+			-- "Target egg" means that egg AND everything above it on the tier ladder
+			if (specific == nil or eggTier(eggType) >= eggTier(specific)) and rank >= minRank then
 				local score = rank * 10000
 				if isBoss then score += (e.osHuntBoss and 200000 or 50000) end
 				if ent.mutation and ent.mutation ~= "NORMAL" then score += (e.osMutations and 30000 or 5000) end
@@ -394,12 +408,22 @@ local function sellEggs()
 	local d = pdata()
 	if not (d and d.Inventory) then return 0 end
 	local picks = type(e.osSellRarities) == "table" and e.osSellRarities or {}
-	if #picks == 0 then return 0 end
+	-- "Sell this egg and below": when an egg is picked here it replaces the
+	-- rarity picks -- every egg whose tier is at or under the picked one sells
+	local upToId = EGG_ID_BY_NAME[e.osSellUpToEgg]
+	local upToTier = upToId and eggTier(upToId) or nil
+	if not upToTier and #picks == 0 then return 0 end
 	local sold = 0
 	for id, it in pairs(d.Inventory) do
 		if it.itemType == "Egg" and it.innerEntity and it.innerEntity.eggType then
-			local r = EGG_RARITY[it.innerEntity.eggType] or "Common"
-			local want = table.find(picks, r) ~= nil
+			local eggType = it.innerEntity.eggType
+			local r = EGG_RARITY[eggType] or "Common"
+			local want
+			if upToTier then
+				want = eggTier(eggType) <= upToTier
+			else
+				want = table.find(picks, r) ~= nil
+			end
 			local mutation = it.innerEntity.mutation or "NORMAL"
 			local size = it.innerEntity.size or "baby"
 			if want and not inPick(e.osSellMutations, mutation) then want = false end
@@ -872,7 +896,7 @@ SL:Dropdown({
 	end,
 }, "osMinRarity")
 SL:Dropdown({
-	Name = "Target Specific Egg", Multi = false, Required = true, Search = true,
+	Name = "Take This Egg And Up", Multi = false, Required = true, Search = true,
 	Options = EGG_NAME_OPTIONS, Default = indexOf(EGG_NAME_OPTIONS, e.osSpecificEgg),
 	Callback = function(v)
 		local picked = type(v) == "table" and v[1] or v
@@ -905,6 +929,18 @@ SL:Dropdown({
 	Options = SELL_OPTIONS, Default = e.osSellRarities,
 	Callback = function(v) e.osSellRarities = multiPick(v, SELL_OPTIONS, {}); sv() end,
 }, "osSellRarities")
+local SELL_UPTO_OPTIONS = {"None (use rarities)"}
+for _, p in ipairs(EGG_LIST) do SELL_UPTO_OPTIONS[#SELL_UPTO_OPTIONS + 1] = p[1] end
+SL:Dropdown({
+	Name = "Sell This Egg And Below", Multi = false, Required = true, Search = true,
+	Options = SELL_UPTO_OPTIONS, Default = indexOf(SELL_UPTO_OPTIONS, e.osSellUpToEgg),
+	Callback = function(v)
+		local picked = type(v) == "table" and v[1] or v
+		if type(picked) ~= "string" then return end
+		e.osSellUpToEgg = EGG_ID_BY_NAME[picked] and picked or "None"
+		sv()
+	end,
+}, "osSellUpToEgg")
 SL:Dropdown({
 	Name = "Sell Mutations", Multi = true, Required = false,
 	Options = MUTATION_OPTIONS, Default = idsToLabels(e.osSellMutations, MUTATION_LABEL_BY_ID),
@@ -915,7 +951,7 @@ SL:Dropdown({
 	Options = SIZE_OPTIONS, Default = idsToLabels(e.osSellSizes, SIZE_LABEL_BY_ID),
 	Callback = function(v) e.osSellSizes = multiPick(v, SIZE_OPTIONS, SIZE_ID_BY_LABEL); sv() end,
 }, "osSellSizes")
-SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\nAn egg sells only when its rarity is picked AND mutation AND size\nmatch. Empty rarity pick sells nothing; empty mutation/size pick =\nno filter on that. Default keeps every mutated egg (only Normal sold)."})
+SL:Label({Text = "(xN) = the game's cash multiplier for that mutation / size.\n\"Sell This Egg And Below\" picks by the game's tier ladder (Polarbear\n= everything up to Polarbear) and overrides the rarity picks; None =\nuse rarities. Mutation AND size must still match. Empty mutation/size\npick = no filter. Default keeps every mutated egg (only Normal sold)."})
 SL:Toggle({Name = "Auto Sell Eggs (by picks)", Default = e.osSellEggs, Callback = function(v) e.osSellEggs = v; sv() end}, "osSellEggs")
 SL:Button({Name = "Sell Picked Eggs Now", Callback = function()
 	task.spawn(function() local n = sellEggs() notify("Sold", ("%d eggs (%s)"):format(n, table.concat(e.osSellRarities or {}, ", "))) end)
