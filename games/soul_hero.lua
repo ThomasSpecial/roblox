@@ -2108,6 +2108,9 @@ IL:Input({
 	Name = "Keep At Least (souls)", Placeholder = "0 = spend everything",
 	Default = tostring(e.shSummonKeepSouls),
 	AcceptedCharacters = function(t) return (tostring(t):gsub("%D", "")) end,
+	-- onChanged saves per keystroke; Callback (FocusLost) alone missed a
+	-- value typed and then left alone
+	onChanged = function(t) e.shSummonKeepSouls = tonumber(t) or 0; sv() end,
 	Callback = function(t) e.shSummonKeepSouls = tonumber(t) or 0; sv() end,
 }, "shSummonKeepSouls")
 IL:Dropdown({

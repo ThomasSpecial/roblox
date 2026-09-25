@@ -1076,6 +1076,13 @@ L:Input({
     Name="Keep At Least (diamonds)", Placeholder="0 = spend everything",
     Default=tostring(e.thFrenzyMinDiamonds),
     AcceptedCharacters=function(t) return (tostring(t):gsub("%D", "")) end,
+    -- MacLib fires Callback only on FocusLost (Enter / click away); a value
+    -- typed and then left alone never reached it. onChanged fires per
+    -- keystroke, so the number is live and saved as it is typed.
+    onChanged=function(t)
+        e.thFrenzyMinDiamonds = tonumber(t) or 0
+        sv()
+    end,
     Callback=function(t)
         e.thFrenzyMinDiamonds = tonumber(t) or 0
         sv()
