@@ -756,6 +756,32 @@ plr.Idled:Connect(function()
 		VirtualUser:ClickButton2(Vector2.new())
 	end
 end)
+-- Idled only answers Roblox's own 20-minute idle kick. This place kicked a
+-- ring-parked account (WalkSpeed 0, no input for hours) and then hopped it
+-- to a new server through its reconnect flow -- that is the game's own
+-- idle tracking, which Idled never sees. A real key event (F15: unbound in
+-- Roblox and in this game) every 30s plus a one-pixel mouse nudge counts
+-- as input for both.
+task.spawn(function()
+	local VIM = game:GetService("VirtualInputManager")
+	while getgenv().__OS == G do
+		task.wait(30)
+		if e.osAntiAFK then
+			pcall(function()
+				VIM:SendKeyEvent(true, Enum.KeyCode.F15, false, game)
+				task.wait(0.05)
+				VIM:SendKeyEvent(false, Enum.KeyCode.F15, false, game)
+				local cam = workspace.CurrentCamera
+				if cam then
+					VirtualUser:CaptureController()
+					VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2 + 1, cam.ViewportSize.Y / 2))
+					task.wait(0.1)
+					VirtualUser:MoveMouse(Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2))
+				end
+			end)
+		end
+	end
+end)
 if not getgenv().__OSReconnectHooked then
 	getgenv().__OSReconnectHooked = true
 	Players.PlayerRemoving:Connect(function(p)
