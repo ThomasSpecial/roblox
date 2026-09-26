@@ -176,7 +176,7 @@ end
 
 local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-", skills=0,
     expedition="-", expeditions=0, frenzy="-", frenzyBuys=0, rebirth="-", rebirths=0, chests=0, chestHits=0, extras=0, extrasNote="-",
-    achievementNote="-"}
+    achievementNote="-", gameAutoTap="-", gameAutoTapFixes=0}
 e.__thStats = stats   -- exposed for live probes only
 
 -- The game's client managers live on the shared table (ClientExpeditionManager,
@@ -689,6 +689,39 @@ task.spawn(function()
             end
         end
         task.wait(30)
+    end
+end)
+
+-- ---------------------------------------------------------------- Game Auto Tap keeper
+-- The game's OWN auto-tap (the "Auto Tap (ON/OFF)" tab button) is a
+-- separate thing from the 3 click loops above: ClientPlayerManager tracks
+-- it (HasAutoTap / IsAutoTapEnabled / SetAutoTapEnabled ->
+-- C2S_SetAutoTapEnabled, state echoed back on S2C_UpdateAutoTapState).
+-- It can flip OFF on its own (rejoins, its own toggle, a rebirth). While
+-- the Auto Tap toggle is on here, this keeps the game's one ON too --
+-- checked every 10s, re-sent only when it actually reads OFF and no
+-- request is already in flight, so the tap loops above are untouched.
+task.spawn(function()
+    while getgenv().__TH == G do
+        if e.thTapEnabled then
+            pcall(function()
+                local S = SH()
+                local pm = S and S.ClientPlayerManager
+                if not (pm and pm.IsAutoTapEnabled) then return end
+                if pm.HasAutoTap and not pm:HasAutoTap() then return end   -- not unlocked yet
+                if pm.AutoTapRequestPending then return end
+                if not pm:IsAutoTapEnabled() then
+                    if pm.SetAutoTapEnabled then
+                        pm:SetAutoTapEnabled(true)
+                    else
+                        req(Msg.C2S_SetAutoTapEnabled, true)
+                    end
+                    stats.gameAutoTap = ("re-enabled %s"):format(os.date("%H:%M:%S"))
+                    stats.gameAutoTapFixes = (stats.gameAutoTapFixes or 0) + 1
+                end
+            end)
+        end
+        task.wait(10)
     end
 end)
 
@@ -1259,7 +1292,7 @@ task.spawn(function()
         pcall(function()
             local rate = tapRate()
             statusLbl:UpdateName((
-                "Auto Tap: %.1f/s  (%d total)\n" ..
+                "Auto Tap: %.1f/s  (%d total) | game auto-tap kept ON (%d fixes, %s)\n" ..
                 "Boss: %s\n" ..
                 "Skills used: %d\n" ..
                 "Recruits: %d\n" ..
@@ -1271,7 +1304,7 @@ task.spawn(function()
                 "Tap Frenzy: %s\n" ..
                 "Rebirth: %s\n" ..
                 "Sky chests: %d (%d hits) | Extras: %d (%s)"
-            ):format(rate, stats.taps, stats.boss, stats.skills, stats.recruits, stats.upgrades,
+            ):format(rate, stats.taps, stats.gameAutoTapFixes, stats.gameAutoTap, stats.boss, stats.skills, stats.recruits, stats.upgrades,
                      stats.dungeon, stats.daily, stats.achievements, stats.achievementNote,
                      stats.expedition, stats.frenzy, stats.rebirth, stats.chests, stats.chestHits, stats.extras, stats.extrasNote))
         end)
