@@ -175,7 +175,8 @@ if not e.thMigratedV2 then
 end
 
 local stats = {taps=0, recruits=0, dungeon="-", daily="-", achievements=0, upgrades=0, boss="-", skills=0,
-    expedition="-", expeditions=0, frenzy="-", frenzyBuys=0, rebirth="-", rebirths=0, chests=0, chestHits=0, extras=0, extrasNote="-"}
+    expedition="-", expeditions=0, frenzy="-", frenzyBuys=0, rebirth="-", rebirths=0, chests=0, chestHits=0, extras=0, extrasNote="-",
+    achievementNote="-"}
 e.__thStats = stats   -- exposed for live probes only
 
 -- The game's client managers live on the shared table (ClientExpeditionManager,
@@ -417,18 +418,53 @@ end)
 -- stage clearing benefits from these too), and whenever a cast does land
 -- during a live boss fight, that's this loop's 20s poll cadence lining up
 -- with a fight window on its own, not a hard requirement to do so.
-local SKILL_ORDER = {105, 103, 104, 101}   -- buffs first, Heavenly Strike last
+-- 2026-09-26: the account now has SIX skills (ClientPlayerManager:
+-- GetTapSkillsData().Skills = {101..106}) -- 106 Hand of Titan (+gold per
+-- tap) was added since the list above was written, and 102 Shadow Clone
+-- turned out to have its own cooldown/active window like the rest
+-- (SkillCooldowns[102] = {CooldownEndTime, ActiveEndTime}), so "already
+-- self-sustaining" was wrong: it runs only while its ActiveEndTime holds.
+-- So: cast every skill the account actually owns, read from the live
+-- skills data each pass, buffs first and Heavenly Strike (101) last, and
+-- only when its CooldownEndTime has passed -- no more blind pokes.
+local SKILL_PRIORITY = {105, 103, 104, 106, 102, 101}
+local function skillsData()
+    local S = SH()
+    local pm = S and S.ClientPlayerManager
+    if not (pm and pm.GetTapSkillsData) then return nil end
+    local ok, d = pcall(function() return pm:GetTapSkillsData() end)
+    return ok and type(d) == "table" and d or nil
+end
 task.spawn(function()
     while getgenv().__TH == G do
         if e.thSkillsEnabled then
-            for _, id in ipairs(SKILL_ORDER) do
+            local d = skillsData()
+            local owned = d and type(d.Skills) == "table" and d.Skills or nil
+            local cds = d and type(d.SkillCooldowns) == "table" and d.SkillCooldowns or {}
+            local order = {}
+            for _, id in ipairs(SKILL_PRIORITY) do
+                if not owned or owned[tostring(id)] or owned[id] then order[#order + 1] = id end
+            end
+            -- anything the game adds beyond the known ids still gets cast
+            if owned then
+                for k in pairs(owned) do
+                    local id = tonumber(k)
+                    if id and not table.find(order, id) then table.insert(order, #order, id) end   -- before 101
+                end
+            end
+            local now = os.time()
+            for _, id in ipairs(order) do
                 if getgenv().__TH ~= G then break end
-                local ok, res = req(Msg.C2S_TapUseSkill, id)
-                if res == true then stats.skills += 1 end
-                task.wait(0.3)
+                local cd = cds[tostring(id)] or cds[id]
+                local ready = not cd or (tonumber(cd.CooldownEndTime) or 0) <= now
+                if ready then
+                    local ok, res = req(Msg.C2S_TapUseSkill, id)
+                    if res == true then stats.skills += 1 end
+                    task.wait(0.3)
+                end
             end
         end
-        task.wait(20)
+        task.wait(5)
     end
 end)
 
@@ -592,6 +628,15 @@ task.spawn(function()
 end)
 
 -- ---------------------------------------------------------------- Auto Achievement
+-- Achievements are chains (1001 -> 1002 -> ... per chainId); only the
+-- CURRENT step of each chain can be claimed, and only once its metric
+-- reaches the target. The game's own ClientAchievementManager already
+-- computes exactly that: GetCurrentAchievements() -> {Config={id,...},
+-- Current, Target, CanClaim, ChainCompleted}. Claim those with CanClaim via
+-- C2S_TapClaimAchievement(id) (bare id, per its ClaimAchievement()). The
+-- old sweep over every config id fired 37 rejections a pass
+-- ("NotCurrentAchievement" / "TargetNotReached") and claimed nothing extra.
+-- Falls back to that sweep only if the manager can't be reached.
 task.spawn(function()
     local ids = {}
     for k, v in pairs(AchCfg) do
@@ -600,15 +645,50 @@ task.spawn(function()
     table.sort(ids, function(a,b) return tostring(a)<tostring(b) end)
     while getgenv().__TH == G do
         if e.thAchievementEnabled then
-            for _, id in ipairs(ids) do
-                if getgenv().__TH ~= G then break end
-                local ok, res = req(Msg.C2S_TapClaimAchievement, id)
-                local success = (type(res)=="table" and res[1]==true)
-                if success then stats.achievements += 1 end
-                task.wait(0.15)
+            local S = SH()
+            local am = S and S.ClientAchievementManager
+            local list = nil
+            if am and am.GetCurrentAchievements then
+                local ok, l = pcall(function() return am:GetCurrentAchievements() end)
+                if ok and type(l) == "table" then list = l end
+            end
+            if list then
+                local claimable, tried = 0, 0
+                for _, a in ipairs(list) do
+                    if getgenv().__TH ~= G then break end
+                    local id = type(a.Config) == "table" and (a.Config.id or a.Config[1]) or nil
+                    if a.CanClaim and id then
+                        claimable += 1
+                        local ok, res = req(Msg.C2S_TapClaimAchievement, tonumber(id))
+                        tried += 1
+                        if ok and res ~= false then stats.achievements += 1 end
+                        task.wait(0.3)
+                    end
+                end
+                if claimable == 0 then
+                    -- nothing claimable is the normal state; say so instead of "0"
+                    local nearest
+                    for _, a in ipairs(list) do
+                        if not a.ChainCompleted and a.TargetValid and a.Target > 0 then
+                            local pct = math.floor((tonumber(a.Current) or 0) / a.Target * 100)
+                            if not nearest or pct > nearest then nearest = pct end
+                        end
+                    end
+                    stats.achievementNote = nearest and ("none ready, nearest %d%%"):format(math.min(nearest, 99)) or "none ready"
+                else
+                    stats.achievementNote = ("claimed %d"):format(tried)
+                end
+            else
+                for _, id in ipairs(ids) do
+                    if getgenv().__TH ~= G then break end
+                    local ok, res = req(Msg.C2S_TapClaimAchievement, id)
+                    local success = (type(res)=="table" and res[1]==true)
+                    if success then stats.achievements += 1 end
+                    task.wait(0.15)
+                end
             end
         end
-        task.wait(45)
+        task.wait(30)
     end
 end)
 
@@ -730,7 +810,12 @@ task.spawn(function()
                 local price = frenzyPrice()
                 local floor = tonumber(e.thFrenzyMinDiamonds) or 0
                 local underFloor = dia - price < floor
-                if left > 5 then
+                -- Buys STACK onto the running timer (seen live: +~48-90s on top of
+                -- what was left), so re-buying at 15s left costs nothing in
+                -- coverage and removes the gap a "buy at 0" would leave --
+                -- the 5s poll plus the server round trip was showing up as a
+                -- visible break in the 20x auto-tap between buys.
+                if left > 15 then
                     stats.frenzy = ("%ds left (%d buys)%s"):format(left, stats.frenzyBuys,
                         underFloor and (" | next buy paused: keeping %d"):format(floor) or "")
                     return
@@ -750,7 +835,7 @@ task.spawn(function()
                 end
             end)
         end
-        task.wait(5)
+        task.wait(2)
     end
 end)
 
@@ -1181,13 +1266,13 @@ task.spawn(function()
                 "Upgrades: %d\n" ..
                 "Dungeon: %s\n" ..
                 "Daily: %s\n" ..
-                "Achievements: %d\n" ..
+                "Achievements: %d (%s)\n" ..
                 "Expedition: %s\n" ..
                 "Tap Frenzy: %s\n" ..
                 "Rebirth: %s\n" ..
                 "Sky chests: %d (%d hits) | Extras: %d (%s)"
             ):format(rate, stats.taps, stats.boss, stats.skills, stats.recruits, stats.upgrades,
-                     stats.dungeon, stats.daily, stats.achievements,
+                     stats.dungeon, stats.daily, stats.achievements, stats.achievementNote,
                      stats.expedition, stats.frenzy, stats.rebirth, stats.chests, stats.chestHits, stats.extras, stats.extrasNote))
         end)
     end
