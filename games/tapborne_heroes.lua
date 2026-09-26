@@ -817,13 +817,25 @@ end)
 -- timer is ClientPlayerManager:GetTapTempBuffs()["Product:TapFrenzy"]
 -- .LeftTime -- re-bought when it drops under 5s (or is gone).
 local FRENZY_PRODUCT = 3629007156
+-- LeftTime in GetTapTempBuffs() is a SNAPSHOT, not a clock: sampled every
+-- second for 7s it read 31.7 seven times (2026-09-26). It only moves when
+-- the server pushes a new buff state, which is why "buy at 15s left"
+-- kept firing late -- the script believed 31s were left while the real
+-- timer had already run out. So the value is projected: remember when the
+-- snapshot last changed and count down from there. Can go negative (= the
+-- buff has expired and the snapshot never said so) -- that buys too.
+local frenzySnapLeft, frenzySnapAt = nil, 0
 local function frenzyLeft()
     local S = SH()
     local pm = S and S.ClientPlayerManager
     if not pm then return nil end
     local ok, buffs = pcall(function() return pm:GetTapTempBuffs() end)
     local b = ok and type(buffs) == "table" and buffs["Product:TapFrenzy"] or nil
-    return b and tonumber(b.LeftTime) or 0
+    local raw = b and tonumber(b.LeftTime) or 0
+    if raw ~= frenzySnapLeft then
+        frenzySnapLeft, frenzySnapAt = raw, os.clock()
+    end
+    return frenzySnapLeft - (os.clock() - frenzySnapAt)
 end
 local function frenzyPrice()
     local S = SH()
@@ -848,8 +860,8 @@ task.spawn(function()
                 -- coverage and removes the gap a "buy at 0" would leave --
                 -- the 5s poll plus the server round trip was showing up as a
                 -- visible break in the 20x auto-tap between buys.
-                if left > 15 then
-                    stats.frenzy = ("%ds left (%d buys)%s"):format(left, stats.frenzyBuys,
+                if left > 25 then
+                    stats.frenzy = ("%ds left (%d buys)%s"):format(math.max(0, left), stats.frenzyBuys,
                         underFloor and (" | next buy paused: keeping %d"):format(floor) or "")
                     return
                 end
