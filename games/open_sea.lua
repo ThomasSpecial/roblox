@@ -8,7 +8,7 @@
 --     .<Service>.RF/<name> (RemoteFunctions) and .RE/<name> (RemoteEvents).
 --     Services + RF confirmed: WaveService{Start,Finished,...},
 --     EggService{PlaceEgg,HatchEgg}, AnimalService{EquipBest,CollectOfflineCash},
---     InventoryService{SellEgg,SellAllBrainrots}, TrainingService{StartTraining,
+--     InventoryService{SellEgg,SellBrainrot(id),SellBrainrots(ids),SellAll}, TrainingService{StartTraining,
 --     StopTraining,BuyTrainTool,EquipTrainTool,ClaimBonus | RE SpawnBonus},
 --     PickaxeService{BuyPickaxe,EquipPickaxe}, UpgradesService{Upgrade},
 --     RebirthService{Rebirth}, PlaytimeRewardService{ClaimGift},
@@ -212,7 +212,7 @@ def("osPotions", false); def("osPotionTrain", true); def("osPotionCash", true); 
 def("osSpeedEnabled", false); def("osSpeedValue", 46)
 def("osAntiAFK", true); def("osAutoReconnect", true)
 
-local stats = {waves = 0, eggsTaken = 0, lastEgg = "-", eggsSold = 0, placed = 0, hatched = 0,
+local stats = {waves = 0, eggsTaken = 0, lastEgg = "-", eggsSold = 0, animalsSold = 0, placed = 0, hatched = 0,
 	trains = 0, ringStarts = 0, bonuses = 0, buys = 0, upgrades = 0, rebirths = 0, claims = 0, note = "-"}
 e.__osStats = stats   -- exposed for live probes only
 
@@ -450,10 +450,31 @@ local function sellEggs()
 	stats.eggsSold += sold
 	return sold
 end
+-- InventoryService.RF.SellBrainrots takes an array of inventory ids (verified live:
+-- one id -> that animal gone). SellAll with no args is the game's whole-inventory wipe;
+-- never use it here so kept eggs stay untouched.
 local function sellUnusedAnimals()
 	call("AnimalService", "EquipBest")
-	task.wait(0.2)
-	call("InventoryService", "SellAllBrainrots")
+	task.wait(0.3)
+	local d = pdata()
+	if not d or not d.Inventory then return 0 end
+	local ids = {}
+	for id, it in pairs(d.Inventory) do
+		local ie = it.innerEntity
+		if (it.itemType == "Brainrot" or (ie and ie.brainrotType)) and not (ie and ie.locked) then
+			ids[#ids + 1] = id
+		end
+	end
+	if #ids == 0 then return 0 end
+	local sold = 0
+	for i = 1, #ids, 50 do
+		local chunk = {}
+		for j = i, math.min(i + 49, #ids) do chunk[#chunk + 1] = ids[j] end
+		if call("InventoryService", "SellBrainrots", chunk) then sold += #chunk end
+		if i + 50 <= #ids then task.wait(0.1) end
+	end
+	stats.animalsSold += sold
+	return sold
 end
 
 local lastEquipBest, plotFullUntil = 0, 0
@@ -998,7 +1019,7 @@ SL:Toggle({Name = "Auto Hatch Eggs (place + hatch)", Default = e.osHatch, Callba
 SL:Toggle({Name = "Auto Equip Best", Default = e.osEquipBest, Callback = function(v) e.osEquipBest = v; sv() end}, "osEquipBest")
 SL:Toggle({Name = "Auto Sell Unused Animals", Default = e.osSellAnimals, Callback = function(v) e.osSellAnimals = v; sv() end}, "osSellAnimals")
 SL:Button({Name = "Sell Unused Animals Now", Callback = function()
-	task.spawn(function() sellUnusedAnimals() notify("Done", "Equipped best, sold the rest") end)
+	task.spawn(function() local n = sellUnusedAnimals() notify("Done", ("Equipped best, sold %d animals"):format(n)) end)
 end})
 SL:Toggle({Name = "Auto Collect Offline Cash", Default = e.osOfflineCash, Callback = function(v) e.osOfflineCash = v; sv() end}, "osOfflineCash")
 
@@ -1148,8 +1169,8 @@ task.spawn(function()
 			local ae = RS:FindFirstChild("ActiveEvents")
 			local ev = {}
 			if ae then for _, c in ipairs(ae:GetChildren()) do ev[#ev + 1] = c.Name end end
-			seaStatusLbl:UpdateName(("Cash: $%s\nWaves: %d | Eggs taken: %d (last: %s)\nEggs sold: %d | Placed: %d | Hatched: %d\nEvent: %s\n%s"):format(
-				fmt(cash), stats.waves, stats.eggsTaken, stats.lastEgg, stats.eggsSold, stats.placed, stats.hatched,
+			seaStatusLbl:UpdateName(("Cash: $%s\nWaves: %d | Eggs taken: %d (last: %s)\nEggs sold: %d | Animals sold: %d | Placed: %d | Hatched: %d\nEvent: %s\n%s"):format(
+				fmt(cash), stats.waves, stats.eggsTaken, stats.lastEgg, stats.eggsSold, stats.animalsSold, stats.placed, stats.hatched,
 				#ev > 0 and table.concat(ev, ", ") or "none", stats.note))
 		end)
 		pcall(function()
