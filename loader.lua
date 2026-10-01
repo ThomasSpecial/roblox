@@ -19,6 +19,7 @@ local PLACE_SCRIPTS = {
     -- Not ours -- hands off to Ouroboros' CreatorId dispatcher, same as the Grow a
     -- Chicken Fighter entry above.
     [74729868188364]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Fish an Anime RNG
+    [78490532994307]  = "https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/loader.lua",       -- Build An Ant Empire
     -- Dungeon Lootr is a multi-place universe: 106484206883664 is the RELEASE
     -- lobby, 132285059959516 is the [Gameplay] sub-place you get teleported into.
     -- Both need the entry -- a direct join into a gameplay server never touches
