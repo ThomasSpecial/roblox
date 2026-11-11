@@ -34,6 +34,8 @@ local PLACE_SCRIPTS = {
     -- Ours (MacLib), ported from the third-party "2K" gist build after reading
     -- it end to end -- same Knit remotes, our theme, our config file.
     [88047783411976]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/open_sea.lua",         -- Open Sea For Animals
+    [117483759937632] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/hunting_together.lua", -- ⚔️ [DUNGEON] Hunting Together RPG
+    [88452215181406]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pet_hunt_party.lua",   -- [🎉RELEASE] Pet Hunt Party 🐾 RPG
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
