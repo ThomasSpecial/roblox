@@ -535,13 +535,39 @@ local function findBossTarget(hrp)
 	return best
 end
 
+local wdPos, wdAt = nil, os.clock()
 task.spawn(function()
 	while alive() do
 		task.wait(0.12)
-		if not (e.phFarm or e.phBossOn or e.phWBOn) then stats.farm = "ปิดอยู่"; pathReset(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
-		if not hrp then stats.farm = "รอเกิดใหม่"; continue end
+		if not hrp then stats.farm = "รอเกิดใหม่"; wdAt = os.clock(); continue end
+
+		-- WATCHDOG (unattended insurance): if the character is totally frozen -- no
+		-- 4-stud move for 30s -- it's wedged in a state pathTo can't see. Teleport-hop
+		-- a few ground-snapped steps toward the field entrance and re-pick fresh, so
+		-- an overnight AFK run can never sit stuck in one spot.
+		if not wdPos or (hrp.Position - wdPos).Magnitude > 4 then wdPos = hrp.Position; wdAt = os.clock() end
+		if os.clock() - wdAt > 30 then
+			wdAt = os.clock()
+			local f = fieldAt(hrp.Position)
+			local flat = f and f.entrance and Vector3.new(f.entrance.X - hrp.Position.X, 0, f.entrance.Z - hrp.Position.Z)
+			local dir = (flat and flat.Magnitude > 1) and flat.Unit
+				or Vector3.new(math.random() * 2 - 1, 0, math.random() * 2 - 1).Unit
+			for _ = 1, 4 do
+				local hopXZ = hrp.Position + dir * 10
+				HOP_PARAMS.FilterDescendantsInstances = {hrp.Parent, workspace:FindFirstChild("Monsters")}
+				local hit = workspace:Raycast(hopXZ + Vector3.new(0, 12, 0), Vector3.new(0, -80, 0), HOP_PARAMS)
+				if hit then hrp.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3, 0)) end
+				task.wait(0.12)
+			end
+			for k in pairs(skipUntil) do skipUntil[k] = nil end
+			farmTarget = nil; engagingFarm = false; engagingBoss = false; pathReset()
+			wdPos = hrp.Position
+			stats.farm = "แก้ติด (watchdog เด้งหลุด)"
+			continue
+		end
 
 		-- AUTO-WARP: if we're not in the field we should be in (e.g. dumped in town
 		-- after a death, or the selected boss is in another field), walk onto the
