@@ -402,11 +402,17 @@ local function fieldUnlocked(fid)
 	local gold = tonumber(plr:GetAttribute("Gold")) or 0
 	return (not w) or gold >= (tonumber(w.gold) or 0)
 end
--- Which field should we be in right now?
-local function wantedField()
+local function isCombatField(fid)
+	if not fid or fid == "town" then return false end
+	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
+	if not okZ then return false end
+	for _, f in ipairs(Z.fields) do if f.id == fid and f.levels then return true end end
+	return false
+end
+-- Which field should we be in right now? (curId = the field we're standing in)
+local function wantedField(curId)
 	if not e.phAutoWarp then return nil end
-	local myLv = tonumber(plr:GetAttribute("Level")) or 1
-	-- 1) a selected, un-beaten, unlocked field boss -> go to its field (progression)
+	-- 1) Auto Field Boss ON: a selected, un-beaten, unlocked boss -> its field.
 	if e.phBossOn and type(e.phBossPick) == "table" then
 		for _, b in ipairs(FIELD_BOSSES) do
 			if e.phBossPick[b.label] and not beatBoss(b.bossId) and fieldUnlocked(b.fieldId) then
@@ -414,7 +420,13 @@ local function wantedField()
 			end
 		end
 	end
-	-- 2) else the highest unlocked combat field I'm high enough for (best farm spot)
+	-- 2) Already in a real combat field -> STAY. Never zone-hop on my own just
+	--    because levelling unlocked a harder field (user: "กลัวมันไปติดโซนถัดไป").
+	--    Warping then only happens to RECOVER after a death dumps us in town.
+	if isCombatField(curId) then return curId end
+	-- 3) Not in a field (died -> town, etc.): go to the highest unlocked combat
+	--    field I'm high enough for -- i.e. back to where I was farming.
+	local myLv = tonumber(plr:GetAttribute("Level")) or 1
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	if okZ then
 		local best
@@ -574,8 +586,8 @@ task.spawn(function()
 		-- nearest WarpStone and fire the Warp remote. This is what lets farming/boss
 		-- resume after dying instead of standing in town.
 		do
-			local wf = wantedField()
 			local curF = fieldAt(hrp.Position)
+			local wf = wantedField(curF and curF.id)
 			if wf and (not curF or curF.id ~= wf) then
 				engagingFarm = false; engagingBoss = false
 				local stone, sd = nearestStone(hrp.Position)
