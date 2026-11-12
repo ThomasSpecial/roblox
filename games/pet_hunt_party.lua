@@ -66,6 +66,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
+	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -1323,6 +1324,8 @@ end
 -- pet. We used to leave the instant it died, so the loot stayed on the ground. Now
 -- we hold a loot phase: wait for drops, walk onto each one near the corpse.
 local lastBoss, lastBossPos = nil, nil
+local chestIgnore = setmetatable({}, {__mode = "k"})   -- chests that won't open for us
+local chestNear = setmetatable({}, {__mode = "k"})     -- chest -> when we got next to it
 local lootPhase = nil      -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
 -- LootDrops also shows OTHER players' drops, which we can't pick up: ignore what was
 -- already lying there when our boss died, and anything we've stood on for 1.5s that
@@ -1478,6 +1481,9 @@ local function wbWanted()
 		if m:GetAttribute("WorldBoss") and (tonumber(m:GetAttribute("Health")) or 0) > 0 then live = true; break end
 	end
 	if w.state ~= "soon" and not live then return nil end   -- results/cleanup phase: nothing to do
+	-- announced but far off: keep doing whatever we were doing; only head out ~45s
+	-- before landing (warp ~5s + walk ~10s -> on the spot ~30s early, user's choice)
+	if not live and w.at and w.at - workspace:GetServerTimeNow() > 45 then return nil end
 	w.name = name or tostring(w.id)
 	w.live = live
 	return w
@@ -1658,6 +1664,46 @@ task.spawn(function()
 		if e.phBossOn then
 			local boss = findBossTarget(hrp)
 			if boss and boss.PrimaryPart then fightBoss(boss, "ตีบอส"); continue end
+		end
+
+		-- PARTY CHESTS: the server only accepts the Open Chest prompt within ~10 studs
+		-- (tested: fired from 613 studs = rejected), so instead of opening from afar we
+		-- walk to any chest in this field within 150 studs, open it on arrival (the chest
+		-- loop fires the prompt instantly, no hold), then the normal flow resumes. Runs
+		-- only when no boss needed us this tick. A chest we've stood next to for 4s
+		-- that's still there isn't ours to open -> ignored.
+		if e.phChest and e.phChestWalk then
+			local myF = fieldAt(hrp.Position)
+			local best, bestD
+			for _, ch in ipairs(workspace:GetChildren()) do
+				if ch.Name == "Party Chest" and not chestIgnore[ch] then
+					local base = ch:FindFirstChild("Base")
+					local prompt = base and base:FindFirstChildWhichIsA("ProximityPrompt")
+					if base and prompt and prompt.Enabled then
+						local cf = fieldAt(base.Position)
+						local d = flatDist(base.Position, hrp.Position)
+						if d <= 150 and (not myF or (cf and cf.id == myF.id)) and (not best or d < bestD) then best, bestD = ch, d end
+					end
+				end
+			end
+			if best then
+				local base = best.Base
+				wdAt = os.clock()
+				if bestD > 6 then
+					chestNear[best] = nil
+					setAuto(false)
+					pathTo(hum, hrp, base.Position)
+					stats.farm = ("ไปเปิดกล่องปาร์ตี้ (ห่าง %.0f)"):format(bestD)
+				else
+					pathReset()
+					local prompt = base:FindFirstChildWhichIsA("ProximityPrompt")
+					if prompt then pcall(fireproximityprompt, prompt) end
+					chestNear[best] = chestNear[best] or os.clock()
+					if os.clock() - chestNear[best] > 4 then chestIgnore[best] = true end
+					stats.farm = "เปิดกล่องปาร์ตี้"
+				end
+				continue
+			end
 		end
 
 		-- no boss up: any boss mode on -> walk back to the saved farm spot after a
@@ -2108,7 +2154,9 @@ FL:Label({Text = "เช่น อยากตีมอนต่ำกว่า�
 FL:Header({Text = "Auto Open Chest"})
 FL:Toggle({Name = "เปิด Auto Open Chest (เปิดกล่องปาร์ตี้ทันที)", Default = e.phChest,
 	Callback = function(v) e.phChest = v; sv() end}, "PHChest")
-FL:Label({Text = "เปิดกล่องปาร์ตี้ที่ตกตอนฟาร์มให้ทันทีเมื่ออยู่ในระยะ"})
+FL:Toggle({Name = "└ เดินไปเปิดกล่องที่อยู่ใกล้ (ไม่เกิน 150 studs)", Default = e.phChestWalk,
+	Callback = function(v) e.phChestWalk = v; sv() end}, "PHChestWalk")
+FL:Label({Text = "เปิดกล่องปาร์ตี้ทันทีเมื่ออยู่ในระยะ (เซิร์ฟเวอร์ตรวจระยะ ~10 studs\nเปิดจากไกลไม่ได้) · ถ้ามีกล่องในฟิลด์เดียวกันจะเดินไปเปิดแล้วกลับมาทำต่อ\n(ไม่ไปตอนตีบอส)"})
 
 local FR = Tabs.Farm:Section({Side = "Right"})
 FR:Header({Text = "สถานะ"})
