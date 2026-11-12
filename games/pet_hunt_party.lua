@@ -778,9 +778,16 @@ local function farmSpotField()
 	local f = fieldAt(Vector3.new(fp.x, fp.y, fp.z))
 	return f and f.id
 end
+local wbWantedFwd   -- = wbWanted (world boss section below)
 local function wantedField(curId)
 	if not e.phAutoWarp then return nil end
 	local myLv = tonumber(plr:GetAttribute("Level")) or 1
+	-- 0) Auto World Boss: announced ("soon") or live world boss that passes the
+	--    filters -> its field, ahead of everything else (it's rare and timed)
+	if wbWantedFwd then
+		local w = wbWantedFwd()
+		if w and w.field and (w.field == curId or fieldUnlocked(w.field)) then return w.field end
+	end
 	-- 1) Auto Field Boss: a selected boss is UP (and my level is enough) -> its field.
 	--    One in the field we're already in wins.
 	if e.phBossOn and type(e.phBossPick) == "table" then
@@ -1442,6 +1449,41 @@ task.spawn(function()
 	end
 end)
 
+-- World boss schedule straight from the server's ReplicatedStorage attributes (what
+-- the game's own WORLD BOSS banner + GO! button read): WorldBoss = state ("soon"
+-- while announced, ~2 min before landing), WorldBossId, WorldBossField, WorldBossAt
+-- (landing time), WorldBossLanding (where GO! walks you), WorldBossSpot (arena centre).
+local function wbInfo()
+	local RSa = game:GetService("ReplicatedStorage")
+	local state = RSa:GetAttribute("WorldBoss")
+	if not state then return nil end
+	local spot, landing = RSa:GetAttribute("WorldBossSpot"), RSa:GetAttribute("WorldBossLanding")
+	return {state = state, id = RSa:GetAttribute("WorldBossId"), field = RSa:GetAttribute("WorldBossField"),
+		at = tonumber(RSa:GetAttribute("WorldBossAt")),
+		spot = typeof(spot) == "Vector3" and spot or nil, landing = typeof(landing) == "Vector3" and landing or nil}
+end
+-- the current world boss, if Auto World Boss is on, it passes the name/field filters,
+-- and it's either announced or actually alive
+local function wbWanted()
+	if not e.phWBOn then return nil end
+	local w = wbInfo()
+	if not (w and w.field) then return nil end
+	local pickOn = type(e.phWBPick) == "table" and next(e.phWBPick) ~= nil
+	local fieldOn = type(e.phWBFields) == "table" and next(e.phWBFields) ~= nil
+	local name = w.id and (WB_LABEL[w.id] or WB_LABEL["wb_" .. tostring(w.id)])
+	if pickOn and not (name and e.phWBPick[name]) then return nil end
+	if fieldOn and not e.phWBFields[FIELD_LABEL[w.field] or w.field] then return nil end
+	local live = false
+	for _, m in ipairs(workspace.Monsters:GetChildren()) do
+		if m:GetAttribute("WorldBoss") and (tonumber(m:GetAttribute("Health")) or 0) > 0 then live = true; break end
+	end
+	if w.state ~= "soon" and not live then return nil end   -- results/cleanup phase: nothing to do
+	w.name = name or tostring(w.id)
+	w.live = live
+	return w
+end
+wbWantedFwd = wbWanted
+
 local wdPos, wdAt = nil, os.clock()
 local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on the spot / last target
 task.spawn(function()
@@ -1591,6 +1633,27 @@ task.spawn(function()
 		if e.phWBOn then
 			local wb = findWorldBoss(hrp)
 			if wb and wb.PrimaryPart then fightBoss(wb, "ตีบอสโลก"); continue end
+			-- announced but not landed yet: be standing at its landing spot when it does
+			-- (auto-warp above already brought us to its field)
+			local w = wbWanted()
+			if w and w.state == "soon" and not w.live then
+				local curF = fieldAt(hrp.Position)
+				local dest = w.landing or w.spot
+				if curF and curF.id == w.field and dest then
+					local left = w.at and math.max(0, math.ceil(w.at - workspace:GetServerTimeNow())) or 0
+					wdAt = os.clock()
+					if flatDist(hrp.Position, dest) > 8 then
+						setAuto(false)
+						pathTo(hum, hrp, dest)
+						stats.farm = ("ไปรอบอสโลก %s (ลงใน %d:%02d)"):format(w.name, left // 60, left % 60)
+					else
+						pathReset()
+						setAuto(true)   -- swat whatever wanders in while we wait
+						stats.farm = ("รอบอสโลก %s ลงจอด %d:%02d"):format(w.name, left // 60, left % 60)
+					end
+					continue
+				end
+			end
 		end
 		if e.phBossOn then
 			local boss = findBossTarget(hrp)
@@ -2106,12 +2169,10 @@ BL:Dropdown({Name = "เลือกตามชื่อบอสโลก (ว
 		end
 		e.phWBPick = sel; sv()
 	end}, "PHWBPick")
--- World bosses only spawn in the Volcano biome (the game's summon is volcano-only
--- and the one observed spawned there), so the map picker lists only real spawn
--- biomes, not all 12 fields.
-local WB_SPAWN_FIELDS = {volcano = true}
+-- World bosses land in any field (seen: Toy Town, Gem Burrow, ...; ReplicatedStorage
+-- WorldBossField says which) -- so every field is offered.
 local fieldOpts, fieldDefault = {}, {}
-for _, f in ipairs(FIELDS) do if WB_SPAWN_FIELDS[f.id] then table.insert(fieldOpts, f.label) end end
+for _, f in ipairs(FIELDS) do table.insert(fieldOpts, f.label) end
 if type(e.phWBFields) == "table" then for lbl, on in pairs(e.phWBFields) do if on then table.insert(fieldDefault, lbl) end end end
 BL:Dropdown({Name = "เลือกตามแมพที่บอสโลกเกิด (ว่าง=ทุกจุด)", Multi = true, Required = false,
 	Options = fieldOpts, Default = fieldDefault,
@@ -2122,7 +2183,7 @@ BL:Dropdown({Name = "เลือกตามแมพที่บอสโล�
 		end
 		e.phWBFields = sel; sv()
 	end}, "PHWBFields")
-BL:Label({Text = "เลือกได้ 2 แบบ: ตามชื่อบอส หรือตามแมพที่เกิด (เช่น เฉพาะ\nMoon Base) · เลือกทั้งคู่ = ต้องตรงทั้งชื่อและแมพ · ว่าง=ไม่กรอง"})
+BL:Label({Text = "เกมประกาศก่อนลง 2 นาที → วาร์ปไปฟิลด์นั้น ยืนรอจุดลงจอด\nลงแล้ว → ตีจนตาย (ยืนชิด ตีลูกน้องตอนกางโล่ หลบสกิล) → เก็บของ → กลับไปทำต่อ\nบอสโลกมาก่อนบอสฟิลด์เสมอ · กรองตามชื่อ/แมพได้ (ว่าง = ทุกตัว ทุกแมพ)"})
 
 local BR = Tabs.Boss:Section({Side = "Right"})
 BR:Header({Text = "สถานะบอสฟิลด์"})
