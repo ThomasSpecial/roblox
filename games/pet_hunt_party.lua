@@ -1522,6 +1522,13 @@ wbWantedFwd = wbWanted
 
 local wdPos, wdAt = nil, os.clock()
 local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on the spot / last target
+-- how far (flat studs) stay-put may step off the spot to fight. Unset = by class:
+-- ranged (attack range >= 20, e.g. Archer 38) = 0 feet locked; melee = 25
+local function stayRadius()
+	local r = tonumber(e.phStayRadius)
+	if r then return math.max(0, r) end
+	return ATTACK_RANGE >= 20 and 0 or 25
+end
 task.spawn(function()
 	while alive() do
 		task.wait(0.12)
@@ -1802,30 +1809,18 @@ task.spawn(function()
 		-- clamped to our attack range so its auto-picks never need a step either.
 		local spot = e.phStayPut and farmAnchor(hrp)
 		if spot then
+			-- R = how far from the spot we may step out (0 = feet locked: ranged classes
+			-- shoot everything from the spot; melee needs room, so it walks out to fight
+			-- inside R and comes back when nothing's left / when dragged past R)
+			local R = stayRadius()
 			local sp = hrp.Position
-			if flatDist(sp, spot) > 2.5 or math.abs(sp.Y - spot.Y) > 4 then
-				stayAnchored = false
-				setAuto(false)
-				pathTo(hum, hrp, spot)
-				stats.farm = ("กลับไปยืนจุดฟาร์ม (ห่าง %.0f)"):format(flatDist(sp, spot))
-				continue
+			local atSpot = flatDist(sp, spot) <= 2.5 and math.abs(sp.Y - spot.Y) <= 4
+			local function inZone(m)
+				local mp = m.PrimaryPart.Position
+				local reach = ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5
+				return flatDist(mp, spot) <= R + reach and math.abs(mp.Y - spot.Y) < 25
 			end
-			pathReset()
-			wdAt = os.clock()
-			if GSettings and not getgenv().__PHP_OLDRANGE then
-				pcall(function()
-					getgenv().__PHP_OLDRANGE = GSettings.get("autoRange")
-					GSettings.set("autoRange", math.max(20, math.floor(ATTACK_RANGE)))
-					if GSettings.get("autoStay") ~= true then GSettings.set("autoStay", true) end
-				end)
-			end
-			if not stayAnchored then
-				-- re-anchor the game's AUTO on this exact spot (it anchors where it's turned on)
-				pcall(TC.setAuto, false); pcall(TC.setAuto, true)
-				stayAnchored = true
-			end
-			setAuto(true)
-			-- best monster we can hit from here: in the level window first, then nearest
+			-- best monster in the zone: in the level window first, then nearest the spot
 			local myLv = tonumber(plr:GetAttribute("Level")) or 1
 			local below = tonumber(e.phFarmBelow) or 99
 			local above = tonumber(e.phFarmAbove) or 10
@@ -1833,16 +1828,11 @@ task.spawn(function()
 			local best, bestScore
 			for _, m in ipairs(workspace.Monsters:GetChildren()) do
 				if m.PrimaryPart and (tonumber(m:GetAttribute("Health")) or 0) > 0 and m:GetAttribute("Dummy") ~= true
-					and (m:GetAttribute("IsBoss") ~= true or e.phFarmBoss) then
-					local mp = m.PrimaryPart.Position
-					local reach = ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5
-					local fd = flatDist(mp, spot)
-					if fd <= reach and math.abs(mp.Y - spot.Y) < 25 then
-						local lv = tonumber(m:GetAttribute("Level")) or 0
-						local inWin = lv >= myLv - below and lv <= myLv + above
-						local score = (inWin and 0 or 1000) + math.abs(lv - targetLv) * 10 + fd
-						if not best or score < bestScore then best, bestScore = m, score end
-					end
+					and (m:GetAttribute("IsBoss") ~= true or e.phFarmBoss) and inZone(m) then
+					local lv = tonumber(m:GetAttribute("Level")) or 0
+					local inWin = lv >= myLv - below and lv <= myLv + above
+					local score = (inWin and 0 or 1000) + math.abs(lv - targetLv) * 10 + flatDist(m.PrimaryPart.Position, spot)
+					if not best or score < bestScore then best, bestScore = m, score end
 				end
 			end
 			local cur = TC.current
@@ -1850,21 +1840,47 @@ task.spawn(function()
 			if stayTarget and stayTarget ~= cur and (not stayTarget.Parent or (tonumber(stayTarget:GetAttribute("Health")) or 0) <= 0) then
 				stats.kills = (stats.kills or 0) + 1
 			end
-			-- never let the current target be something we'd have to walk to
-			if cur and cur.PrimaryPart then
-				local reachC = ATTACK_RANGE + (tonumber(cur:GetAttribute("Radius")) or 1) - 0.5
-				if flatDist(cur.PrimaryPart.Position, spot) > reachC + 1 then pcall(TC.set, nil); cur = nil end
+			if cur and cur.PrimaryPart and not inZone(cur) then pcall(TC.set, nil); cur = nil end   -- never chase out of the zone
+			-- walk back to the spot when: feet-lock mode and we're off it; dragged past
+			-- R; or nothing left to fight in the zone
+			local tooFar = flatDist(sp, spot) > R + 6
+			if (R == 0 and not atSpot) or tooFar or (not atSpot and not cur and not best) then
+				stayAnchored = false
+				if tooFar then pcall(TC.set, nil) end
+				setAuto(false)
+				pathTo(hum, hrp, spot)
+				stats.farm = ("กลับไปยืนจุดฟาร์ม (ห่าง %.0f)"):format(flatDist(sp, spot))
+				continue
 			end
-			-- keep shooting the current one until it dies (no flip-flopping); then the best
+			pathReset()
+			wdAt = os.clock()
+			-- the game's own auto stays inside the same zone: autoStay + autoRange
+			local wantRange = math.clamp(math.floor(R + ATTACK_RANGE), 20, 150)
+			if GSettings and getgenv().__PHP_SETRANGE ~= wantRange then
+				pcall(function()
+					if not getgenv().__PHP_OLDRANGE then getgenv().__PHP_OLDRANGE = GSettings.get("autoRange") end
+					GSettings.set("autoRange", wantRange)
+					if GSettings.get("autoStay") ~= true then GSettings.set("autoStay", true) end
+					getgenv().__PHP_SETRANGE = wantRange
+				end)
+			end
+			if atSpot and not stayAnchored then
+				-- re-anchor the game's AUTO on this exact spot (it anchors where it's turned on)
+				pcall(TC.setAuto, false); pcall(TC.setAuto, true)
+				stayAnchored = true
+			end
+			setAuto(true)
+			-- keep hitting the current one until it dies (no flip-flopping); then the best
 			if not cur and best then pcall(TC.set, best); cur = best end
 			stayTarget = cur
-			stats.farm = cur and ("ยืนตีที่จุดฟาร์ม: %s L%d"):format(cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
+			stats.farm = cur and ("%s: %s L%d"):format(R == 0 and "ยืนตีที่จุดฟาร์ม" or "ตีรอบจุดฟาร์ม", cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
 				or "ยืนรอมอนเข้าระยะที่จุดฟาร์ม"
 			continue
 		elseif getgenv().__PHP_OLDRANGE and GSettings then
 			-- stay mode off (or no spot here): give the player's autoRange back
 			pcall(function() GSettings.set("autoRange", getgenv().__PHP_OLDRANGE) end)
 			getgenv().__PHP_OLDRANGE = nil
+			getgenv().__PHP_SETRANGE = nil
 		end
 		stayAnchored = false
 
@@ -2183,8 +2199,12 @@ FL:Toggle({Name = "ตีบอสฟิลด์ด้วย (ปลดล็�
 	Callback = function(v) e.phFarmBoss = v; sv() end}, "PHFarmBoss")
 FL:Toggle({Name = "└ ข้ามบอสที่ตีผ่านแล้ว (ปลดล็อกด่านแล้ว)", Default = e.phBossUnbeaten,
 	Callback = function(v) e.phBossUnbeaten = v; sv() end}, "PHBossUnbeaten")
-FL:Toggle({Name = "ยืนนิ่งที่จุดฟาร์ม (ไม่เดินไล่มอน ยิงเฉพาะที่ถึง)", Default = e.phStayPut,
+FL:Toggle({Name = "ฟาร์มที่จุดฟาร์ม (ล็อกจุดยืน)", Default = e.phStayPut,
 	Callback = function(v) e.phStayPut = v; sv() end}, "PHStayPut")
+FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
+	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
+	Callback = function(v) e.phStayRadius = math.floor(v + 0.5); sv() end}, "PHStayRadius")
+FL:Label({Text = "สายยิงไกล (ธนู): 0 = ยืนนิ่ง ยิงทุกตัวที่ถึงจากจุด\nสายตีใกล้: ~20-30 = เดินออกไปตีมอนในวงนี้ แล้วกลับมาที่จุดเอง\n(ยังไม่เคยปรับ = ตั้งให้ตามอาชีพ: ยิงไกล 0 / ตีใกล้ 25)"})
 local stayLbl
 local function stayText()
 	local fp = e.phFarmPos
@@ -2528,6 +2548,7 @@ W.onUnloaded(function()
 		pcall(function() GSettings.set("autoRange", getgenv().__PHP_OLDRANGE) end)
 		getgenv().__PHP_OLDRANGE = nil
 	end
+	getgenv().__PHP_SETRANGE = nil
 	print("[PetHunt] Unloaded")
 end)
 Tabs.Farm:Select()
