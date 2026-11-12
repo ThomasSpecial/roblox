@@ -881,22 +881,32 @@ buildWorldBosses()
 -- so you can target by boss name, by WHICH MAP it spawned in, or both:
 --   phWBPick   -- empty = any boss name
 --   phWBFields -- empty = any field; else only engage one whose spawn map is picked
+-- The boss dropdown stores LABELS ("The Clover Queen · Lv~102") but we look bosses up
+-- by NAME ("The Clover Queen"): compare by label prefix. (Before, the two never matched,
+-- so picking bosses filtered EVERY world boss out -- "it spawned but didn't go".)
+local function wbNamePicked(name)
+	if type(e.phWBPick) ~= "table" or next(e.phWBPick) == nil then return true end
+	if not name then return false end
+	for label, on in pairs(e.phWBPick) do
+		if on and (label == name or label:sub(1, #name) == name) then return true end
+	end
+	return false
+end
+-- map filter: the server says which field it landed in (WorldBossField); the model's
+-- own position/ArenaCenter doesn't resolve to the right field (read as "town")
+local function wbFieldPicked(fieldId)
+	if type(e.phWBFields) ~= "table" or next(e.phWBFields) == nil then return true end
+	return fieldId ~= nil and e.phWBFields[FIELD_LABEL[fieldId] or fieldId] == true
+end
 local function findWorldBoss(hrp)
 	if not e.phWBOn then return nil end
-	local pickOn = type(e.phWBPick) == "table" and next(e.phWBPick) ~= nil
-	local fieldOn = type(e.phWBFields) == "table" and next(e.phWBFields) ~= nil
+	local wbField = game:GetService("ReplicatedStorage"):GetAttribute("WorldBossField")
 	local best, bestD
 	for _, m in ipairs(workspace.Monsters:GetChildren()) do
 		if m.PrimaryPart and m:GetAttribute("WorldBoss") and (tonumber(m:GetAttribute("Health")) or 0) > 0 then
-			local name = WB_LABEL[m:GetAttribute("MonsterId")]
-			local okName = (not pickOn) or (name and e.phWBPick[name])
-			local okField = not fieldOn
-			if fieldOn then
-				local center = m:GetAttribute("ArenaCenter")
-				local pos = (typeof(center) == "Vector3") and center or m.PrimaryPart.Position
-				local f = fieldAt(pos)
-				okField = f and e.phWBFields[FIELD_LABEL[f.id] or f.id] == true
-			end
+			local name = WB_LABEL[m:GetAttribute("MonsterId")] or m.Name
+			local okName = wbNamePicked(name) or wbNamePicked(m.Name)
+			local okField = wbFieldPicked(wbField)
 			if okName and okField then
 				local dd = (m.PrimaryPart.Position - hrp.Position).Magnitude
 				if not best or dd < bestD then best, bestD = m, dd end
@@ -1471,11 +1481,9 @@ local function wbWanted()
 	if not e.phWBOn then return nil end
 	local w = wbInfo()
 	if not (w and w.field) then return nil end
-	local pickOn = type(e.phWBPick) == "table" and next(e.phWBPick) ~= nil
-	local fieldOn = type(e.phWBFields) == "table" and next(e.phWBFields) ~= nil
 	local name = w.id and (WB_LABEL[w.id] or WB_LABEL["wb_" .. tostring(w.id)])
-	if pickOn and not (name and e.phWBPick[name]) then return nil end
-	if fieldOn and not e.phWBFields[FIELD_LABEL[w.field] or w.field] then return nil end
+	if not wbNamePicked(name) then return nil end
+	if not wbFieldPicked(w.field) then return nil end
 	local live = false
 	for _, m in ipairs(workspace.Monsters:GetChildren()) do
 		if m:GetAttribute("WorldBoss") and (tonumber(m:GetAttribute("Health")) or 0) > 0 then live = true; break end
