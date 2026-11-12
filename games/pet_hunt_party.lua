@@ -970,6 +970,15 @@ local RunService = game:GetService("RunService")
 local hazards = {}
 local dodging = false
 local fightFocus = nil   -- the boss model we're fighting: its LIVE position bounds the dodge
+-- the circle that boss is tied to ({center, radius}): world boss = WorldBossSpot r42
+-- (WorldBoss.arena), field boss = its ArenaFloor r40. Leave it (or drag the boss out
+-- of it) and the boss leashes back to full HP -- so we never stand, dodge, or chase
+-- helpers outside it.
+local fightArena = nil
+local function inFightArena(p, margin)
+	if not fightArena then return true end
+	return flatDist(p, fightArena.center) <= fightArena.radius - (margin or 0)
+end
 local DODGE_MARGIN = 2.5
 pcall(function()
 	local BF = require(plr.PlayerScripts.Client.Controllers.BossFx)
@@ -1074,6 +1083,7 @@ local function findEscape(pos, bossPos)
 	local keepIn = math.max(ATTACK_RANGE - 8, 16)
 	local function try(c, extra)
 		if arena and flatDist(c, arena.center) > arena.radius - 3 then return end
+		if not inFightArena(c, 3) then return end
 		if bossPos and flatDist(c, bossPos) > keepIn then return end
 		if safeEverywhere(c) and sameFloor(c, pos.Y) then
 			local score = flatDist(pos, c) + (extra or 0) + (bossPos and flatDist(c, bossPos) * 0.25 or 0)
@@ -1208,6 +1218,12 @@ local function engageTarget(hum, hrp, t, closeIn)
 		if closeIn and not dodging and fd > CLOSE_IN + (tonumber(t:GetAttribute("Radius")) or 1) + 2 then
 			local away = Vector3.new(pos.X - tp.X, 0, pos.Z - tp.Z)
 			local stand = away.Magnitude > 0.5 and (tp + away.Unit * (CLOSE_IN + (tonumber(t:GetAttribute("Radius")) or 1))) or tp
+			-- keep the stand spot inside the boss's circle
+			if fightArena and not inFightArena(stand, 4) then
+				local c = fightArena.center
+				local dir = Vector3.new(stand.X - c.X, 0, stand.Z - c.Z)
+				if dir.Magnitude > 0.5 then stand = Vector3.new(c.X, 0, c.Z) + dir.Unit * (fightArena.radius - 5) end
+			end
 			hum:MoveTo(Vector3.new(stand.X, pos.Y, stand.Z))
 		end
 		return "fight"
@@ -1334,6 +1350,12 @@ end
 -- pet. We used to leave the instant it died, so the loot stayed on the ground. Now
 -- we hold a loot phase: wait for drops, walk onto each one near the corpse.
 local lastBoss, lastBossPos = nil, nil
+local lastBossWB = false
+local WB_ARENA_R = 42   -- WorldBoss.arena.radius
+pcall(function()
+	local W = require(RS.Shared.Config.WorldBoss)
+	if W.arena and tonumber(W.arena.radius) then WB_ARENA_R = tonumber(W.arena.radius) end
+end)
 local chestIgnore = setmetatable({}, {__mode = "k"})   -- chests that won't open for us
 local chestNear = setmetatable({}, {__mode = "k"})     -- chest -> when we got next to it
 local lootPhase = nil      -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
@@ -1354,7 +1376,7 @@ local function nearestLoot(center, pos)
 			lp.nearAt[p] = lp.nearAt[p] or now
 			if now - lp.nearAt[p] > 4.5 then lp.ignore[p] = true end
 		end
-		if p:IsA("BasePart") and not (lp and lp.ignore[p]) and flatDist(p.Position, center) < 80 then
+		if p:IsA("BasePart") and not (lp and lp.ignore[p]) and flatDist(p.Position, center) < ((lp and lp.radius) or 80) then
 			local d = flatDist(p.Position, pos)
 			if not best or d < bestD then best, bestD = p, d end
 		end
@@ -1540,7 +1562,12 @@ task.spawn(function()
 		-- before warping/walking anywhere (wait ~2.5s for them to land, max 10s).
 		if lastBoss and (not lastBoss.Parent or (tonumber(lastBoss:GetAttribute("Health")) or 0) <= 0) then
 			local now0 = os.clock()
-			lootPhase = {center = lastBossPos or hrp.Position, minT = now0 + 2.5, untilT = now0 + 18, ignore = {}, nearAt = {}}
+			-- world boss: rewards arrive after the game's ~9s results screen and scatter
+			-- wider -> wait it out and sweep longer/wider so nothing is left behind
+			lootPhase = lastBossWB
+				and {center = lastBossPos or hrp.Position, minT = now0 + 11, untilT = now0 + 40, radius = 100, ignore = {}, nearAt = {}}
+				or {center = lastBossPos or hrp.Position, minT = now0 + 2.5, untilT = now0 + 18, radius = 80, ignore = {}, nearAt = {}}
+			fightArena = nil
 			stats.kills = (stats.kills or 0) + 1
 			stats.bossKills = (stats.bossKills or 0) + 1
 			local lf = workspace:FindFirstChild("LootDrops")
@@ -1617,16 +1644,52 @@ task.spawn(function()
 			-- SHIELD PHASE: the boss raises a shield (Shielded=true) and spawns BossAdd
 			-- helpers; attacking the boss does nothing until they die (they may also heal
 			-- it). Target the nearest add until the shield drops, then the boss again.
+			fightFocus = boss
+			local isWB = boss:GetAttribute("WorldBoss") ~= nil
+			lastBossWB = isWB
+			-- the circle this boss is tied to
+			local ai = (not isWB) and arenaInfo(fieldAt(boss.PrimaryPart.Position)) or nil
+			if isWB then
+				local spot = game:GetService("ReplicatedStorage"):GetAttribute("WorldBossSpot")
+				local ac = boss:GetAttribute("ArenaCenter")
+				local c = typeof(spot) == "Vector3" and spot or (typeof(ac) == "Vector3" and ac) or nil
+				local r = tonumber(boss:GetAttribute("ArenaRadius")) or WB_ARENA_R
+				fightArena = c and {center = c, radius = r} or nil
+			elseif ai and flatDist(boss.PrimaryPart.Position, ai.center) < ai.radius + 10 then
+				fightArena = {center = ai.center, radius = ai.radius}
+			else
+				fightArena = nil
+			end
+			-- shield phase: kill its helpers -- but only ones INSIDE its circle (chasing a
+			-- helper out of the circle drags the boss after us and it leashes/resets)
 			local t, addMode = boss, false
 			if boss:GetAttribute("Shielded") == true then
-				local add = nearestBossAdd(hrp.Position)
-				if add and add.PrimaryPart then t, addMode = add, true end
+				local best, bestD
+				local M = workspace:FindFirstChild("Monsters")
+				for _, j in ipairs(M and M:GetChildren() or {}) do
+					if j:GetAttribute("BossAdd") and j.PrimaryPart and (tonumber(j:GetAttribute("Health")) or 0) > 0
+						and inFightArena(j.PrimaryPart.Position, 0) then
+						local d = flatDist(j.PrimaryPart.Position, hrp.Position)
+						if not best or d < bestD then best, bestD = j, d end
+					end
+				end
+				if best then t, addMode = best, true end
 			end
-			fightFocus = boss
 			-- not up on the boss's arena yet: take the known ramp first
-			local ai = arenaInfo(fieldAt(boss.PrimaryPart.Position))
 			if ai and flatDist(boss.PrimaryPart.Position, ai.center) < ai.radius + 10 and climbToArena(hum, hrp, ai) then
 				stats.farm = ("ขึ้นทางลาดลานบอส %s"):format(boss.Name)
+				return
+			end
+			-- outside the boss's circle (knocked out / walked out): get back in first
+			if fightArena and not dodging and not inFightArena(hrp.Position, 2) then
+				local c = fightArena.center
+				local dir = Vector3.new(hrp.Position.X - c.X, 0, hrp.Position.Z - c.Z)
+				local back = dir.Magnitude > 0.5 and (Vector3.new(c.X, hrp.Position.Y, c.Z) + dir.Unit * (fightArena.radius - 8))
+					or Vector3.new(c.X, hrp.Position.Y, c.Z)
+				setAuto(true)
+				if TC.current ~= t then pcall(TC.set, t) end
+				if flatDist(hrp.Position, c) > fightArena.radius + 25 then pathTo(hum, hrp, back) else hum:MoveTo(back) end
+				stats.farm = ("กลับเข้าวงบอส %s"):format(boss.Name)
 				return
 			end
 			pathReset()   -- our own walk (if any) yields to the game's chase
