@@ -540,6 +540,7 @@ end
 
 -- Auto Ride: the game's own mount toggle (Mounts:InvokeServer("ride", bool)); the
 -- class walk speed is slow, the mount isn't. Throttled; the dodge roll dismounts by itself.
+local arenaInfoFwd   -- = arenaInfo (defined further down, with the arena map knowledge)
 local lastRideAt = 0
 local function ride(want)
 	if not (e.phRide and MR) then return end
@@ -555,8 +556,32 @@ local function pathTo(hum, hrp, goalPos)
 	local now = os.clock()
 	-- a manual push (walk off a terrace edge / up a ramp) is in progress: don't let the
 	-- walker or our own unstick kicks override it with the route that just stalled
-	if now < (pf.manualUntil or 0) then return end
+	if now < (pf.manualUntil or 0) then
+		-- dropped off the terrace: the push did its job, hand back to the walker now
+		if pf.manualStartY and hrp.Position.Y < pf.manualStartY - 4 then
+			pf.manualUntil = 0; pf.manualStartY = nil
+		else
+			return
+		end
+	end
 	if flatDist(hrp.Position, goalPos) > 40 then ride(true) end
+	-- LEAVING A BOSS ARENA: the plateau's only way down is its StairRamp; the walker
+	-- sometimes can't find it from on top. Known route: rim end of the ramp -> down.
+	do
+		local p0 = hrp.Position
+		local ai = arenaInfoFwd and arenaInfoFwd(fieldAt(p0))
+		if ai and flatDist(goalPos, ai.center) > ai.radius + 6 then
+			local onArena = p0.Y > ai.floorY + 1 and flatDist(p0, ai.center) < ai.radius + 2
+			local onRamp = flatDist(p0, ai.bot) + flatDist(p0, ai.top) <= ai.len + 3
+				and p0.Y > ai.bot.Y + 1 and p0.Y < ai.floorY + 5
+			if onArena or onRamp then
+				if PW then pcall(PW.stop) end
+				pf.pwGoal = nil
+				if onArena and flatDist(p0, ai.top) > 3 then hum:MoveTo(ai.top) else hum:MoveTo(ai.botOut) end
+				return
+			end
+		end
+	end
 	if not PW or now < (pf.fallbackUntil or 0) then return navTo(hum, hrp, goalPos) end
 	local pos = hrp.Position
 	if now - (pf.pwLast or 0) > 0.5 then pf.pwMark = pos; pf.pwMarkAt = now; pf.pwKick = nil end   -- stale after a pause
@@ -1267,6 +1292,7 @@ local function arenaInfo(f)
 	arenaCache[f.id] = c
 	return c
 end
+arenaInfoFwd = arenaInfo
 -- returns true while it's still taking us up onto the arena (caller skips the fight)
 local function climbToArena(hum, hrp, ai)
 	local pos = hrp.Position
@@ -1366,8 +1392,11 @@ task.spawn(function()
 					if dir.Magnitude > 1 then
 						lastPush = os.clock()
 						pcall(PW.stop)
-						pf.manualUntil = os.clock() + 2   -- hold off the walker/kicks while we drop
-						hum:MoveTo(pos + dir.Unit * math.min(14, dir.Magnitude))
+						-- walk far enough to actually reach the edge (a mound can be ~40
+						-- across); the hold ends early once we've dropped (see pathTo)
+						pf.manualUntil = os.clock() + 4
+						pf.manualStartY = pos.Y
+						hum:MoveTo(pos + dir.Unit * math.min(45, dir.Magnitude))
 						stats.rampPush = (stats.rampPush or 0) + 1
 					end
 				else
