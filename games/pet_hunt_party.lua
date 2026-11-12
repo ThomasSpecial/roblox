@@ -20,6 +20,32 @@
 getgenv().__PHP = (getgenv().__PHP or 0) + 1
 local G = getgenv().__PHP
 pcall(function() if getgenv().__PHPW then getgenv().__PHPW:Unload() end end)
+-- MacLib's :Unload() doesn't reliably Destroy its ScreenGui, and MacLib parents the
+-- window inconsistently (sometimes a direct child of gethui, sometimes nested under
+-- CoreGui.RobloxGui), so reloads -- and a second executor auto-running the same file
+-- -- stacked duplicate windows on screen. DEEP-purge every MacLib window (any
+-- ScreenGui carrying both a "Base" and a "Notifications" frame) across every GUI root
+-- before building a fresh one. Guarantees exactly one window, however many copies ran.
+pcall(function()
+	local plr0 = game:GetService("Players").LocalPlayer
+	local roots = {
+		(gethui and gethui()) or nil,
+		game:GetService("CoreGui"),
+		plr0 and plr0:FindFirstChildOfClass("PlayerGui"),
+	}
+	local seen = {}
+	for _, root in ipairs(roots) do
+		if root then
+			for _, g in ipairs(root:GetDescendants()) do
+				if not seen[g] and g:IsA("ScreenGui")
+					and g:FindFirstChild("Base") and g:FindFirstChild("Notifications") then
+					seen[g] = true
+					g:Destroy()
+				end
+			end
+		end
+	end
+end)
 local function alive() return getgenv().__PHP == G end
 
 local Players = game:GetService("Players")
@@ -36,6 +62,10 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phBossWaitLv = true,    -- only go fight a field boss once my level >= its level
 	phBossUnbeaten = true,  -- skip field bosses already cleared (Beat_<id> attr = field unlocked)
 	phAutoWarp = true,      -- walk to a WarpStone and warp to the right field (incl. after a death->town)
+	phDodge = true,         -- step out of boss/monster skill telegraphs (BossCast red zones)
+	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
+	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
+	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -60,7 +90,7 @@ local function controllers()
 	return c
 end
 
-local TC, GearState, Equipment, gearRemote, GSettings, Zones
+local TC, GearState, Equipment, gearRemote, GSettings, Zones, PW, MR
 local function hooks()
 	if TC and GearState and Equipment and gearRemote then return true end
 	local c = controllers()
@@ -69,6 +99,10 @@ local function hooks()
 		TC = require(c:WaitForChild("TargetController", 5))
 		GearState = require(c:WaitForChild("GearState", 5))
 	end)
+	pcall(function() MR = require(c:WaitForChild("MountRide", 5)) end)
+	-- the game's own walker (quest auto-walk / click-to-move): cost-map routes that
+	-- prefer roads, avoid the boss Dais, cross between fields over the bridges
+	pcall(function() PW = require(c:WaitForChild("PathWalker", 5)) end)
 	pcall(function() GSettings = require(c:WaitForChild("Settings", 5)) end)
 	pcall(function() Equipment = require(RS.Shared.Config.Equipment) end)
 	pcall(function() Zones = require(RS.Shared.Config.Zones) end)
@@ -91,6 +125,39 @@ local function fieldAt(pos)
 	local ok, f = pcall(Zones.baseAt, pos)
 	if ok and type(f) == "table" and f.id then return f end
 	return nil
+end
+
+-- Every combat field OPEN right now. Z.allFields lists all 12 biomes (Z.fields only
+-- has the 7 original); fields past Moon Base are released by time via opensAt, and
+-- their config `comingSoon` flag goes STALE once that timestamp passes -- so we gate
+-- on opensAt, never on comingSoon. Falls back to Z.fields if allFields is missing.
+local function openFields(Z)
+	local src = (type(Z.allFields) == "table" and #Z.allFields > 0) and Z.allFields or Z.fields
+	if type(src) ~= "table" then return {} end
+	local now = os.time()
+	local out = {}
+	for _, f in ipairs(src) do
+		local opensAt = tonumber(f.opensAt)
+		if (not opensAt) or opensAt <= now then out[#out + 1] = f end
+	end
+	return out
+end
+
+-- Field bosses fight in PHASES: at low HP the boss calls helpers and raises a SHIELD
+-- (attribute Shielded=true) -- while shielded it takes no damage, and the helpers
+-- (Monster models tagged BossAdd) can even heal it. Kill the adds first to break the
+-- shield, then resume the boss. This finds the nearest living add to retarget onto.
+local function nearestBossAdd(pos)
+	local M = workspace:FindFirstChild("Monsters")
+	if not M then return nil end
+	local best, bestD
+	for _, j in ipairs(M:GetChildren()) do
+		if j:GetAttribute("BossAdd") and j.PrimaryPart and (tonumber(j:GetAttribute("Health")) or 0) > 0 then
+			local d = (j.PrimaryPart.Position - pos).Magnitude
+			if not best or d < bestD then best, bestD = j, d end
+		end
+	end
+	return best
 end
 
 -- Auto Reconnect: 3-trigger version (PlayerRemoving alone misses silent drops
@@ -128,21 +195,41 @@ end
 -- ----------------------------------------------------------------- rarity
 -- def.lines is the gear's stat-line count = rarity tier 0..4 (dungeon gear is
 -- its own bucket "dg"), the same key the game's "Sell all" uses.
+-- named exactly like the game's bag shows gear ("Tier IV · Armor · Lv.93"):
+-- Kit.GearArt.tierName maps lines 0..4 -> I..V, dungeon gear -> DG
 local TIER_LABELS = {
-	[0] = "ขั้น 0 (ธรรมดา)",
-	[1] = "ขั้น 1",
-	[2] = "ขั้น 2",
-	[3] = "ขั้น 3",
-	[4] = "ขั้น 4 (สูงสุด)",
-	dg = "ของดันเจี้ยน",
+	[0] = "Tier I",
+	[1] = "Tier II",
+	[2] = "Tier III",
+	[3] = "Tier IV",
+	[4] = "Tier V",
+	dg = "DG",
 }
-local TIER_ORDER = {0, 1, 2, 3, 4, "dg"}
+-- Legendary (no sellable field gear exists at that rarity -- only dungeon gear reaches
+-- it) and dungeon gear are NEVER offered or sold (user: "เอา Dungeon ออก เดี๋ยวลบมั่ว")
+local TIER_ORDER = {0, 1, 2, 3}
+local NEVER_SELL = {[4] = true, dg = true}
 
 local function defaultTiers()
 	-- by default only the cheap tiers, mirroring the game's {[0]=true,1,2}
 	return {[TIER_LABELS[0]] = true, [TIER_LABELS[1]] = true, [TIER_LABELS[2]] = true}
 end
 if type(e.phSellTiers) ~= "table" then e.phSellTiers = defaultTiers() end
+do   -- migrate picks saved under the old Thai labels ("ขั้น 0 (ธรรมดา)" ...)
+	local OLD = {["ขั้น 0 (ธรรมดา)"] = 0, ["ขั้น 1"] = 1, ["ขั้น 2"] = 2, ["ขั้น 3"] = 3, ["ขั้น 4 (สูงสุด)"] = 4, ["ของดันเจี้ยน"] = "dg",
+		Common = 0, Uncommon = 1, Rare = 2, Epic = 3, Legendary = 4, Dungeon = "dg"}
+	local migrated = false
+	for old, t in pairs(OLD) do
+		if e.phSellTiers[old] then e.phSellTiers[old] = nil; e.phSellTiers[TIER_LABELS[t]] = true; migrated = true end
+	end
+	-- drop any saved Legendary/Dungeon pick: those can never be sold by this script
+	for t in pairs(NEVER_SELL) do
+		if e.phSellTiers[TIER_LABELS[t]] then e.phSellTiers[TIER_LABELS[t]] = nil; migrated = true end
+	end
+	if migrated then pcall(function() writefile(SF, HS:JSONEncode(e)) end) end
+end
+-- per-rarity level filter: phSellLv[tierKey] = {["93"] = true, ...}; empty = sell every level
+if type(e.phSellLv) ~= "table" then e.phSellLv = {} end
 
 local function tierOf(def)
 	if def.dungeon then return "dg" end
@@ -151,6 +238,9 @@ end
 
 -- ------------------------------------------------------------------- stats
 local stats = {farm = "-", sell = "-", sold = 0, gold = 0, collect = "-", equip = "-", equipped = 0, chest = "-"}
+getgenv().__PHP_STATS = stats   -- read-only diagnostics handle (current generation's status)
+stats.sessionAt = os.clock()
+stats.kills = 0
 
 -- 7 gear slots (Equipment.types). Auto Equip Best fills each with the strongest
 -- owned item you can actually wear (class nil = any class, else your class).
@@ -179,10 +269,29 @@ local skipUntil = {}          -- monster -> os.clock() deadline
 -- character never chases one across the field gate into a locked field):
 --   phFarmBoss on + the field boss present & reachable -> the boss (to unlock
 --   the next field); otherwise the highest-level monster, closest breaking ties.
+-- Farm anchor: when a farm spot is set (Boss tab button) and it's in the field we're
+-- standing in, ONLY farm monsters within ANCHOR_RADIUS of it. Before, the spot was
+-- only a "return here after a boss trip" point and pickTarget roamed the whole field
+-- (user: "ตั้งจุดฟามไว้ แต่มันเดินไปฟามจุดอื่น"). Flat XZ distance -- terrain is terraced.
+local ANCHOR_RADIUS = 70
+local function farmAnchor(hrp)
+	local fp = e.phFarmPos
+	if type(fp) ~= "table" or not fp.x then return nil end
+	local a = Vector3.new(fp.x, fp.y, fp.z)
+	local fa, fh = fieldAt(a), fieldAt(hrp.Position)
+	if fa and fh and fa.id == fh.id then return a end
+	return nil
+end
+local function flatDist(p, q) return Vector3.new(p.X - q.X, 0, p.Z - q.Z).Magnitude end
+
 local function pickTarget(hrp)
 	local myField = fieldAt(hrp.Position)
 	local myId = myField and myField.id
 	local now = os.clock()
+	local anchor = farmAnchor(hrp)
+	-- spot is set but in ANOTHER field: auto-warp is taking us home, so don't pick up
+	-- random monsters here on the way (only a selected boss may still be fought)
+	local spotElsewhere = e.phAutoWarp and type(e.phFarmPos) == "table" and e.phFarmPos.x and not anchor
 	local bossId = myField and myField.boss
 	-- nearHi: strongest within NEAR_RADIUS (what we actually fight)
 	-- nearest: closest anything within FARM_RADIUS (roam toward it when none near)
@@ -208,7 +317,10 @@ local function pickTarget(hrp)
 			local isBoss = m:GetAttribute("IsBoss") == true or m:GetAttribute("MonsterId") == bossId
 			if (not isBoss) or e.phFarmBoss then
 				local d = (m.PrimaryPart.Position - hrp.Position).Magnitude
-				if d < FARM_RADIUS then
+				local inAnchor = isBoss
+					or (anchor and flatDist(m.PrimaryPart.Position, anchor) < ANCHOR_RADIUS)
+					or (not anchor and not spotElsewhere)
+				if d < FARM_RADIUS and inAnchor then
 					local mf = fieldAt(m.PrimaryPart.Position)
 					if not myId or (mf and mf.id == myId) then
 						local bid2 = m:GetAttribute("MonsterId")
@@ -219,18 +331,24 @@ local function pickTarget(hrp)
 						end
 						local lv = tonumber(m:GetAttribute("Level")) or 0
 						if not isBoss then
+							-- travel cost, not straight-line distance: a monster on another
+							-- terrace (cliff in between, |dy| > 9) means a detour via a ramp,
+							-- so it costs its height x3 and loses ties to same-floor ones
+							local dy = math.abs(m.PrimaryPart.Position.Y - hrp.Position.Y)
+							local cost = d + (dy > 9 and dy * 3 or 0)
+							local floorPen = dy > 9 and 3 or 0
 							-- always remember the field's strongest (fallback)
-							if not fieldMax or lv > fieldMaxLv or (lv == fieldMaxLv and d < fieldMaxD) then
-								fieldMax, fieldMaxLv, fieldMaxD = m, lv, d
+							if not fieldMax or lv > fieldMaxLv or (lv == fieldMaxLv and cost < fieldMaxD) then
+								fieldMax, fieldMaxLv, fieldMaxD = m, lv, cost
 							end
 							-- inside the window, aim for targetLv: pick the monster whose
-							-- level is closest to it (tie -> nearest). nearest = closest
-							-- in-window monster, used only to roam into the action.
+							-- level is closest to it (tie -> cheapest to reach). nearest =
+							-- cheapest in-window monster, used only to roam into the action.
 							if lv >= loLv and lv <= hiLv then
-								if not nearest or d < nearestD then nearest, nearestD = m, d end
-								local off = math.abs(lv - targetLv)
-								if d < NEAR_RADIUS and (not nearBest or off < nearBestOff or (off == nearBestOff and d < nearBestD)) then
-									nearBest, nearBestOff, nearBestD = m, off, d
+								if not nearest or cost < nearestD then nearest, nearestD = m, cost end
+								local off = math.abs(lv - targetLv) + floorPen
+								if d < NEAR_RADIUS and (not nearBest or off < nearBestOff or (off == nearBestOff and cost < nearBestD)) then
+									nearBest, nearBestOff, nearBestD = m, off, cost
 								end
 							end
 						end
@@ -239,7 +357,15 @@ local function pickTarget(hrp)
 			end
 		end
 	end
-	if bossPick then return bossPick.m end  -- boss first when phFarmBoss is on
+	if bossPick then
+		-- SHIELD PHASE: while the boss is shielded (it summoned helpers) it takes no
+		-- damage -- kill the BossAdd helpers first so the shield breaks, then the boss.
+		if bossPick.m:GetAttribute("Shielded") == true then
+			local add = nearestBossAdd(hrp.Position)
+			if add then return add end
+		end
+		return bossPick.m
+	end
 	if nearBest then return nearBest end    -- nearby monster closest to target level
 	if nearest then return nearest end      -- roam to the closest in-window
 	return fieldMax                         -- none in window: farm the field's best
@@ -269,72 +395,251 @@ local pf = {path = nil, wps = {}, i = 1, goal = nil, at = 0, jumpAt = 0,
 	bestGoalD = math.huge, goalProgAt = 0}
 local HOP_PARAMS = RaycastParams.new()
 HOP_PARAMS.FilterType = Enum.RaycastFilterType.Exclude
-local function pathTo(hum, hrp, goalPos)
+-- v4 (arena fix). Boss arenas sit on a plateau 12 studs up, ringed by Cliff walls
+-- (top ~16.5 above ground) with ONE StairRamp. v3 failed there in a loop:
+--   * "stuck" = no straight-line progress to the goal, but the route to the ramp
+--     DETOURS away from the boss -> false "stuck" after 1.3s;
+--   * it then hopped straight AT the goal -> into the cliff, and its ground-snap ray
+--     started only 12 above the char = INSIDE the 16.5-tall cliff, so the ray skipped
+--     the cliff and snapped back to the ground at its foot. Repeat forever.
+-- v4: stuck = the character physically isn't moving (<3 studs in 1.3s), or no 3D
+-- progress for 8s (orbiting); a detour that keeps walking is fine. Hops follow the
+-- PATH (next waypoint, i.e. up the ramp), snapped from just above that waypoint;
+-- only with no path at all do we hop at the goal with a ray high enough to clear
+-- cliffs. Distances are 3D so standing UNDER the arena never counts as "arrived".
+local function navTo(hum, hrp, goalPos)
 	local now = os.clock()
-	local goalFlat = Vector3.new(goalPos.X - hrp.Position.X, 0, goalPos.Z - hrp.Position.Z)
-	local goalD = goalFlat.Magnitude
-	-- progress toward the goal (not just "did we move"); a wandering monster that
-	-- outruns us also reads as stalled, which is correct -- we hop to catch it.
+	local pos = hrp.Position
+	local goalD = (goalPos - pos).Magnitude
+	-- not called for a while (we were fighting / standing on purpose): the stuck
+	-- timers are stale -- restart them, or the first step after every kill reads as
+	-- "stuck 1.3s" and teleport-hops (user saw it as warping like a cheat)
+	if now - (pf.lastCall or 0) > 0.5 then
+		pf.markPos = pos; pf.markAt = now; pf.bestGoalD = goalD; pf.goalProgAt = now; pf.hopping = false
+	end
+	pf.lastCall = now
 	if goalD < pf.bestGoalD - 3 then pf.bestGoalD = goalD; pf.goalProgAt = now end
-	local stuck = now - (pf.goalProgAt or now) > 1.3
-	-- enter a hop burst once stalled; stay in it until we've clearly broken free
+	if not pf.markPos or (pos - pf.markPos).Magnitude > 3 then pf.markPos = pos; pf.markAt = now end
+	local stillFor = now - (pf.markAt or now)
+	-- stage 1 (1.3s not moving): jump + replan, still walking -- invisible
+	-- stage 2 (3s not moving, or 12s orbiting with no progress): teleport-hop burst
+	local wedged = stillFor > 1.3
+	local stuck = pf.forceHop or stillFor > 3 or (now - (pf.goalProgAt or now) > 12)
+	pf.forceHop = false
+	if wedged and not pf.hopping and now - pf.jumpAt > 0.6 then
+		hum.Jump = true; pf.jumpAt = now; pf.goal = nil   -- forces a fresh route below
+	end
 	if stuck and not pf.hopping then
 		pf.hopping = true; pf.hopStartGoalD = goalD; pf.hopStartAt = now
+		stats.hops = (stats.hops or 0) + 1
 	end
-	if pf.hopping and (goalD < (pf.hopStartGoalD or goalD) - 18 or goalD < 8 or now - (pf.hopStartAt or now) > 3) then
-		pf.hopping = false; pf.bestGoalD = goalD; pf.goalProgAt = now
+	-- short bursts: stop as soon as we've broken free (moved 12 closer) or 1.2s
+	if pf.hopping and (goalD < (pf.hopStartGoalD or goalD) - 12 or goalD < 6 or now - (pf.hopStartAt or now) > 1.2) then
+		pf.hopping = false; pf.bestGoalD = goalD; pf.goalProgAt = now; pf.markPos = pos; pf.markAt = now
 	end
 
+	-- Route in the BACKGROUND. ComputeAsync yields for 50-500ms; done inline it froze
+	-- this loop, the character reached its 4-stud waypoint and stood still until the
+	-- new route arrived -- the "เดินๆหยุดๆ" stutter on every replan. Now we keep
+	-- walking the old route (or straight at the goal) while the new one computes.
 	local needReplan = not pf.goal or (goalPos - pf.goal).Magnitude > 10
-		or pf.i > #pf.wps or #pf.wps == 0 or stuck
-	if needReplan and now - pf.at > 0.4 then
-		pf.at = now
+		or pf.i > #pf.wps or #pf.wps == 0 or pf.hopping
+	if needReplan and not pf.computing and now - pf.at > 0.4 then
+		pf.at = now; pf.computing = true; pf.goal = goalPos
 		if not pf.path then pf.path = PFS:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, AgentMaxSlope = 89, WaypointSpacing = 4}) end
-		local ok = pcall(function() pf.path:ComputeAsync(hrp.Position, goalPos) end)
-		if ok and pf.path.Status == Enum.PathStatus.Success then
-			pf.wps = pf.path:GetWaypoints(); pf.i = 2; pf.goal = goalPos
-		else
-			pf.wps = {}; pf.goal = goalPos
+		local path, from, gen = pf.path, pos, pf.gen
+		task.spawn(function()
+			local ok = pcall(function() path:ComputeAsync(from, goalPos) end)
+			pf.computing = false
+			if pf.gen ~= gen then return end   -- pathReset() happened meanwhile: discard
+			if ok and path.Status == Enum.PathStatus.Success then
+				local wps = path:GetWaypoints()
+				-- we kept moving while it computed: resume from the waypoint nearest us
+				local cur = hrp.Position
+				local bi, bd = 2, math.huge
+				for k = 2, math.min(#wps, 12) do
+					local dd = (wps[k].Position - cur).Magnitude
+					if dd < bd then bi, bd = k, dd end
+				end
+				pf.wps = wps; pf.i = bi
+			else
+				pf.wps = {}
+			end
+		end)
+	end
+
+	-- skip waypoints we're already standing on (flat-close AND same height band)
+	local wp = pf.wps[pf.i]
+	while wp and Vector3.new(pos.X - wp.Position.X, 0, pos.Z - wp.Position.Z).Magnitude < 4
+		and math.abs(wp.Position.Y - pos.Y) < 6 do
+		pf.i += 1; wp = pf.wps[pf.i]
+	end
+	local aim = wp and wp.Position or goalPos
+	-- look ahead up to 3 waypoints along flat, jump-free stretches so MoveTo always
+	-- has ~12 studs to cover (no stop at each 4-stud point between loop ticks)
+	if wp then
+		for k = pf.i + 1, math.min(pf.i + 3, #pf.wps) do
+			local w = pf.wps[k]
+			if w.Action == Enum.PathWaypointAction.Jump or math.abs(w.Position.Y - wp.Position.Y) > 2 then break end
+			aim = w.Position
 		end
 	end
 
-	local wp = pf.wps[pf.i]
-	local aim = wp and wp.Position or goalPos
-
-	-- HOP MODE -> teleport-hop past the obstacle toward the aim, snapped to ground.
+	-- HOP MODE: small ground-snapped teleport steps (under the anti-cheat cap).
 	if pf.hopping and goalD > 1 then
-		local flat = Vector3.new(aim.X - hrp.Position.X, 0, aim.Z - hrp.Position.Z)
-		if flat.Magnitude < 2 then flat = goalFlat end
-		if flat.Magnitude > 1 then
-			local hopXZ = hrp.Position + flat.Unit * math.min(9, flat.Magnitude)
-			HOP_PARAMS.FilterDescendantsInstances = {hrp.Parent, workspace:FindFirstChild("Monsters")}
-			local hit = workspace:Raycast(hopXZ + Vector3.new(0, 12, 0), Vector3.new(0, -80, 0), HOP_PARAMS)
-			if hit then
-				hrp.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3, 0))
-			end
-			-- no ground ahead (void/edge): skip this hop; try again next tick
+		local flat = Vector3.new(aim.X - pos.X, 0, aim.Z - pos.Z)
+		if flat.Magnitude < 1 then flat = Vector3.new(goalPos.X - pos.X, 0, goalPos.Z - pos.Z) end
+		if flat.Magnitude > 0.5 then
+			local hopXZ = pos + flat.Unit * math.min(9, flat.Magnitude)
+			-- following a path: snap onto the path surface (just above the waypoint);
+			-- no path: cast from well above so a cliff/plateau top gets hit, not skipped
+			local topY = wp and (math.max(pos.Y, aim.Y) + 6) or (math.max(pos.Y, goalPos.Y) + 22)
+			HOP_PARAMS.FilterDescendantsInstances = {hrp.Parent, workspace:FindFirstChild("Monsters"), workspace:FindFirstChild("BossFx")}
+			local hit = workspace:Raycast(Vector3.new(hopXZ.X, topY, hopXZ.Z), Vector3.new(0, -120, 0), HOP_PARAMS)
+			if hit then hrp.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3, 0)) end
 		end
 		return
 	end
 
 	hum:MoveTo(aim)
 	-- jump to climb: on a Jump waypoint, or when the next point is above us
-	if ((wp and wp.Action == Enum.PathWaypointAction.Jump) or (aim.Y - hrp.Position.Y > 1.5))
+	if ((wp and wp.Action == Enum.PathWaypointAction.Jump) or (aim.Y - pos.Y > 1.5))
 		and now - pf.jumpAt > 0.25 then
 		hum.Jump = true; pf.jumpAt = now
 	end
-	if wp then
-		local flat = Vector3.new(hrp.Position.X - wp.Position.X, 0, hrp.Position.Z - wp.Position.Z)
-		if flat.Magnitude < 4 then pf.i += 1 end
+end
+local function pathReset()
+	pf.gen = (pf.gen or 0) + 1   -- invalidates any route still computing in the background
+	pf.goal = nil; pf.wps = {}; pf.i = 1; pf.bestGoalD = math.huge
+	pf.goalProgAt = os.clock(); pf.hopping = false; pf.markPos = nil; pf.markAt = os.clock()
+	-- stop the game walker ONLY if it's still on OUR travel goal -- the game's own
+	-- chase (after TC.set) also drives PathWalker and must not be cancelled
+	if PW and pf.pwGoal then
+		local ok, g = pcall(PW.goal)
+		if ok and g and (g - pf.pwGoal).Magnitude < 1 then pcall(PW.stop) end
+		pf.pwGoal = nil
 	end
 end
-local function pathReset() pf.goal = nil; pf.wps = {}; pf.i = 1; pf.bestGoalD = math.huge; pf.goalProgAt = os.clock(); pf.hopping = false end
+
+-- Travel = the game's PathWalker (what quest auto-walk uses): exact routes over the
+-- real terrain, ramps and bridges. Our navigator (navTo: PathfindingService +
+-- ground-snapped hops) is only the fallback when the walker makes no progress 4s.
+-- one ground-snapped teleport step (<=9 studs, under the anti-cheat cap) toward target;
+-- snaps from topY down so it lands on the walkable surface along the route
+local function hopStep(hrp, target, topY)
+	local pos = hrp.Position
+	local flat = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
+	if flat.Magnitude < 0.5 then return false end
+	local hopXZ = pos + flat.Unit * math.min(9, flat.Magnitude)
+	HOP_PARAMS.FilterDescendantsInstances = {hrp.Parent, workspace:FindFirstChild("Monsters"), workspace:FindFirstChild("BossFx")}
+	local hit = workspace:Raycast(Vector3.new(hopXZ.X, topY, hopXZ.Z), Vector3.new(0, -120, 0), HOP_PARAMS)
+	if not hit then return false end
+	hrp.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3, 0))
+	return true
+end
+
+-- Auto Ride: the game's own mount toggle (Mounts:InvokeServer("ride", bool)); the
+-- class walk speed is slow, the mount isn't. Throttled; the dodge roll dismounts by itself.
+local lastRideAt = 0
+local function ride(want)
+	if not (e.phRide and MR) then return end
+	local okR, riding = pcall(MR.isRiding)
+	if not okR or riding == want then return end
+	if want and (plr:GetAttribute("Mount") or "") == "" then return end   -- no mount equipped
+	if os.clock() - lastRideAt < 1.5 then return end
+	lastRideAt = os.clock()
+	pcall(MR.toggle, want)
+end
+
+local function pathTo(hum, hrp, goalPos)
+	local now = os.clock()
+	-- a manual push (walk off a terrace edge / up a ramp) is in progress: don't let the
+	-- walker or our own unstick kicks override it with the route that just stalled
+	if now < (pf.manualUntil or 0) then return end
+	if flatDist(hrp.Position, goalPos) > 40 then ride(true) end
+	if not PW or now < (pf.fallbackUntil or 0) then return navTo(hum, hrp, goalPos) end
+	local pos = hrp.Position
+	if now - (pf.pwLast or 0) > 0.5 then pf.pwMark = pos; pf.pwMarkAt = now; pf.pwKick = nil end   -- stale after a pause
+	pf.pwLast = now
+	if not pf.pwMark or (pos - pf.pwMark).Magnitude > 3 then pf.pwMark = pos; pf.pwMarkAt = now; pf.pwKick = nil end
+	local still = now - (pf.pwMarkAt or now)
+	-- Level 1 (1.5s still): the walker only re-issues MoveTo every ~3s per waypoint and
+	-- stalls after anything interrupts it (a dodge stop, a terrace lip). Push toward its
+	-- own next waypoint ourselves + jump, then restart it with a fresh route. Invisible.
+	if still > 1.5 and not pf.pwKick then
+		pf.pwKick = now
+		local okA, route = pcall(PW.ahead)
+		if okA and type(route) == "table" then
+			for _, p in ipairs(route) do
+				if typeof(p) == "Vector3" and flatDist(p, pos) > 2 then hum:MoveTo(p); break end
+			end
+		end
+		hum.Jump = true
+		task.delay(0.6, function()
+			if pf.pwGoal == goalPos or not PW.isWalking() then
+				pcall(PW.stop); pf.pwGoal = goalPos; pf.pwAt = os.clock()
+				pcall(PW.walkTo, goalPos)
+			end
+		end)
+		return
+	end
+	-- Level 2 (3.5s still): hop a short burst ALONG THE WALKER'S OWN ROUTE (ahead()
+	-- = its upcoming waypoints, e.g. up the ramp) -- not straight at the goal through
+	-- a cliff -- then let it walk again. No route at all: our navigator, hopping now.
+	if still > 3.5 then
+		local okA, route = pcall(PW.ahead)
+		local nextPt
+		if okA and type(route) == "table" then
+			for _, p in ipairs(route) do
+				if typeof(p) == "Vector3" and Vector3.new(p.X - pos.X, 0, p.Z - pos.Z).Magnitude > 3 then nextPt = p; break end
+			end
+		end
+		if nextPt then
+			pf.pwHopUntil = pf.pwHopUntil and pf.pwHopUntil > now and pf.pwHopUntil or now + 1.2
+			if now < pf.pwHopUntil then
+				if hopStep(hrp, nextPt, math.max(pos.Y, nextPt.Y) + 6) then stats.hops = (stats.hops or 0) + 1 end
+				return
+			end
+			pf.pwHopUntil = nil; pf.pwMarkAt = now; pf.pwKick = nil
+			pcall(PW.stop); pf.pwAt = now; pf.pwGoal = goalPos
+			pcall(PW.walkTo, goalPos)
+			return
+		end
+		pcall(PW.stop); pf.pwGoal = nil
+		pf.fallbackUntil = now + 6; pf.pwMarkAt = now; pf.pwKick = nil; pf.forceHop = true
+		return navTo(hum, hrp, goalPos)
+	end
+	local okG, g = pcall(PW.goal)
+	g = okG and g or nil
+	if not PW.isWalking() or not g or (g - goalPos).Magnitude > 8 then
+		if now - (pf.pwAt or 0) > 0.6 then
+			pf.pwAt = now; pf.pwGoal = goalPos
+			pcall(PW.walkTo, goalPos)
+		end
+	end
+end
+-- Height gap that means "not on the same floor" (target on a plateau/terrace above
+-- or below us). Same-floor gaps are ~2-6 (root heights differ); a 12-stud plateau
+-- reads ~15. Past this we must PATHFIND (via the ramp), never MoveTo straight at it.
+local FLOOR_GAP = 9
 
 -- Travel with the game's auto OFF (so it doesn't fight our MoveTo and stutter),
 -- then switch it ON only once we're on top of the monster. Re-issue MoveTo only
 -- when the goal shifts, so the walk is smooth instead of restarting every tick.
+-- The game's AUTO (TC.auto) drives auto-target picking AND auto skill casting
+-- (CombatController reads it) and tells the server (AutoState). So for every fight it
+-- stays ON and we set the target like a player click (TC.set) -- the game then
+-- chases it with its own PathWalker (any distance), shoots, and casts skills.
+-- What broke attacks before was TOGGLING it every travel/dodge tick: setAuto(false)
+-- clears the target + tells the server to stop. Now it only goes OFF for walks to a
+-- non-monster spot (warp stone, farm spot, loot) so auto doesn't wander off to hit
+-- random monsters on the way -- a few toggles a minute, not every tick.
 local function setAuto(want)
-	if (TC.auto == true) ~= want then pcall(TC.setAuto, want) end
+	if want then
+		if TC.auto ~= true then pcall(TC.setAuto, true) end
+	elseif TC.auto == true then
+		pcall(TC.setAuto, false)
+	end
 end
 
 -- ------------------------------------------------------- auto field boss
@@ -347,17 +652,21 @@ local function buildFieldBosses()
 	if #FIELD_BOSSES > 0 then return end
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	local okM, M = pcall(require, RS.Shared.Config.Monsters)
-	if not (okZ and okM and type(Z.fields) == "table") then return end
-	for _, f in ipairs(Z.fields) do
+	if not (okZ and okM) then return end
+	-- build from openFields (all 12 biomes, not just the 7 in Z.fields) so the boss
+	-- dropdown is complete through Volcano Valley, not cut off at Moon Base.
+	for _, f in ipairs(openFields(Z)) do
 		local bid = f.boss
-		local d = (M.defs or {})[bid] or {}
-		local name = d.name or bid
-		local lv = tonumber(d.level) or (f.levels and f.levels[2]) or 0
-		local label = ("%s · Lv%d (%s)"):format(name, lv, f.name or f.id)
-		table.insert(FIELD_BOSSES, {fieldId = f.id, bossId = bid, name = name, lv = lv, label = label,
-			respawn = tonumber(d.respawn) or 600})
-		BOSS_LABEL[bid] = label
-		BOSS_LV[bid] = lv
+		if bid and not BOSS_LV[bid] then
+			local d = (M.defs or {})[bid] or {}
+			local name = d.name or bid
+			local lv = tonumber(d.level) or (f.levels and f.levels[2]) or 0
+			local label = ("%s · Lv%d (%s)"):format(name, lv, f.name or f.id)
+			table.insert(FIELD_BOSSES, {fieldId = f.id, bossId = bid, name = name, lv = lv, label = label,
+				respawn = tonumber(d.respawn) or 600})
+			BOSS_LABEL[bid] = label
+			BOSS_LV[bid] = lv
+		end
 	end
 end
 buildFieldBosses()
@@ -369,31 +678,50 @@ buildFieldBosses()
 -- Gold. This gets us to the right field -- and recovers after a death dumps us in town.
 local Net = require(RS.Shared.Net)
 local function beatBoss(bid) return plr:GetAttribute("Beat_" .. tostring(bid)) == true end
-local WARP_STONES = {}         -- cached obelisk positions (static), refreshed occasionally
+-- A WarpStone is an 8.3-wide Platform with a SOLID 2.4-wide Obelisk in the middle and
+-- corner posts. We used to walk at the obelisk's center -- a point INSIDE a solid part,
+-- so both PathWalker and PathfindingService returned no path and we fell back to a
+-- straight MoveTo into whatever cliff was in the way (stood stuck for minutes). Now we
+-- walk to the platform edge facing us: 3.3 from the obelisk, on the platform top,
+-- between the corner posts -- reachable, and still inside the ~6-stud warp range.
+local WARP_STONES = {}         -- {center = obelisk pos, topY = platform top} (static)
 local warpStonesAt = 0
 local function warpStones()
 	if os.clock() - warpStonesAt < 8 and #WARP_STONES > 0 then return WARP_STONES end
 	warpStonesAt = os.clock()
 	WARP_STONES = {}
 	for _, m in ipairs(workspace:GetDescendants()) do
-		if m.Name == "Obelisk" and m:IsA("BasePart") then WARP_STONES[#WARP_STONES + 1] = m.Position end
+		if m.Name == "Obelisk" and m:IsA("BasePart") then
+			local topY = -math.huge   -- highest Platform top (the inner slab you stand on)
+			for _, s in ipairs(m.Parent and m.Parent:GetChildren() or {}) do
+				if s.Name == "Platform" and s:IsA("BasePart") then topY = math.max(topY, s.Position.Y + s.Size.Y / 2) end
+			end
+			if topY == -math.huge then topY = m.Position.Y - m.Size.Y / 2 end
+			WARP_STONES[#WARP_STONES + 1] = {center = m.Position, topY = topY}
+		end
 	end
 	return WARP_STONES
 end
+-- returns: stand point (walk target), distance from us to the obelisk center
 local function nearestStone(pos)
 	local best, bestD
-	for _, p in ipairs(warpStones()) do
-		local d = (p - pos).Magnitude
-		if not best or d < bestD then best, bestD = p, d end
+	for _, s in ipairs(warpStones()) do
+		local d = (s.center - pos).Magnitude
+		if not best or d < bestD then best, bestD = s, d end
 	end
-	return best, bestD
+	if not best then return nil, nil end
+	local c = best.center
+	local dx, dz = pos.X - c.X, pos.Z - c.Z
+	local side = (math.abs(dx) >= math.abs(dz)) and Vector3.new(dx >= 0 and 3.3 or -3.3, 0, 0)
+		or Vector3.new(0, 0, dz >= 0 and 3.3 or -3.3)
+	return Vector3.new(c.X + side.X, best.topY, c.Z + side.Z), bestD
 end
 local function fieldUnlocked(fid)
 	if fid == "town" then return true end
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	if not okZ then return false end
 	local field
-	for _, f in ipairs(Z.fields) do if f.id == fid then field = f break end end
+	for _, f in ipairs(openFields(Z)) do if f.id == fid then field = f break end end
 	if not field then return false end
 	local myLv = tonumber(plr:GetAttribute("Level")) or 1
 	local ok, block = pcall(Z.gateBlock, field, myLv, beatBoss)
@@ -406,18 +734,50 @@ local function isCombatField(fid)
 	if not fid or fid == "town" then return false end
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	if not okZ then return false end
-	for _, f in ipairs(Z.fields) do if f.id == fid and f.levels then return true end end
+	for _, f in ipairs(openFields(Z)) do if f.id == fid and f.levels then return true end end
 	return false
 end
 -- Which field should we be in right now? (curId = the field we're standing in)
+-- workspace.Monsters holds every field's monsters (streaming only drops their parts),
+-- so a selected boss being alive can be checked from anywhere on the map.
+local function bossAlive(bid)
+	for _, m in ipairs(workspace.Monsters:GetChildren()) do
+		if m:GetAttribute("IsBoss") == true and m:GetAttribute("MonsterId") == bid
+			and (tonumber(m:GetAttribute("Health")) or 0) > 0 then return true end
+	end
+	return false
+end
+local function farmSpotField()
+	local fp = e.phFarmPos
+	if type(fp) ~= "table" or not fp.x then return nil end
+	local f = fieldAt(Vector3.new(fp.x, fp.y, fp.z))
+	return f and f.id
+end
 local function wantedField(curId)
 	if not e.phAutoWarp then return nil end
-	-- 1) Auto Field Boss ON: a selected, un-beaten, unlocked boss -> its field.
+	local myLv = tonumber(plr:GetAttribute("Level")) or 1
+	-- 1) Auto Field Boss: a selected boss is UP (and my level is enough) -> its field.
+	--    One in the field we're already in wins.
+	if e.phBossOn and type(e.phBossPick) == "table" then
+		local pick
+		for _, b in ipairs(FIELD_BOSSES) do
+			if e.phBossPick[b.label] and bossAlive(b.bossId)
+				and ((not e.phBossWaitLv) or myLv >= (b.lv or 0)) and fieldUnlocked(b.fieldId) then
+				if b.fieldId == curId then return curId end
+				pick = pick or b.fieldId
+			end
+		end
+		if pick then return pick end
+	end
+	-- 2) A farm spot is set: that's HOME. Go back to its field (warp if needed) and
+	--    farm only there (user: "ตีเฉพาะบอส และมอนตรงจุดที่มาร์ค" -- it was left
+	--    roaming Neon City while the spot was in Volcano).
+	local home = farmSpotField()
+	if home and (home == curId or fieldUnlocked(home)) then return home end
+	-- 3) Boss mode, no spot: wait in a selected boss's field.
 	if e.phBossOn and type(e.phBossPick) == "table" then
 		for _, b in ipairs(FIELD_BOSSES) do
-			if e.phBossPick[b.label] and not beatBoss(b.bossId) and fieldUnlocked(b.fieldId) then
-				return b.fieldId
-			end
+			if e.phBossPick[b.label] and fieldUnlocked(b.fieldId) then return b.fieldId end
 		end
 	end
 	-- 2) Already in a real combat field -> STAY. Never zone-hop on my own just
@@ -430,7 +790,7 @@ local function wantedField(curId)
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	if okZ then
 		local best
-		for _, f in ipairs(Z.fields) do
+		for _, f in ipairs(openFields(Z)) do
 			if f.id ~= "town" and f.levels and myLv >= f.levels[1] and fieldUnlocked(f.id) then
 				best = f.id
 			end
@@ -440,6 +800,9 @@ local function wantedField(curId)
 	return nil
 end
 local lastWarpFire = 0
+-- read-only diagnostics handle
+getgenv().__PHP_DBG = {wantedField = wantedField, fieldUnlocked = fieldUnlocked, farmSpotField = farmSpotField,
+	bossAlive = bossAlive, e = e, FIELD_BOSSES = FIELD_BOSSES}
 
 -- World bosses: rarer event bosses (WorldBoss config, every ~30 min). A live one
 -- is a monster in workspace.Monsters carrying a WorldBoss attribute + MonsterId.
@@ -527,10 +890,11 @@ local function findBossTarget(hrp)
 		if m.PrimaryPart and m:GetAttribute("IsBoss") == true and (tonumber(m:GetAttribute("Health")) or 0) > 0 then
 			local bid = m:GetAttribute("MonsterId")
 			local label = BOSS_LABEL[bid]
-			-- skip bosses already cleared: Beat_<bossId> attr means the field is
-			-- unlocked, so re-fighting it is pointless (user: "ปลดล็อกแล้วยังมาตีอยู่")
-			local beaten = e.phBossUnbeaten and plr:GetAttribute("Beat_" .. tostring(bid)) == true
-			if label and e.phBossPick[label] and not beaten then
+			-- A boss the user EXPLICITLY picked in this dropdown is always fought, beaten
+			-- or not (farming its drops is the point). The "skip beaten" toggle only
+			-- applies to Auto Farm's "ตีบอสฟิลด์ด้วย" unlock mode -- before, it silently
+			-- vetoed every pick for a max-level player who has beaten them all.
+			if label and e.phBossPick[label] then
 				-- level gate: keep farming until I reach the boss's level, then engage.
 				-- the boss's own Level attr wins; fall back to the config level.
 				local bossLv = tonumber(m:GetAttribute("Level")) or BOSS_LV[bid] or 0
@@ -547,7 +911,510 @@ local function findBossTarget(hrp)
 	return best
 end
 
+-- ------------------------------------------------------------- auto dodge
+-- Bosses (and some monsters) telegraph every skill with a BossCast event before it
+-- lands: {id, windup (0.7-2.8s, shorter when enraged), shape, arena, shapes = list of
+--   line   {center, dir, length, width}   -- strip starting at center along dir
+--   circle {center, radius} / ring {center, radius, inner (safe hole)}
+--   safe   {center, radius}                -- shape "shelter": ONLY these are safe
+-- }; a BossHit with the same id fires when it lands. shape "stack" (follows a player,
+-- "stand together to share the hit") is a shared hit, not something to dodge.
+-- We wrap BossFx.play (the client calls it for every one of these) to record them,
+-- and a fast loop walks us to the nearest safe spot on the SAME floor (never off the
+-- arena plateau), dash-rolling (the game's own dodge) when walking won't make it.
+-- The main loop yields movement to this while `dodging` is set.
+local RunService = game:GetService("RunService")
+local hazards = {}
+local dodging = false
+local fightFocus = nil   -- the boss model we're fighting: its LIVE position bounds the dodge
+local DODGE_MARGIN = 2.5
+pcall(function()
+	local BF = require(plr.PlayerScripts.Client.Controllers.BossFx)
+	if not getgenv().__PHP_BFPLAY_ORIG then   -- wrap ONCE; reloads only swap the callback
+		local orig = BF.play
+		getgenv().__PHP_BFPLAY_ORIG = orig
+		BF.play = function(kind, data, ...)
+			local cb = getgenv().__PHP_ONCAST
+			if cb then pcall(cb, kind, data) end
+			return orig(kind, data, ...)
+		end
+	end
+end)
+local okMC, MoveCtl = pcall(require, plr.PlayerScripts.Client.Controllers.MoveController)
+getgenv().__PHP_ONCAST = function(kind, data)
+	if not alive() or type(data) ~= "table" then return end
+	if kind == "BossCast" and type(data.shapes) == "table" then
+		if data.shape == "stack" then return end
+		local _, _, hrp = myChar()
+		if not hrp then return end
+		local near = false
+		for _, s in ipairs(data.shapes) do
+			if typeof(s.center) == "Vector3" and flatDist(s.center, hrp.Position) < 120
+				and math.abs(s.center.Y - hrp.Position.Y) < 30 then near = true; break end
+		end
+		if not near then return end
+		local tEnd = os.clock() + (tonumber(data.windup) or 1) + 0.35
+		-- "mark"-style casts FOLLOW a player during the windup (shape.follow = UserId)
+		-- and only lock right before landing, so walking away early is useless. For
+		-- ones on us: ignore until ~0.45s before impact, then snapshot the circle at
+		-- our position and get out (the short time left triggers the dash-roll).
+		local followMe = false
+		for _, s in ipairs(data.shapes) do if s.follow == plr.UserId then followMe = true end end
+		local arena = type(data.arena) == "table" and typeof(data.arena.center) == "Vector3"
+			and {center = data.arena.center, radius = tonumber(data.arena.radius) or 40} or nil
+		hazards[data.id or os.clock()] = {shapes = data.shapes, shape = data.shape,
+			boss = typeof(data.boss) == "Vector3" and data.boss or nil, arena = arena,
+			tEnd = tEnd, followMe = followMe, tLock = tEnd - 0.35 - 0.45}
+	elseif kind == "BossHit" and data.id ~= nil then
+		local h = hazards[data.id]
+		if h then h.tEnd = math.min(h.tEnd, os.clock() + 0.15) end
+	end
+end
+local function shapeHits(s, p)
+	if typeof(s.center) ~= "Vector3" then return false end
+	local k = s.kind
+	if k == "line" then
+		if typeof(s.dir) ~= "Vector3" then return false end
+		local d = Vector3.new(s.dir.X, 0, s.dir.Z)
+		if d.Magnitude < 0.01 then return false end
+		d = d.Unit
+		local v = Vector3.new(p.X - s.center.X, 0, p.Z - s.center.Z)
+		local along = v:Dot(d)
+		if along < -DODGE_MARGIN or along > (tonumber(s.length) or 0) + DODGE_MARGIN then return false end
+		return (v - d * along).Magnitude < (tonumber(s.width) or 6) / 2 + DODGE_MARGIN
+	elseif k == "safe" or k == "tower" then
+		return false
+	end
+	local dd = flatDist(p, s.center)   -- circle / ring / arena-wide disc
+	if dd > (tonumber(s.radius) or 0) + DODGE_MARGIN then return false end
+	if k == "ring" and dd < (tonumber(s.inner) or 0) - DODGE_MARGIN then return false end
+	return true
+end
+local function hazardHits(h, p)
+	if h.followMe and not h.locked then return false end   -- still tracking us: not yet
+	if h.shape == "shelter" then   -- everything is lethal except inside a safe circle
+		for _, s in ipairs(h.shapes) do
+			if s.kind == "safe" and typeof(s.center) == "Vector3"
+				and flatDist(p, s.center) < (tonumber(s.radius) or 0) - 1.5 then return false end
+		end
+		return true
+	end
+	for _, s in ipairs(h.shapes) do if shapeHits(s, p) then return true end end
+	return false
+end
+local function safeEverywhere(p)
+	for _, h in pairs(hazards) do if hazardHits(h, p) then return false end end
+	return true
+end
+local function sameFloor(p, refY)
+	HOP_PARAMS.FilterDescendantsInstances = {plr.Character, workspace:FindFirstChild("Monsters"), workspace:FindFirstChild("BossFx")}
+	local hit = workspace:Raycast(Vector3.new(p.X, refY + 6, p.Z), Vector3.new(0, -14, 0), HOP_PARAMS)
+	return hit and math.abs(hit.Position.Y + 3 - refY) < 4
+end
+-- Boss fights happen inside the arena circle (BossCast.arena {center, radius}); leaving
+-- it drags us out of range and the boss leashes/resets. So an escape spot must stay
+-- INSIDE the arena (3-stud margin) and is scored to stay within attack range of the
+-- boss. If no safe spot exists inside the circle we return nil = take the hit and keep
+-- attacking (user: "ถ้าหลบไม่ได้ ก็ยอมโดนสกิลไป").
+local ATTACK_RANGE = 38    -- Archer attackRange (Classes.defs); refreshed below per class
+pcall(function()
+	local Classes = require(RS.Shared.Config.Classes)
+	local d = (Classes.defs or Classes)[plr:GetAttribute("Class") or ""]
+	if d and tonumber(d.attackRange) then ATTACK_RANGE = tonumber(d.attackRange) end
+end)
+local function findEscape(pos, bossPos)
+	local arena
+	for _, h in pairs(hazards) do if h.arena then arena = h.arena; break end end
+	local best, bestScore
+	-- HARD limit (not just a score): stay well inside attack range of the boss's live
+	-- position, or the boss loses us and leashes back to full HP
+	local keepIn = math.max(ATTACK_RANGE - 8, 16)
+	local function try(c, extra)
+		if arena and flatDist(c, arena.center) > arena.radius - 3 then return end
+		if bossPos and flatDist(c, bossPos) > keepIn then return end
+		if safeEverywhere(c) and sameFloor(c, pos.Y) then
+			local score = flatDist(pos, c) + (extra or 0) + (bossPos and flatDist(c, bossPos) * 0.25 or 0)
+			if not best or score < bestScore then best, bestScore = c, score end
+		end
+	end
+	for _, h in pairs(hazards) do   -- shelter: the safe circles themselves
+		if h.shape == "shelter" then
+			for _, s in ipairs(h.shapes) do
+				if s.kind == "safe" and typeof(s.center) == "Vector3" then try(Vector3.new(s.center.X, pos.Y, s.center.Z)) end
+			end
+		end
+	end
+	if best then return best end
+	for _, r in ipairs({5, 8, 12, 16, 22, 30}) do   -- nearest ring that has a safe spot
+		for a = 0, 15 do
+			local ang = a * math.pi / 8
+			try(pos + Vector3.new(math.cos(ang) * r, 0, math.sin(ang) * r))
+		end
+		if best then return best end
+	end
+	return nil
+end
+task.spawn(function()
+	local lastRoll = 0
+	while alive() do
+		task.wait(0.05)
+		local now = os.clock()
+		for id, h in pairs(hazards) do if now > h.tEnd then hazards[id] = nil end end
+		if not e.phDodge or not next(hazards) then dodging = false; continue end
+		local _, hum, hrp = myChar()
+		if not hrp then dodging = false; continue end
+		local pos = hrp.Position
+		for _, h in pairs(hazards) do   -- lock follow-marks at our spot just before impact
+			if h.followMe and not h.locked and now >= h.tLock then
+				h.locked = true
+				for _, s in ipairs(h.shapes) do
+					if s.follow == plr.UserId then s.center = Vector3.new(pos.X, s.center and s.center.Y or pos.Y, pos.Z) end
+				end
+			end
+		end
+		local soonest, bossPos = nil, nil
+		for _, h in pairs(hazards) do
+			if hazardHits(h, pos) then
+				soonest = math.min(soonest or math.huge, h.tEnd - now)
+				bossPos = bossPos or h.boss
+			end
+		end
+		if not soonest then
+			if dodging then hum:MoveTo(pos) end   -- reached safety: stop; main loop resumes
+			dodging = false
+			continue
+		end
+		-- bound the escape by where the boss IS now, not where it stood when it cast
+		local ff = fightFocus
+		if ff and ff.Parent and ff.PrimaryPart and (tonumber(ff:GetAttribute("Health")) or 0) > 0 then
+			bossPos = ff.PrimaryPart.Position
+		end
+		local esc = findEscape(pos, bossPos)
+		if not esc then
+			-- nowhere safe inside the arena: take the hit, keep fighting
+			if dodging then hum:MoveTo(pos) end
+			dodging = false
+			stats.tanked = (stats.tanked or 0) + 1
+		end
+		if esc then
+			if not dodging then
+				stats.dodges = (stats.dodges or 0) + 1
+				if PW then pcall(PW.stop) end   -- the game walker would override our MoveTo
+			end
+			dodging = true   -- AUTO + target stay set: we keep shooting while stepping out
+			hum:MoveTo(esc)
+			stats.farm = "หลบสกิลบอส"
+			-- Dash-roll (the game's Q dodge: ~11 studs burst + Dodge remote) when
+			--   * walking can't make it before impact, or
+			--   * we're STILL inside the zone in the last 0.35s (wedged on a monster etc.)
+			-- The roll goes along Humanoid.MoveDirection, so wait until MoveTo has
+			-- actually turned us toward the escape (else the game rolls BACKWARD).
+			local cantWalk = flatDist(pos, esc) > (hum.WalkSpeed * math.max(soonest - 0.15, 0.05)) * 0.8
+			local lastChance = soonest <= 0.35
+			local want = Vector3.new(esc.X - pos.X, 0, esc.Z - pos.Z)
+			-- the roll always dashes ~11 studs: if the landing spot isn't on this same
+			-- floor (arena edge / cliff), rolling throws us OFF the plateau -> walk instead
+			local rollSafe = want.Magnitude > 0.5 and sameFloor(pos + want.Unit * 12, pos.Y)
+				and sameFloor(pos + want.Unit * 6, pos.Y)
+			if okMC and MoveCtl.dodge and rollSafe and now - lastRoll > 0.95 and (cantWalk or lastChance) then
+				lastRoll = now
+				task.spawn(function()
+					for _ = 1, 6 do   -- up to ~6 frames for MoveDirection to line up
+						local md = hum.MoveDirection
+						if want.Magnitude < 0.5 or (md.Magnitude > 0.5 and md.Unit:Dot(want.Unit) > 0.6) then break end
+						RunService.Heartbeat:Wait()
+					end
+					if pcall(MoveCtl.dodge) then stats.rolls = (stats.rolls or 0) + 1 end
+				end)
+			end
+		end
+	end
+end)
+
+-- Fight a monster/boss the way a player does: AUTO on + click it (TC.set). The game's
+-- step() chases it with PathWalker at any distance, stops at attack range, shoots and
+-- casts skills. We only SUPERVISE the chase for stuck:
+--   2.5s not moving while out of range -> jump + PW.stop (step() re-chases next
+--     frame with a fresh route; the walker otherwise only re-issues every ~3s)
+--   5s  -> short ground-snapped hop burst along the walker's own route (PW.ahead)
+--   9s  -> report "stuck" (farm drops the target for a while)
+-- returns "fight" (in range), "chase", or "stuck"
+local chaseMark = {}
+local CLOSE_IN = 6   -- boss fights: stand this close (flat) to the boss
+local function engageTarget(hum, hrp, t, closeIn)
+	setAuto(true)
+	if TC.current ~= t then pcall(TC.set, t) end
+	local now, pos = os.clock(), hrp.Position
+	if chaseMark.t ~= t then chaseMark.idleAt = nil end
+	if chaseMark.t ~= t or not chaseMark.pos or (pos - chaseMark.pos).Magnitude > 3 then
+		chaseMark.t = t; chaseMark.pos = pos; chaseMark.at = now; chaseMark.kick = nil
+	end
+	local tp = t.PrimaryPart.Position
+	-- exactly the game's own in-range test (TargetController step: attackRange +
+	-- target Radius - 0.5, flat) -- with a different cutoff we flip-flopped between
+	-- "chase" and "fight" while the game was happily shooting from the boundary
+	local reach = ATTACK_RANGE + (tonumber(t:GetAttribute("Radius")) or 1) - 0.5
+	if flatDist(tp, pos) <= reach and math.abs(tp.Y - pos.Y) < FLOOR_GAP + 5 then
+		chaseMark.at = now; chaseMark.kick = nil; chaseMark.idleAt = nil
+		ride(false)   -- off the mount to shoot
+		-- Boss: the game's chase parks us at max attack range (38 for Archer) -- right
+		-- at the arena edge (radius 40), so the first dodge stepped us out and the boss
+		-- leashed to full HP. Walk in next to it (keep shooting meanwhile); dodges then
+		-- have room inside the circle.
+		local fd = flatDist(tp, pos)
+		if closeIn and not dodging and fd > CLOSE_IN + (tonumber(t:GetAttribute("Radius")) or 1) + 2 then
+			local away = Vector3.new(pos.X - tp.X, 0, pos.Z - tp.Z)
+			local stand = away.Magnitude > 0.5 and (tp + away.Unit * (CLOSE_IN + (tonumber(t:GetAttribute("Radius")) or 1))) or tp
+			hum:MoveTo(Vector3.new(stand.X, pos.Y, stand.Z))
+		end
+		return "fight"
+	end
+	if flatDist(tp, pos) > reach + 25 then ride(true) end   -- long chase: ride there
+	-- the game's chase sometimes just doesn't start (target a hair past range, or on
+	-- another terrace): if its walker has been idle 0.8s while we're out of range,
+	-- walk there ourselves with the same walker instead of standing around
+	local walking = PW and PW.isWalking()
+	if walking then chaseMark.idleAt = nil else chaseMark.idleAt = chaseMark.idleAt or now end
+	if chaseMark.idleAt and now - chaseMark.idleAt > 0.8 then
+		-- still the same give-up rule: 7s without getting anywhere = unreachable
+		-- (e.g. just past range but below a cliff from the farm spot) -> skip it
+		if now - chaseMark.at > 7 then return "stuck" end
+		pathTo(hum, hrp, tp)
+		return "chase"
+	end
+	-- the game walker still heading somewhere else (an old loot spot / farm spot left
+	-- over from before a warp) fights the chase: drop it so step() re-routes to t
+	if PW then
+		local okG, g = pcall(PW.goal)
+		if okG and g and flatDist(g, tp) > 25 then pcall(PW.stop); pf.pwGoal = nil end
+	end
+	local still = now - chaseMark.at
+	if still > 2 and not chaseMark.kick then
+		chaseMark.kick = now
+		-- push toward the walker's own next waypoint, jump, then let step() re-chase
+		local okA, route = pcall(function() return PW and PW.ahead() end)
+		if okA and type(route) == "table" then
+			for _, p in ipairs(route) do
+				if typeof(p) == "Vector3" and flatDist(p, pos) > 2 then hum:MoveTo(p); break end
+			end
+		end
+		hum.Jump = true
+		task.delay(0.6, function() if PW then pcall(PW.stop) end end)
+	elseif still > 4.5 then
+		local nextPt
+		local okA, route = pcall(function() return PW and PW.ahead() end)
+		if okA and type(route) == "table" then
+			for _, p in ipairs(route) do
+				if typeof(p) == "Vector3" and flatDist(p, pos) > 3 then nextPt = p; break end
+			end
+		end
+		local ok = nextPt and hopStep(hrp, nextPt, math.max(pos.Y, nextPt.Y) + 6)
+			or hopStep(hrp, tp, math.max(pos.Y, tp.Y) + 22)
+		if ok then stats.hops = (stats.hops or 0) + 1 end
+		if still > 7 then return "stuck" end
+	end
+	return "chase"
+end
+
+-- ARENA MAP KNOWLEDGE. Every field's boss arena is a plateau ~12 studs above the field
+-- (ArenaFloor), ringed by cliffs, and its ONLY way up is the one StairRamp whose top
+-- end sits on the arena rim (~40 from the center) at floor height (measured across all
+-- fields). The game's chase measures range flat, so it happily parked us BELOW the
+-- plateau "in range" -- outside the arena circle, where the boss counts nobody in
+-- its arena and leashes back to full HP. So for bosses we route deterministically:
+-- ramp bottom -> straight up the ramp -> onto the arena, then fight.
+local arenaCache = {}   -- fieldId -> {center, radius, floorY, top, bot, topIn, botOut, len}
+local WORLD_RP = RaycastParams.new()
+WORLD_RP.FilterType = Enum.RaycastFilterType.Include
+local function arenaInfo(f)
+	if not (f and f.id and f.arena and f.arena.center) then return nil end
+	local c = arenaCache[f.id]
+	if c then return c end
+	local world = workspace:FindFirstChild("World")
+	local folder = world and world:FindFirstChild("Field_" .. f.id)
+	if not folder then return nil end
+	WORLD_RP.FilterDescendantsInstances = {world}
+	local ac = f.arena.center
+	local aHit = workspace:Raycast(Vector3.new(ac.X, 600, ac.Z), Vector3.new(0, -800, 0), WORLD_RP)
+	if not aHit then   -- not streamed in yet: ask for it, try again next tick
+		task.spawn(function() pcall(plr.RequestStreamAroundAsync, plr, Vector3.new(ac.X, 200, ac.Z), 3) end)
+		return nil
+	end
+	local floorY = aHit.Position.Y
+	local best, bestD
+	for _, p in ipairs(folder:GetDescendants()) do
+		if p:IsA("BasePart") and p.Name == "StairRamp" then
+			local look = p.CFrame.LookVector
+			local e1, e2 = p.Position + look * p.Size.Z / 2, p.Position - look * p.Size.Z / 2
+			local h1 = workspace:Raycast(Vector3.new(e1.X, 600, e1.Z), Vector3.new(0, -800, 0), WORLD_RP)
+			local h2 = workspace:Raycast(Vector3.new(e2.X, 600, e2.Z), Vector3.new(0, -800, 0), WORLD_RP)
+			if h1 and h2 then
+				local top, bot = h1.Position, h2.Position
+				if bot.Y > top.Y then top, bot = bot, top end
+				local d = flatDist(top, ac)
+				if math.abs(top.Y - floorY) < 3 and d < 50 and (not best or d < bestD) then
+					best, bestD = {top = top, bot = bot}, d
+				end
+			end
+		end
+	end
+	if not best then return nil end
+	local dir = Vector3.new(best.top.X - best.bot.X, 0, best.top.Z - best.bot.Z)
+	local u = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+	c = {center = Vector3.new(ac.X, floorY, ac.Z), radius = tonumber(f.arena.radius) or 40, floorY = floorY,
+		top = best.top, bot = best.bot, len = dir.Magnitude,
+		topIn = best.top + u * 5, botOut = best.bot - u * 4}
+	arenaCache[f.id] = c
+	return c
+end
+-- returns true while it's still taking us up onto the arena (caller skips the fight)
+local function climbToArena(hum, hrp, ai)
+	local pos = hrp.Position
+	local onArena = pos.Y > ai.floorY + 1 and flatDist(pos, ai.center) < ai.radius + 2
+	if onArena then return false end
+	setAuto(false)   -- short climb: don't let the game's chase pull another way
+	local onRamp = flatDist(pos, ai.bot) + flatDist(pos, ai.top) <= ai.len + 3 and pos.Y > ai.bot.Y + 1
+	if onRamp or flatDist(pos, ai.bot) < 5 or flatDist(pos, ai.botOut) < 4 then
+		if PW then pcall(PW.stop) end
+		pathReset()
+		hum:MoveTo(ai.topIn)   -- the ramp is one straight walkable slope
+		if hum.MoveDirection.Magnitude < 0.1 then hum.Jump = true end
+	else
+		pathTo(hum, hrp, ai.botOut)
+	end
+	return true
+end
+
+-- Boss loot: after a boss dies its drops scatter around it as Parts named "Loot" in
+-- workspace.LootDrops, and the game's Auto Pickup only grabs what's near you or your
+-- pet. We used to leave the instant it died, so the loot stayed on the ground. Now
+-- we hold a loot phase: wait for drops, walk onto each one near the corpse.
+local lastBoss, lastBossPos = nil, nil
+local lootPhase = nil      -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
+-- LootDrops also shows OTHER players' drops, which we can't pick up: ignore what was
+-- already lying there when our boss died, and anything we've stood on for 1.5s that
+-- didn't vanish (= not ours) -- otherwise we circle someone else's loot for 10s.
+local function nearestLoot(center, pos)
+	local f = workspace:FindFirstChild("LootDrops")
+	if not f then return nil end
+	local lp = lootPhase
+	local now = os.clock()
+	local best, bestD
+	for _, p in ipairs(f:GetChildren()) do
+		-- the game takes a claimable drop (gear/card) once we're within 12 of where it
+		-- landed and retries every 3s if the server says no -- so only call a drop
+		-- "not ours" after standing within 8 of it for 4.5s (covers one retry)
+		if lp and not lp.ignore[p] and p:IsA("BasePart") and flatDist(p.Position, pos) < 8 then
+			lp.nearAt[p] = lp.nearAt[p] or now
+			if now - lp.nearAt[p] > 4.5 then lp.ignore[p] = true end
+		end
+		if p:IsA("BasePart") and not (lp and lp.ignore[p]) and flatDist(p.Position, center) < 80 then
+			local d = flatDist(p.Position, pos)
+			if not best or d < bestD then best, bestD = p, d end
+		end
+	end
+	return best, bestD
+end
+
+-- STEP ASSIST: what a player does by reflex -- if we're being told to walk (MoveDirection
+-- set, by us or by the game's walker) but we've barely moved for 0.4s, we're against
+-- a lip (top of a StairRamp, a terrace step): jump. Cheap, invisible, works on every map.
+-- RAMP PUSH (map knowledge for every StairRamp, not just the arena one): the game's
+-- walker pauses ~3s at ramp ends ("stepping") and sometimes never resumes, leaving us
+-- parked at the top/bottom lip with no MoveTo at all -- so the step assist above never
+-- fires. If we've stood still 1s on or right beside a ramp while a walk is active,
+-- push to the end of that ramp that matches where we're going (up if the goal is
+-- higher, down if lower) and jump.
+local rampEnds = setmetatable({}, {__mode = "k"})   -- ramp part -> {hi = V3, lo = V3}
+local function endsOf(ramp)
+	local c = rampEnds[ramp]
+	if c then return c end
+	local look = ramp.CFrame.LookVector
+	local e1, e2 = ramp.Position + look * ramp.Size.Z / 2, ramp.Position - look * ramp.Size.Z / 2
+	local world = workspace:FindFirstChild("World")
+	if not world then return nil end
+	WORLD_RP.FilterDescendantsInstances = {world}
+	local h1 = workspace:Raycast(Vector3.new(e1.X, ramp.Position.Y + 40, e1.Z), Vector3.new(0, -80, 0), WORLD_RP)
+	local h2 = workspace:Raycast(Vector3.new(e2.X, ramp.Position.Y + 40, e2.Z), Vector3.new(0, -80, 0), WORLD_RP)
+	if not (h1 and h2) then return nil end
+	local hi, lo = h1.Position, h2.Position
+	if lo.Y > hi.Y then hi, lo = lo, hi end
+	local u = Vector3.new(hi.X - lo.X, 0, hi.Z - lo.Z)
+	u = u.Magnitude > 0.1 and u.Unit or Vector3.new(1, 0, 0)
+	c = {hi = hi + u * 4, lo = lo - u * 4}   -- a few studs past each end, off the lip
+	rampEnds[ramp] = c
+	return c
+end
+task.spawn(function()
+	local stillSince, lastPush, lastPos = nil, 0, nil
+	while alive() do
+		task.wait(0.25)
+		local _, hum, hrp = myChar()
+		if not (hum and hrp) or dodging or not (PW and PW.isWalking()) then stillSince = nil; continue end
+		local pos = hrp.Position
+		-- "still" = no real HORIZONTAL progress (jump-bouncing against a lip moves us up
+		-- and down every tick and used to reset this, so the push never fired)
+		if not lastPos or flatDist(pos, lastPos) > 2.5 then lastPos = pos; stillSince = nil
+		else stillSince = stillSince or os.clock() end
+		if stillSince and os.clock() - stillSince > 1 and os.clock() - lastPush > 1.5 then
+			local okG, goal = pcall(PW.goal)
+			if okG and goal then
+				if goal.Y < pos.Y - 5 then
+					-- going DOWN a terrace: no need for the ramp at all -- just walk off
+					-- the edge toward the goal (an 8-stud drop, no damage)
+					local dir = Vector3.new(goal.X - pos.X, 0, goal.Z - pos.Z)
+					if dir.Magnitude > 1 then
+						lastPush = os.clock()
+						pcall(PW.stop)
+						pf.manualUntil = os.clock() + 2   -- hold off the walker/kicks while we drop
+						hum:MoveTo(pos + dir.Unit * math.min(14, dir.Magnitude))
+						stats.rampPush = (stats.rampPush or 0) + 1
+					end
+				else
+					local ramp
+					for _, p in ipairs(workspace:GetPartBoundsInRadius(pos, 14)) do
+						if p.Name == "StairRamp" and p:IsA("BasePart") then ramp = p; break end
+					end
+					local ends = ramp and endsOf(ramp)
+					if ends then
+						lastPush = os.clock()
+						pcall(PW.stop)
+						pf.manualUntil = os.clock() + 2
+						hum:MoveTo((goal.Y > pos.Y + 2) and ends.hi or ends.lo)
+						hum.Jump = true
+						stats.rampPush = (stats.rampPush or 0) + 1
+					end
+				end
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	local blockedSince, lastJump = nil, 0
+	while alive() do
+		task.wait(0.1)
+		local _, hum, hrp = myChar()
+		if hum and hrp and not dodging and hum.MoveDirection.Magnitude > 0.5
+			and hum.FloorMaterial ~= Enum.Material.Air then
+			local v = hrp.AssemblyLinearVelocity
+			if Vector3.new(v.X, 0, v.Z).Magnitude < 3 then
+				blockedSince = blockedSince or os.clock()
+				if os.clock() - blockedSince > 0.4 and os.clock() - lastJump > 0.6 then
+					hum.Jump = true; lastJump = os.clock()
+					stats.stepJumps = (stats.stepJumps or 0) + 1
+				end
+			else
+				blockedSince = nil
+			end
+		else
+			blockedSince = nil
+		end
+	end
+end)
+
 local wdPos, wdAt = nil, os.clock()
+local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on the spot / last target
 task.spawn(function()
 	while alive() do
 		task.wait(0.12)
@@ -555,6 +1422,8 @@ task.spawn(function()
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
 		if not hrp then stats.farm = "รอเกิดใหม่"; wdAt = os.clock(); continue end
+		-- the dodge loop owns movement while a skill telegraph covers us
+		if dodging then wdAt = os.clock(); pathReset(); continue end
 
 		-- WATCHDOG (unattended insurance): if the character is totally frozen -- no
 		-- 4-stud move for 30s -- it's wedged in a state pathTo can't see. Teleport-hop
@@ -578,7 +1447,51 @@ task.spawn(function()
 			farmTarget = nil; engagingFarm = false; engagingBoss = false; pathReset()
 			wdPos = hrp.Position
 			stats.farm = "แก้ติด (watchdog เด้งหลุด)"
+			stats.watchdog = (stats.watchdog or 0) + 1
 			continue
+		end
+
+		-- BOSS LOOT: the boss we were fighting just died -> stay and pick up its drops
+		-- before warping/walking anywhere (wait ~2.5s for them to land, max 10s).
+		if lastBoss and (not lastBoss.Parent or (tonumber(lastBoss:GetAttribute("Health")) or 0) <= 0) then
+			local now0 = os.clock()
+			lootPhase = {center = lastBossPos or hrp.Position, minT = now0 + 2.5, untilT = now0 + 18, ignore = {}, nearAt = {}}
+			stats.kills = (stats.kills or 0) + 1
+			stats.bossKills = (stats.bossKills or 0) + 1
+			local lf = workspace:FindFirstChild("LootDrops")
+			for _, p in ipairs(lf and lf:GetChildren() or {}) do lootPhase.ignore[p] = true end   -- pre-existing = not ours
+			lastBoss = nil
+			fightFocus = nil
+		end
+		if lootPhase then
+			local now0 = os.clock()
+			if now0 > lootPhase.untilT then
+				lootPhase = nil
+			else
+				local drop, dd = nearestLoot(lootPhase.center, hrp.Position)
+				-- a drop we've been walking to for 5s without reaching (on a cliff lip,
+				-- off the walkable area) is skipped instead of circling it for the full phase
+				if drop then
+					if lootPhase.cur ~= drop then lootPhase.cur = drop; lootPhase.curAt = now0 end
+					if now0 - lootPhase.curAt > 5 and dd > 8 then
+						lootPhase.ignore[drop] = true
+						drop = nil
+					end
+				end
+				if drop then
+					setAuto(false)   -- don't let auto drag us to a monster mid-pickup
+					wdAt = os.clock()
+					-- within 5 of where it lies is well inside the game's 12-stud take range
+					if dd > 5 then pathTo(hum, hrp, drop.Position) else pathReset() end
+					stats.farm = "เก็บของบอส"
+					continue
+				elseif now0 < lootPhase.minT then
+					wdAt = os.clock()
+					stats.farm = "รอของบอสดรอป"
+					continue
+				end
+				lootPhase = nil
+			end
 		end
 
 		-- AUTO-WARP: if we're not in the field we should be in (e.g. dumped in town
@@ -596,6 +1509,8 @@ task.spawn(function()
 					stats.farm = ("ไปหินวาร์ป -> %s (ห่าง %.0f)"):format(wf, sd)
 				elseif stone then
 					setAuto(false); pathReset()
+					if PW then pcall(PW.stop) end   -- never carry a walk across a warp
+					lootPhase = nil
 					if os.clock() - lastWarpFire > 2.5 then
 						pcall(function() Net.event("Warp"):FireServer(wf) end)
 						lastWarpFire = os.clock()
@@ -613,18 +1528,33 @@ task.spawn(function()
 		-- small boss moves don't flip the mode off and interrupt attacks.
 		local function fightBoss(boss, tag)
 			needReturn = true
-			local d = (boss.PrimaryPart.Position - hrp.Position).Magnitude
-			if d > (engagingBoss and 35 or ENGAGE_DIST) then
-				engagingBoss = false
-				setAuto(false); pathTo(hum, hrp, boss.PrimaryPart.Position)
-				stats.farm = ("ไป%s %s (ห่าง %.0f)"):format(tag, boss.Name, d)
-			else
-				engagingBoss = true
-				setAuto(true)
-				if TC.current ~= boss then pcall(TC.set, boss) end
-				if d > 8 then hum:MoveTo(boss.PrimaryPart.Position) else hum:MoveTo(hrp.Position); pathReset() end
+			lastBoss, lastBossPos = boss, boss.PrimaryPart.Position   -- for the loot phase
+			-- SHIELD PHASE: the boss raises a shield (Shielded=true) and spawns BossAdd
+			-- helpers; attacking the boss does nothing until they die (they may also heal
+			-- it). Target the nearest add until the shield drops, then the boss again.
+			local t, addMode = boss, false
+			if boss:GetAttribute("Shielded") == true then
+				local add = nearestBossAdd(hrp.Position)
+				if add and add.PrimaryPart then t, addMode = add, true end
+			end
+			fightFocus = boss
+			-- not up on the boss's arena yet: take the known ramp first
+			local ai = arenaInfo(fieldAt(boss.PrimaryPart.Position))
+			if ai and flatDist(boss.PrimaryPart.Position, ai.center) < ai.radius + 10 and climbToArena(hum, hrp, ai) then
+				stats.farm = ("ขึ้นทางลาดลานบอส %s"):format(boss.Name)
+				return
+			end
+			pathReset()   -- our own walk (if any) yields to the game's chase
+			local r = engageTarget(hum, hrp, t, true)
+			engagingBoss = (r == "fight")
+			if r == "fight" then wdAt = os.clock() end   -- standing to shoot is not "stuck"
+			if addMode then
+				stats.farm = ("%s: กำจัดลูกน้อง (โล่ %s)"):format(tag, boss.Name)
+			elseif r == "fight" then
 				stats.farm = ("%s %s (เลือด %d%%)"):format(tag, boss.Name,
 					math.floor((tonumber(boss:GetAttribute("Health")) or 0) / math.max(tonumber(boss:GetAttribute("MaxHealth")) or 1, 1) * 100))
+			else
+				stats.farm = ("ไป%s %s (ห่าง %.0f)"):format(tag, boss.Name, (t.PrimaryPart.Position - hrp.Position).Magnitude)
 			end
 		end
 
@@ -657,9 +1587,82 @@ task.spawn(function()
 			-- the field's best monsters via pickTarget so we level toward the boss.
 		end
 
+		-- STAY PUT: farm spot saved and we're in its field -> stand exactly on it and only
+		-- shoot what's within attack range of it; never walk after monsters. Uses the
+		-- game's own autoStay (AUTO anchors to where it was switched on) with autoRange
+		-- clamped to our attack range so its auto-picks never need a step either.
+		local spot = e.phStayPut and farmAnchor(hrp)
+		if spot then
+			local sp = hrp.Position
+			if flatDist(sp, spot) > 2.5 or math.abs(sp.Y - spot.Y) > 4 then
+				stayAnchored = false
+				setAuto(false)
+				pathTo(hum, hrp, spot)
+				stats.farm = ("กลับไปยืนจุดฟาร์ม (ห่าง %.0f)"):format(flatDist(sp, spot))
+				continue
+			end
+			pathReset()
+			wdAt = os.clock()
+			if GSettings and not getgenv().__PHP_OLDRANGE then
+				pcall(function()
+					getgenv().__PHP_OLDRANGE = GSettings.get("autoRange")
+					GSettings.set("autoRange", math.max(20, math.floor(ATTACK_RANGE)))
+					if GSettings.get("autoStay") ~= true then GSettings.set("autoStay", true) end
+				end)
+			end
+			if not stayAnchored then
+				-- re-anchor the game's AUTO on this exact spot (it anchors where it's turned on)
+				pcall(TC.setAuto, false); pcall(TC.setAuto, true)
+				stayAnchored = true
+			end
+			setAuto(true)
+			-- best monster we can hit from here: in the level window first, then nearest
+			local myLv = tonumber(plr:GetAttribute("Level")) or 1
+			local below = tonumber(e.phFarmBelow) or 99
+			local above = tonumber(e.phFarmAbove) or 10
+			local targetLv = myLv - below + above
+			local best, bestScore
+			for _, m in ipairs(workspace.Monsters:GetChildren()) do
+				if m.PrimaryPart and (tonumber(m:GetAttribute("Health")) or 0) > 0 and m:GetAttribute("Dummy") ~= true
+					and (m:GetAttribute("IsBoss") ~= true or e.phFarmBoss) then
+					local mp = m.PrimaryPart.Position
+					local reach = ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5
+					local fd = flatDist(mp, spot)
+					if fd <= reach and math.abs(mp.Y - spot.Y) < 25 then
+						local lv = tonumber(m:GetAttribute("Level")) or 0
+						local inWin = lv >= myLv - below and lv <= myLv + above
+						local score = (inWin and 0 or 1000) + math.abs(lv - targetLv) * 10 + fd
+						if not best or score < bestScore then best, bestScore = m, score end
+					end
+				end
+			end
+			local cur = TC.current
+			if cur and (not cur.Parent or (tonumber(cur:GetAttribute("Health")) or 0) <= 0) then cur = nil end
+			if stayTarget and stayTarget ~= cur and (not stayTarget.Parent or (tonumber(stayTarget:GetAttribute("Health")) or 0) <= 0) then
+				stats.kills = (stats.kills or 0) + 1
+			end
+			-- never let the current target be something we'd have to walk to
+			if cur and cur.PrimaryPart then
+				local reachC = ATTACK_RANGE + (tonumber(cur:GetAttribute("Radius")) or 1) - 0.5
+				if flatDist(cur.PrimaryPart.Position, spot) > reachC + 1 then pcall(TC.set, nil); cur = nil end
+			end
+			-- keep shooting the current one until it dies (no flip-flopping); then the best
+			if not cur and best then pcall(TC.set, best); cur = best end
+			stayTarget = cur
+			stats.farm = cur and ("ยืนตีที่จุดฟาร์ม: %s L%d"):format(cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
+				or "ยืนรอมอนเข้าระยะที่จุดฟาร์ม"
+			continue
+		elseif getgenv().__PHP_OLDRANGE and GSettings then
+			-- stay mode off (or no spot here): give the player's autoRange back
+			pcall(function() GSettings.set("autoRange", getgenv().__PHP_OLDRANGE) end)
+			getgenv().__PHP_OLDRANGE = nil
+		end
+		stayAnchored = false
+
 		local t = farmTarget
 		local now = os.clock()
 		local dead = not (t and t.Parent and (tonumber(t:GetAttribute("Health")) or 0) > 0)
+		if dead and t and engagingFarm then stats.kills = (stats.kills or 0) + 1; engagingFarm = false end
 		-- re-pick when the target died, or ~once a second while still walking to a
 		-- far one (so a closer/stronger monster that wandered in gets taken instead)
 		local far = t and t.PrimaryPart and (t.PrimaryPart.Position - hrp.Position).Magnitude > ENGAGE_DIST
@@ -685,6 +1688,11 @@ task.spawn(function()
 		local arena = e.phFarmBoss and fbEligible and myF and myF.arena and myF.arena.center
 		if arena and not tIsBoss then
 			local ac = (typeof(arena) == "Vector3") and arena or Vector3.new(arena.X or arena[1] or 436, 0, arena.Z or arena[3] or 112)
+			-- config arena centers are at y=0 (underground): snap onto the real ArenaFloor,
+			-- or the walkers path toward a point inside the terrain and never arrive
+			HOP_PARAMS.FilterDescendantsInstances = {plr.Character, workspace:FindFirstChild("Monsters"), workspace:FindFirstChild("BossFx")}
+			local gHit = workspace:Raycast(Vector3.new(ac.X, hrp.Position.Y + 120, ac.Z), Vector3.new(0, -300, 0), HOP_PARAMS)
+			if gHit then ac = gHit.Position end
 			if (Vector3.new(hrp.Position.X - ac.X, 0, hrp.Position.Z - ac.Z)).Magnitude > 55 then
 				setAuto(false)
 				pathTo(hum, hrp, ac)
@@ -696,39 +1704,47 @@ task.spawn(function()
 		if not (t and t.PrimaryPart) then
 			engagingFarm = false
 			setAuto(false)
+			-- nothing alive near the farm spot: walk back onto it and wait for respawns
+			-- there, instead of standing wherever the last kill happened
+			local anc = farmAnchor(hrp)
+			if anc and flatDist(hrp.Position, anc) > 10 then
+				pathTo(hum, hrp, anc)
+				stats.farm = "กลับจุดฟาร์ม (รอมอนเกิด)"
+				continue
+			end
 			local f = fieldAt(hrp.Position)
+			wdAt = os.clock()   -- waiting on the spot for respawns is not "stuck"
 			stats.farm = f and ("ไม่เจอมอนในฟิลด์ " .. (f.name or f.id) .. (e.phFarmBoss and " (รอบอสเกิด)" or "")) or "ไม่เจอมอนในฟิลด์นี้"
 		else
 			local d = (t.PrimaryPart.Position - hrp.Position).Magnitude
 			local boss = (t:GetAttribute("IsBoss") == true)
-			-- Hysteresis: once in range, hold "engaged" (game auto drives the fight and
-			-- short chases) until the monster is really far (DISENGAGE_DIST). Without
-			-- this, a monster hovering near ENGAGE_DIST flips travel<->attack every tick
-			-- and the character stutters in place ("เดินๆหยุดๆ").
-			local engageCut = engagingFarm and DISENGAGE_DIST or ENGAGE_DIST
-			if d > engageCut then
+			if boss then
+				-- field boss picked in farm mode ("ตีบอสฟิลด์ด้วย"): same treatment as
+				-- Auto Boss -- known ramp onto the arena, stand close, kill the adds while
+				-- it's shielded, loot afterwards
+				fightBoss(t, "ตีบอส")
+				continue
+			end
+			-- AUTO on + click the target: the game chases (PathWalker), shoots and casts
+			-- skills; engageTarget only supervises the chase and reports a hopeless one.
+			pathReset()
+			local r = engageTarget(hum, hrp, t)
+			if r == "stuck" then
+				skipUntil[t] = os.clock() + 12   -- unreachable (wall / bad terrain): pick another
+				farmTarget = nil
 				engagingFarm = false
-				if os.clock() - travelStart > STUCK_S then
-					-- can't reach it (wall / wanderer on bad terrain): drop it, try another
-					skipUntil[t] = os.clock() + 12
-					farmTarget = nil
-					pathReset()
-				else
-					setAuto(false)
-					pathTo(hum, hrp, t.PrimaryPart.Position)
-					stats.farm = ("%s %s L%d (ห่าง %.0f)"):format(boss and "ไปตีบอส" or "เดินไปหา",
-						t.Name, tonumber(t:GetAttribute("Level")) or 0, d)
-				end
-			else
-				-- engaged: let the game auto fight (it handles short chases natively);
-				-- re-lock the target; keep resetting the travel timer so STUCK_S only
-				-- counts time actually spent failing to reach, not time fighting.
+			elseif r == "fight" then
 				engagingFarm = true
 				travelStart = os.clock()
-				setAuto(true)
-				pathReset()
-				if TC.current ~= t then pcall(TC.set, t) end
+				-- a ranged class shoots from one spot for minutes: the watchdog must
+				-- not read that as "frozen" (it was teleport-hopping us away from the
+				-- monsters every 30s -- the "warping away while farming" bug)
+				wdAt = os.clock()
 				stats.farm = ("%s %s L%d"):format(boss and "ตีบอส" or "ตี", t.Name, tonumber(t:GetAttribute("Level")) or 0)
+			else
+				engagingFarm = false
+				stats.farm = ("%s %s L%d (ห่าง %.0f)"):format(boss and "ไปตีบอส" or "เดินไปหา",
+					t.Name, tonumber(t:GetAttribute("Level")) or 0, d)
 			end
 		end
 	end
@@ -777,9 +1793,16 @@ local function sellScan()
 	local list, gold = {}, 0
 	for uid, piece in pairs(g.gear) do
 		local def = Equipment.defs[piece.id]
-		if def and not piece.locked and not equipped[uid] and (tonumber(def.sellPrice) or 0) > 0 then
-			local label = TIER_LABELS[tierOf(def)]
-			if e.phSellTiers[label] then
+		if def and not piece.locked and not equipped[uid] and (tonumber(def.sellPrice) or 0) > 0
+			and not NEVER_SELL[tierOf(def)] then
+			local tier = tierOf(def)
+			local label = TIER_LABELS[tier]
+			-- rarity picked; then its level filter: none picked = every level of it
+			local lvs = e.phSellLv[tostring(tier)]
+			local anyLv = false
+			if type(lvs) == "table" then for _, on in pairs(lvs) do if on then anyLv = true; break end end end
+			local lvOk = (not anyLv) or lvs[tostring(def.level)] == true
+			if e.phSellTiers[label] and lvOk then
 				table.insert(list, uid)
 				gold += tonumber(def.sellPrice) or 0
 			end
@@ -798,6 +1821,43 @@ local function sellNow()
 	end
 	return #list
 end
+
+-- Monster junk: Items type "material" (Sugar Cube, Lava Rock, boss feathers...). They
+-- have no recipe or other use anywhere in the game's configs -- only monster drop
+-- tables -- so they exist to be sold. Counts live as attributes on plr.Inventory.
+-- Selling uses the item shop's own SELL LOOT action: Net.func("Shop"):InvokeServer(
+-- "sellMaterials"), which sells every material and nothing else.
+local function matScan()
+	local inv = plr:FindFirstChild("Inventory")
+	local okI, Items = pcall(require, RS.Shared.Config.Items)
+	if not (inv and okI) then return 0, 0 end
+	local n, gold = 0, 0
+	for id, cnt in pairs(inv:GetAttributes()) do
+		local d = Items.defs[id]
+		if d and d.type == "material" and tonumber(cnt) and cnt > 0 then
+			n += cnt; gold += cnt * (tonumber(d.sellPrice) or 0)
+		end
+	end
+	return n, gold
+end
+stats.mats = "ปิดอยู่"
+task.spawn(function()
+	while alive() do
+		task.wait(3)
+		if not e.phSellMats then stats.mats = "ปิดอยู่"; continue end
+		local n, gold = matScan()
+		if n <= 0 then stats.mats = "ไม่มีวัตถุดิบให้ขาย"; continue end
+		local ok, res = pcall(function() return Net.func("Shop"):InvokeServer("sellMaterials") end)
+		if ok and type(res) == "table" and res.ok then
+			stats.matsSold = (stats.matsSold or 0) + n
+			stats.mats = ("ขายวัตถุดิบ %d ชิ้น (~%d ทอง) แล้ว"):format(n, gold)
+		else
+			stats.mats = "ขายไม่สำเร็จ: " .. tostring(type(res) == "table" and res.error or res)
+		end
+		local wait = math.max(tonumber(e.phSellEvery) or 20, 10)
+		for _ = 1, wait do if not alive() or not e.phSellMats then break end task.wait(1) end
+	end
+end)
 
 task.spawn(function()
 	while alive() do
@@ -912,6 +1972,25 @@ FL:Toggle({Name = "เปิด Auto Farm (เดินหามอนเลเ�
 	Callback = function(v) e.phFarm = v; sv() end}, "PHFarm")
 FL:Toggle({Name = "ตีบอสฟิลด์ด้วย (ปลดล็อกฟิลด์ถัดไป)", Default = e.phFarmBoss,
 	Callback = function(v) e.phFarmBoss = v; sv() end}, "PHFarmBoss")
+FL:Toggle({Name = "└ ข้ามบอสที่ตีผ่านแล้ว (ปลดล็อกด่านแล้ว)", Default = e.phBossUnbeaten,
+	Callback = function(v) e.phBossUnbeaten = v; sv() end}, "PHBossUnbeaten")
+FL:Toggle({Name = "ยืนนิ่งที่จุดฟาร์ม (ไม่เดินไล่มอน ยิงเฉพาะที่ถึง)", Default = e.phStayPut,
+	Callback = function(v) e.phStayPut = v; sv() end}, "PHStayPut")
+local stayLbl
+local function stayText()
+	local fp = e.phFarmPos
+	if type(fp) ~= "table" or not fp.x then return "จุดยืน: ยังไม่ได้ตั้ง (กดปุ่มด้านบนตอนยืนตรงจุดที่ต้องการ)" end
+	return ("จุดยืน: %.0f, %.0f, %.0f"):format(fp.x, fp.y, fp.z)
+end
+FL:Button({Name = "ตั้งจุดยืนฟาร์ม = ตำแหน่งตอนนี้",
+	Callback = function()
+		local _, _, hrp = myChar()
+		if not hrp then return end
+		local p = hrp.Position
+		e.phFarmPos = {x = p.X, y = p.Y, z = p.Z}; sv()
+		pcall(function() stayLbl:UpdateName(stayText()) end)
+	end})
+stayLbl = FL:Label({Text = stayText()})
 FL:Label({Text = "เลือกช่วงเลเวลมอนที่จะฟาร์ม (นับจากเลเวลเรา):"})
 local farmRangeLbl
 local function farmRangeText()
@@ -951,8 +2030,6 @@ BL:Toggle({Name = "เปิด Auto Field Boss (ไปตีบอสฟิล�
 	Callback = function(v) e.phBossOn = v; sv() end}, "PHBossOn")
 BL:Toggle({Name = "รอเวลถึงเลเวลบอสก่อนค่อยไปตี (ระหว่างนั้นฟาร์มมอน)", Default = e.phBossWaitLv,
 	Callback = function(v) e.phBossWaitLv = v; sv() end}, "PHBossWaitLv")
-BL:Toggle({Name = "ข้ามบอสที่ตีผ่านแล้ว (ปลดล็อกด่านแล้ว)", Default = e.phBossUnbeaten,
-	Callback = function(v) e.phBossUnbeaten = v; sv() end}, "PHBossUnbeaten")
 local bossOpts, bossDefault = {}, {}
 for _, b in ipairs(FIELD_BOSSES) do table.insert(bossOpts, b.label) end
 if type(e.phBossPick) == "table" then for lbl, on in pairs(e.phBossPick) do if on then table.insert(bossDefault, lbl) end end end
@@ -980,7 +2057,10 @@ BL:Button({Name = "ตั้งจุดฟาร์ม (ตำแหน่ง�
 		pcall(function() farmPosLbl:UpdateName(farmPosText()) end)
 	end})
 farmPosLbl = BL:Label({Text = farmPosText()})
-BL:Label({Text = "เลือกบอส → บอสเกิดในฟิลด์ที่อยู่ จะไปตี พอตีเสร็จกลับจุดฟาร์ม\nตีได้เฉพาะบอสในฟิลด์เดียวกับจุดฟาร์ม (ข้ามฟิลด์ยังไม่รองรับ)"})
+BL:Label({Text = "บอสที่เลือกจะไปตีเสมอ (ผ่านแล้วก็ตี) พอตายกลับจุดฟาร์ม\nระหว่างรอบอสเกิด ฟาร์มเฉพาะรอบจุดฟาร์ม (รัศมี 70)"})
+
+BL:Toggle({Name = "หลบสกิลบอสอัตโนมัติ (เดินออกวงแดง + กดหลบ)", Default = e.phDodge,
+	Callback = function(v) e.phDodge = v; sv() end}, "PHDodge")
 
 BL:Header({Text = "Auto World Boss"})
 BL:Toggle({Name = "เปิด Auto World Boss (บอสโลก ทุก ~30 นาที)", Default = e.phWBOn,
@@ -1028,16 +2108,76 @@ local tierOpts = {}
 for _, t in ipairs(TIER_ORDER) do table.insert(tierOpts, TIER_LABELS[t]) end
 local tierDefault = {}
 for lbl, on in pairs(e.phSellTiers) do if on then table.insert(tierDefault, lbl) end end
-SLs:Dropdown({Name = "ขั้นของที่จะขาย", Multi = true, Required = false,
+local lvDropdowns = {}   -- tierKey (string) -> level dropdown, shown only while its rarity is picked
+local function refreshLvVisibility()
+	for _, t in ipairs(TIER_ORDER) do
+		local dd = lvDropdowns[tostring(t)]
+		if dd then pcall(function() dd:SetVisibility(e.phSellTiers[TIER_LABELS[t]] == true) end) end
+	end
+end
+local function readMulti(v)
+	local sel = {}
+	if type(v) == "table" then
+		for k, on in pairs(v) do if on == true then sel[k] = true elseif type(k) == "number" then sel[on] = true end end
+	end
+	return sel
+end
+SLs:Dropdown({Name = "Tier ที่จะขาย", Multi = true, Required = false,
 	Options = tierOpts, Default = tierDefault,
 	Callback = function(v)
-		local sel = {}
-		if type(v) == "table" then
-			for k, on in pairs(v) do if on == true then sel[k] = true elseif type(k) == "number" then sel[on] = true end end
-		end
-		e.phSellTiers = sel; sv()
+		e.phSellTiers = readMulti(v); sv()
+		refreshLvVisibility()
 	end}, "PHSellTiers")
-SLs:Label({Text = "ไม่ขายเด็ดขาด: ของที่ lock, ที่ใส่อยู่, ของราคา 0\n(ใช้คำสั่งขายปกติของเกม ไม่ต้องมี Auto Sell Pass)"})
+-- one level picker per rarity: the levels that rarity's gear actually comes in
+-- (from the game's Equipment defs). Nothing picked = sell that rarity at every level.
+do
+	local okE, Eq = pcall(require, RS.Shared.Config.Equipment)
+	for _, t in ipairs(TIER_ORDER) do
+		local key = tostring(t)
+		local levels, seenLv = {}, {}
+		if okE and type(Eq.defs) == "table" then
+			for _, def in pairs(Eq.defs) do
+				if (tonumber(def.sellPrice) or 0) > 0 and tierOf(def) == t and def.level and not seenLv[def.level] then
+					seenLv[def.level] = true
+					table.insert(levels, tonumber(def.level))
+				end
+			end
+		end
+		table.sort(levels)
+		local opts, byLabel, def = {}, {}, {}
+		for _, lv in ipairs(levels) do
+			local lbl = "Lv " .. lv
+			table.insert(opts, lbl); byLabel[lbl] = tostring(lv)
+			if type(e.phSellLv[key]) == "table" and e.phSellLv[key][tostring(lv)] then table.insert(def, lbl) end
+		end
+		if #opts > 0 then
+			lvDropdowns[key] = SLs:Dropdown({Name = ("└ เลเวล %s ที่จะขาย (ไม่เลือก = ขายทุกเลเวล)"):format(TIER_LABELS[t]),
+				Multi = true, Required = false, Search = true, Options = opts, Default = def,
+				Callback = function(v)
+					local picked = {}
+					for lbl in pairs(readMulti(v)) do if byLabel[lbl] then picked[byLabel[lbl]] = true end end
+					e.phSellLv[key] = picked; sv()
+				end}, "PHSellLv_" .. key)
+		end
+	end
+	refreshLvVisibility()
+end
+SLs:Label({Text = "ไม่ขายเด็ดขาด: Tier V, ของดันเจี้ยน (DG), ของที่ lock, ที่ใส่อยู่, ของราคา 0\n(ใช้คำสั่งขายปกติของเกม ไม่ต้องมี Auto Sell Pass)"})
+SLs:Header({Text = "ขยะจากมอน (วัตถุดิบ)"})
+SLs:Toggle({Name = "ขายวัตถุดิบอัตโนมัติ (ปุ่ม SELL LOOT ของเกม)", Default = e.phSellMats,
+	Callback = function(v) e.phSellMats = v; sv() end}, "PHSellMats")
+local matsLbl = SLs:Label({Text = "-"})
+SLs:Label({Text = "ขายเฉพาะไอเทมประเภทวัตถุดิบ (ดรอปจากมอน) ไม่แตะยา/หินตีบวก/อุปกรณ์\nวัตถุดิบในเกมนี้ไม่มีสูตรคราฟต์ใช้ มีไว้ขายอย่างเดียว"})
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			local n, gold = matScan()
+			matsLbl:UpdateName(("ในกระเป๋า: %d ชิ้น (~%s ทอง)\nสถานะ: %s"):format(n,
+				gold >= 1e6 and ("%.2fM"):format(gold / 1e6) or tostring(gold), tostring(stats.mats)))
+		end)
+		task.wait(1)
+	end
+end)
 local SRs = Tabs.Sell:Section({Side = "Right"})
 SRs:Header({Text = "สถานะ"})
 local sellLbl = SRs:Label({Text = "-"})
@@ -1067,11 +2207,21 @@ STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟ�
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
 STs:Toggle({Name = "Auto Warp (วาร์ปไปฟิลด์ที่ถูก / ตายแล้ววาร์ปกลับจากเมือง)", Default = e.phAutoWarp,
 	Callback = function(v) e.phAutoWarp = v; sv() end}, "PHAutoWarp")
+STs:Toggle({Name = "Auto Ride (ขี่สัตว์ตอนเดินไกล / ลงเองตอนเข้าระยะตี)", Default = e.phRide,
+	Callback = function(v) e.phRide = v; sv() end}, "PHRide")
 STs:Label({Text = "กำลังจะมา: Auto World Boss (บอสโลกทุก 30 นาที)"})
 
 task.spawn(function()
 	while alive() do
-		pcall(function() farmLbl:UpdateName("ฟาร์ม: " .. stats.farm) end)
+		pcall(function()
+			-- session farm stats: kills of monsters we were fighting, kill rate, gold/hour
+			local mins = math.max((os.clock() - (stats.sessionAt or os.clock())) / 60, 1 / 60)
+			local gold = tonumber(plr:GetAttribute("Gold")) or 0
+			stats.goldStart = stats.goldStart or gold
+			local gph = (gold - stats.goldStart) / mins * 60
+			farmLbl:UpdateName(("ฟาร์ม: %s\nฆ่าแล้ว %d ตัว (%.1f/นาที) | ทอง %s/ชม."):format(stats.farm, stats.kills or 0,
+				(stats.kills or 0) / mins, gph >= 1e6 and ("%.1fM"):format(gph / 1e6) or ("%.0fk"):format(gph / 1e3)))
+		end)
 		pcall(function() chestLbl:UpdateName("กล่อง: " .. stats.chest) end)
 		pcall(function() if farmRangeLbl then farmRangeLbl:UpdateName(farmRangeText()) end end)
 		pcall(function()
@@ -1090,20 +2240,26 @@ task.spawn(function()
 				bossWasUp[b.bossId] = isUp
 			end
 			-- field boss lines
+			-- realtime: the server publishes each boss's respawn moment as
+			-- workspace.Monsters attribute BossBack_<bossId> (server time) -- the same
+			-- value behind the game's "BACK IN m:ss" pill over each arena
 			local lines = {"= บอสฟิลด์ ="}
+			local srvNow = workspace:GetServerTimeNow()
 			for _, b in ipairs(FIELD_BOSSES) do
 				local m = live[b.bossId]
 				local st
 				if m then
-					st = ("เกิดอยู่ %d%%"):format(math.floor((tonumber(m:GetAttribute("Health")) or 0) / math.max(tonumber(m:GetAttribute("MaxHealth")) or 1, 1) * 100))
-				elseif bossDeadAt[b.bossId] then
-					local left = (bossDeadAt[b.bossId] + (b.respawn or 600)) - now
-					st = left > 0 and ("เกิดใน %d:%02d"):format(math.floor(left / 60), left % 60) or "ใกล้เกิด"
+					st = ("🟢 เกิดแล้ว (เลือด %d%%)"):format(math.floor((tonumber(m:GetAttribute("Health")) or 0) / math.max(tonumber(m:GetAttribute("MaxHealth")) or 1, 1) * 100))
 				else
-					st = "-"
+					local back = tonumber(workspace.Monsters:GetAttribute("BossBack_" .. b.bossId))
+					local left = back and math.ceil(back - srvNow)
+					if left and left > 0 then
+						st = ("⏳ เกิดใน %d:%02d"):format(left // 60, left % 60)
+					else
+						st = "⏳ กำลังเกิด"
+					end
 				end
 				local mark = (type(e.phBossPick) == "table" and e.phBossPick[b.label]) and "✔ " or "· "
-				if plr:GetAttribute("Beat_" .. tostring(b.bossId)) == true then st = "ผ่านแล้ว" end
 				lines[#lines + 1] = ("%s%s Lv%d: %s"):format(mark, b.name, b.lv, st)
 			end
 			-- world boss lines
@@ -1116,7 +2272,33 @@ task.spawn(function()
 					wbUp[#wbUp + 1] = ("%s Lv%s (%s)"):format(m.Name, tostring(m:GetAttribute("Level") or "?"), f and (FIELD_NAME[f.id] or f.id) or "?")
 				end
 			end
-			lines[#lines + 1] = #wbUp > 0 and ("เกิดอยู่: " .. table.concat(wbUp, ", ")) or "ยังไม่เกิด (เกิดทุก ~30 นาที)"
+			-- realtime from the server's ReplicatedStorage attributes (what the game's
+			-- own "WORLD BOSS INCOMING m:ss" banner reads): WorldBoss = "soon" while
+			-- announced, WorldBossAt = landing time, WorldBossEnds = despawn time.
+			local RSa = game:GetService("ReplicatedStorage")
+			local wbState = RSa:GetAttribute("WorldBoss")
+			local wbId = RSa:GetAttribute("WorldBossId")
+			local wbField = RSa:GetAttribute("WorldBossField")
+			local wbName = (wbId and (WB_LABEL[wbId] or WB_LABEL["wb_" .. tostring(wbId)])) or tostring(wbId or "?")
+			local wbWhere = wbField and (FIELD_NAME[wbField] or wbField) or "?"
+			local wbAt = tonumber(RSa:GetAttribute("WorldBossAt"))
+			if wbAt then getgenv().__PHP_WBLAST = wbAt end   -- remember for the next-round estimate
+			if #wbUp > 0 then
+				local ends = tonumber(RSa:GetAttribute("WorldBossEnds"))
+				local left = ends and math.max(0, math.ceil(ends - srvNow))
+				lines[#lines + 1] = "🟢 เกิดแล้ว: " .. table.concat(wbUp, ", ")
+					.. (left and ("  (หายใน %d:%02d)"):format(left // 60, left % 60) or "")
+			elseif wbState == "soon" and wbAt then
+				local left = math.max(0, math.ceil(wbAt - srvNow))
+				lines[#lines + 1] = ("⏳ %s เกิดใน %d:%02d ที่ %s"):format(wbName, left // 60, left % 60, wbWhere)
+			elseif getgenv().__PHP_WBLAST then
+				local nxt = getgenv().__PHP_WBLAST + 1800
+				while nxt < srvNow do nxt += 1800 end
+				local left = math.ceil(nxt - srvNow)
+				lines[#lines + 1] = ("⏳ รอบหน้า ~%d:%02d (ประกาศก่อนเกิด 2 นาที)"):format(left // 60, left % 60)
+			else
+				lines[#lines + 1] = "⏳ ยังไม่ประกาศ (เกิดทุก 30 นาที ประกาศก่อน 2 นาที)"
+			end
 			bossLbl:UpdateName(table.concat(lines, "\n"))
 		end)
 		pcall(function()
@@ -1132,6 +2314,11 @@ end)
 
 W.onUnloaded(function()
 	if getgenv().__PHP == G then getgenv().__PHP = G + 1 end
+	-- give the player's own autoRange back if stay-put mode had clamped it
+	if getgenv().__PHP_OLDRANGE and GSettings then
+		pcall(function() GSettings.set("autoRange", getgenv().__PHP_OLDRANGE) end)
+		getgenv().__PHP_OLDRANGE = nil
+	end
 	print("[PetHunt] Unloaded")
 end)
 Tabs.Farm:Select()
