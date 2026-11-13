@@ -973,17 +973,43 @@ end
 local RunService = game:GetService("RunService")
 local hazards = {}
 local dodging = false
+-- Everything tuned for the crypt boss (wider margins, pools, marks, stars, towers,
+-- channels, shrink ring, per-frame dodge...) is gated on this: field / world boss
+-- (Auto Boss) keeps its original, proven dodge behaviour untouched.
+local function inDG() return plr:GetAttribute("DungeonRun") ~= nil end
+-- channel casts (Requiem / Soul Harvest: "Hit it hard to break the charge!"): unbroken
+-- they land a 5x hit + 5-6s STUN -- the stun is what got us killed. Until this clock
+-- runs out the dungeon logic pours everything into the boss.
+local dgChannelUntil = 0
 local fightFocus = nil   -- the boss model we're fighting: its LIVE position bounds the dodge
 -- the circle that boss is tied to ({center, radius}): world boss = WorldBossSpot r42
 -- (WorldBoss.arena), field boss = its ArenaFloor r40. Leave it (or drag the boss out
 -- of it) and the boss leashes back to full HP -- so we never stand, dodge, or chase
 -- helpers outside it.
 local fightArena = nil
+-- Shrinking ring (BossPhase kind "shrink": center, from -> to over `over` s): the
+-- longer the fight, the smaller the safe circle; outside it ticks damage. Crypt boss:
+-- at 45% HP, down to r20 over 80s. Live radius = the ring's inner edge right now.
+local shrinkZone = nil
+local function shrinkRadius()
+	local z = shrinkZone
+	if not z then return nil end
+	if os.clock() - z.t0 > (z.over or 0) + 240 then shrinkZone = nil; return nil end   -- stale
+	local k = math.clamp((os.clock() - z.t0) / math.max(z.over or 1, 0.1), 0, 1)
+	return z.from + (z.to - z.from) * k, z.center
+end
+local SHRINK_MARGIN = 2
 local function inFightArena(p, margin)
+	if inDG() then
+		local r, c = shrinkRadius()
+		if r and flatDist(p, c) > r - SHRINK_MARGIN - (margin or 0) then return false end
+	end
 	if not fightArena then return true end
 	return flatDist(p, fightArena.center) <= fightArena.radius - (margin or 0)
 end
-local DODGE_MARGIN = 2.5
+local DODGE_MARGIN = 2.5      -- field / world boss (original)
+local DODGE_MARGIN_DG = 3.5   -- dungeon: server judges position late, hits come in chains
+local relaxMargin = nil       -- set for a second, tighter escape search when none was found
 pcall(function()
 	local BF = require(plr.PlayerScripts.Client.Controllers.BossFx)
 	if not getgenv().__PHP_BFPLAY_ORIG then   -- wrap ONCE; reloads only swap the callback
@@ -999,6 +1025,47 @@ end)
 local okMC, MoveCtl = pcall(require, plr.PlayerScripts.Client.Controllers.MoveController)
 getgenv().__PHP_ONCAST = function(kind, data)
 	if not alive() or type(data) ~= "table" then return end
+	-- diagnostics ring buffer (getgenv().__PHP_CASTLOG): what was cast, where we stood
+	pcall(function()
+		if kind ~= "BossCast" and kind ~= "BossLock" and kind ~= "BossHit" and kind ~= "BossPhase" then return end
+		local log = getgenv().__PHP_CASTLOG or {}
+		getgenv().__PHP_CASTLOG = log
+		local _, _, r0 = myChar()
+		local nf, myd, near = 0, nil, nil
+		for _, s in ipairs(type(data.shapes) == "table" and data.shapes or {}) do
+			if type(s) == "table" then
+				if s.follow then nf = nf + 1 end
+				if r0 and typeof(s.center) == "Vector3" then
+					local d = flatDist(s.center, r0.Position) - (tonumber(s.radius) or 0)
+					near = math.min(near or math.huge, d)
+					if s.follow == plr.UserId then myd = flatDist(s.center, r0.Position) end
+				end
+			end
+		end
+		if not near or near > 150 then return end   -- other parties' runs broadcast too
+		local _, h0 = myChar()
+		local vel = r0 and Vector3.new(r0.AssemblyLinearVelocity.X, 0, r0.AssemblyLinearVelocity.Z).Magnitude or 0
+		log[#log + 1] = ("%.2f v=%.0f ws=%s goal=%s %s %s/%s id=%s wu=%s n=%d fol=%d myd=%s edge=%s hp=%s seal=%s dodge=%s"):format(os.clock(),
+			vel, h0 and tostring(math.floor(h0.WalkSpeed)) or "-", tostring(getgenv().__PHP_DGOAL and r0 and math.floor(flatDist(getgenv().__PHP_DGOAL, r0.Position)) or "-"), kind,
+			tostring(data.shape or data.kind), tostring(data.name), tostring(data.id), tostring(data.windup),
+			type(data.shapes) == "table" and #data.shapes or 0, nf, myd and ("%.1f"):format(myd) or "-",
+			("%.1f"):format(near), h0 and h0.MaxHealth > 0 and ("%d%%"):format(h0.Health / h0.MaxHealth * 100) or "-",
+			tostring((tonumber(plr:GetAttribute("SealedUntil")) or 0) > workspace:GetServerTimeNow()), tostring(dodging))
+		if #log > 200 then table.remove(log, 1) end
+	end)
+	-- every party's boss phases are broadcast server-wide: only OUR room's ring counts
+	-- (another run's shrink/clear was overwriting ours -> we walked out of the real ring)
+	if kind == "BossPhase" and data.kind == "shrink" and typeof(data.center) == "Vector3" then
+		local _, _, rS = myChar()
+		if rS and flatDist(data.center, rS.Position) < 150 then
+			shrinkZone = {center = data.center, from = tonumber(data.from) or 60, to = tonumber(data.to) or 20,
+				over = tonumber(data.over) or 60, t0 = os.clock(), model = data.model}
+		end
+		return
+	elseif kind == "BossClear" then
+		if shrinkZone and shrinkZone.model ~= nil and data.model == shrinkZone.model then shrinkZone = nil end
+		return
+	end
 	if kind == "BossCast" and type(data.shapes) == "table" then
 		if data.shape == "stack" then return end
 		local _, _, hrp = myChar()
@@ -1009,25 +1076,58 @@ getgenv().__PHP_ONCAST = function(kind, data)
 				and math.abs(s.center.Y - hrp.Position.Y) < 30 then near = true; break end
 		end
 		if not near then return end
-		local tEnd = os.clock() + (tonumber(data.windup) or 1) + 0.35
+		local impact = os.clock() + (tonumber(data.windup) or 1)
+		local tEnd = impact + 0.35
+		-- channel (Requiem / Soul Harvest: the big slow red circle): NOT dodged (user: "วง
+		-- แดงใหญ่ๆ ที่มันนานๆ ไม่ต้องหลบ ยืนตีคุ้มกว่า") -- stand and pour damage into the boss
+		local dg = inDG()
+		if dg and data.shape == "channel" then dgChannelUntil = impact + 0.2; return end
+		-- "puddles" (Grave Mist etc.): the green pools STAY on the floor for `duration`
+		-- (20s on the crypt boss) ticking damage -- they must stay a hazard that long, or
+		-- we walk straight back into them the moment they land
+		local persist = dg and data.shape == "puddles"
+		if persist then tEnd = impact + (tonumber(data.duration) or 20) + 0.5 end
 		-- "mark"-style casts FOLLOW a player during the windup (shape.follow = UserId)
-		-- and only lock right before landing, so walking away early is useless. For
-		-- ones on us: ignore until ~0.45s before impact, then snapshot the circle at
-		-- our position and get out (the short time left triggers the dash-roll).
+		-- and lock `lock` seconds before landing (Lantern Hex: 0.75s, and it SEALS potions
+		-- for 5s). Snapshot the circle exactly when the game locks it, so we get the whole
+		-- 0.75s to get out instead of a hopeless 0.45s.
 		local followMe = false
 		for _, s in ipairs(data.shapes) do if s.follow == plr.UserId then followMe = true end end
 		local arena = type(data.arena) == "table" and typeof(data.arena.center) == "Vector3"
 			and {center = data.arena.center, radius = tonumber(data.arena.radius) or 40} or nil
-		hazards[data.id or os.clock()] = {shapes = data.shapes, shape = data.shape,
+		local shapes = {}   -- own copies: the lock rewrites centres, the game's fx keep theirs
+		for i, s in ipairs(data.shapes) do shapes[i] = type(s) == "table" and table.clone(s) or s end
+		hazards[data.id or os.clock()] = {shapes = shapes, shape = data.shape,
 			boss = typeof(data.boss) == "Vector3" and data.boss or nil, arena = arena,
-			tEnd = tEnd, followMe = followMe, tLock = tEnd - 0.35 - 0.45}
+			tEnd = tEnd, impact = impact, followMe = followMe, persist = persist,
+			tLock = dg and (impact - math.max(tonumber(data.lock) or 0.75, 0.5)) or (tEnd - 0.35 - 0.45)}
+	elseif kind == "BossLock" and data.id ~= nil and inDG() then
+		-- the server's own lock: exact final centres of the follow-marks (Lantern Hex)
+		local h = hazards[data.id]
+		if h then
+			for i, s in ipairs(type(data.shapes) == "table" and data.shapes or {}) do
+				if h.shapes[i] and typeof(s.center) == "Vector3" then h.shapes[i].center = s.center end
+			end
+			h.locked = true
+		end
 	elseif kind == "BossHit" and data.id ~= nil then
 		local h = hazards[data.id]
-		if h then h.tEnd = math.min(h.tEnd, os.clock() + 0.15) end
+		if h and not h.persist then h.tEnd = math.min(h.tEnd, os.clock() + 0.15) end
+		-- pools land here: (re)register them for their full lifetime even if we missed
+		-- the cast (joined the room mid-skill / were out of the 120-stud window)
+		if inDG() and data.shape == "puddles" and type(data.shapes) == "table" then
+			local life = os.clock() + (tonumber(data.duration) or 20) + 0.5
+			if h then h.tEnd = math.max(h.tEnd, life); h.persist = true
+			else
+				hazards[data.id] = {shapes = data.shapes, shape = "puddles", persist = true, tEnd = life,
+					boss = typeof(data.boss) == "Vector3" and data.boss or nil}
+			end
+		end
 	end
 end
-local function shapeHits(s, p)
+local function shapeHits(s, p, extra)
 	if typeof(s.center) ~= "Vector3" then return false end
+	local DODGE_MARGIN = relaxMargin or (inDG() and DODGE_MARGIN_DG or DODGE_MARGIN)
 	local k = s.kind
 	if k == "line" then
 		if typeof(s.dir) ~= "Vector3" then return false end
@@ -1042,7 +1142,7 @@ local function shapeHits(s, p)
 		return false
 	end
 	local dd = flatDist(p, s.center)   -- circle / ring / arena-wide disc
-	if dd > (tonumber(s.radius) or 0) + DODGE_MARGIN then return false end
+	if dd > (tonumber(s.radius) or 0) + DODGE_MARGIN + (extra or 0) then return false end
 	if k == "ring" and dd < (tonumber(s.inner) or 0) - DODGE_MARGIN then return false end
 	return true
 end
@@ -1055,7 +1155,17 @@ local function hazardHits(h, p)
 		end
 		return true
 	end
-	for _, s in ipairs(h.shapes) do if shapeHits(s, p) then return true end end
+	-- Tomb Wards ("Stand in the tombs, or everyone gets hit!"): safe ONLY inside a tomb
+	local dg = inDG()
+	if dg and h.shape == "towers" then
+		for _, s in ipairs(h.shapes) do
+			if typeof(s.center) == "Vector3" and flatDist(p, s.center) < (tonumber(s.radius) or 5) - 1.5 then return false end
+		end
+		return true
+	end
+	-- marks: the server judges our position ~0.15s late -> clear them by a wider margin
+	local extra = (dg and h.shape == "mark") and 3 or 0
+	for _, s in ipairs(h.shapes) do if shapeHits(s, p, extra) then return true end end
 	return false
 end
 local function safeEverywhere(p)
@@ -1078,31 +1188,84 @@ pcall(function()
 	local d = (Classes.defs or Classes)[plr:GetAttribute("Class") or ""]
 	if d and tonumber(d.attackRange) then ATTACK_RANGE = tonumber(d.attackRange) end
 end)
-local function findEscape(pos, bossPos)
+local function findEscape(pos, bossPos, prefDir)
+	local dg = inDG()
+	if not dg or (prefDir and prefDir.Magnitude < 0.3) then prefDir = nil end
+	local starOn = false
+	for _, h in pairs(hazards) do
+		if dg and h.shape == "star" then
+			starOn = true
+			if not bossPos then
+				bossPos = typeof(h.boss) == "Vector3" and h.boss
+					or (h.shapes[1] and typeof(h.shapes[1].center) == "Vector3" and h.shapes[1].center) or nil
+			end
+		end
+	end
 	local arena
 	for _, h in pairs(hazards) do if h.arena then arena = h.arena; break end end
 	local best, bestScore
 	-- HARD limit (not just a score): stay well inside attack range of the boss's live
 	-- position, or the boss loses us and leashes back to full HP
-	local keepIn = math.max(ATTACK_RANGE - 8, 16)
+	local keepIn = dg and math.max(ATTACK_RANGE + 4, 16) or math.max(ATTACK_RANGE - 8, 16)
 	local function try(c, extra)
 		if arena and flatDist(c, arena.center) > arena.radius - 3 then return end
-		if not inFightArena(c, 3) then return end
+		if not inFightArena(c, dg and 1 or 3) then return end
 		if bossPos and flatDist(c, bossPos) > keepIn then return end
 		if safeEverywhere(c) and sameFloor(c, pos.Y) then
 			local score = flatDist(pos, c) + (extra or 0) + (bossPos and flatDist(c, bossPos) * 0.25 or 0)
+			-- STAR (Spirit Star / Eclipse: 8-12 spokes out of the boss): the gaps between
+			-- spokes only open up far from the boss -- prefer spots well away from it
+			if starOn and bossPos then score = score - math.min(flatDist(c, bossPos), 30) * 0.8 end
+			if prefDir then   -- already running: keep the momentum, don't turn around
+				local v = Vector3.new(c.X - pos.X, 0, c.Z - pos.Z)
+				if v.Magnitude > 0.5 then score = score + (1 - prefDir.Unit:Dot(v.Unit)) * 4 end
+			end
 			if not best or score < bestScore then best, bestScore = c, score end
 		end
 	end
-	for _, h in pairs(hazards) do   -- shelter: the safe circles themselves
-		if h.shape == "shelter" then
+	for _, h in pairs(hazards) do
+		-- channel (Requiem / Soul Harvest): a 5x hit + 5s stun on everyone inside. The boss
+		-- stands still while it charges, so get OUT past its edge even beyond our usual
+		-- arena clamp (no drag: it isn't following) -- the floor check keeps us in the room
+		if dg and h.shape == "channel" then
+			for _, s in ipairs(h.shapes) do
+				if typeof(s.center) == "Vector3" and tonumber(s.radius) then
+					for a = 0, 23 do
+						local ang = a * math.pi / 12
+						local c = Vector3.new(s.center.X + math.cos(ang) * (s.radius + 4), pos.Y, s.center.Z + math.sin(ang) * (s.radius + 4))
+						local sr, sc = shrinkRadius()
+						if (not sr or flatDist(c, sc) <= sr - SHRINK_MARGIN) and safeEverywhere(c) and sameFloor(c, pos.Y) then
+							local score = flatDist(pos, c)
+							if not best or score < bestScore then best, bestScore = c, score end
+						end
+					end
+				end
+			end
+		end
+	end
+	if best then return best end
+	for _, h in pairs(hazards) do   -- shelter / tombs: the safe circles themselves
+		if dg and (h.shape == "shelter" or h.shape == "towers") then
+			for _, s in ipairs(h.shapes) do
+				if (s.kind == "safe" or h.shape == "towers") and typeof(s.center) == "Vector3" then
+					local c = Vector3.new(s.center.X, pos.Y, s.center.Z)
+					-- the game put it there: skip OUR arena clamp / boss-range limit, keep
+					-- only the shrinking ring and the "is it actually safe" checks
+					local sr, sc = shrinkRadius()
+					if (not sr or flatDist(c, sc) <= sr - SHRINK_MARGIN) and safeEverywhere(c) then
+						local score = flatDist(pos, c)
+						if not best or score < bestScore then best, bestScore = c, score end
+					end
+				end
+			end
+		elseif not dg and h.shape == "shelter" then   -- field / world boss: original logic
 			for _, s in ipairs(h.shapes) do
 				if s.kind == "safe" and typeof(s.center) == "Vector3" then try(Vector3.new(s.center.X, pos.Y, s.center.Z)) end
 			end
 		end
 	end
 	if best then return best end
-	for _, r in ipairs({5, 8, 12, 16, 22, 30}) do   -- nearest ring that has a safe spot
+	for _, r in ipairs(dg and {5, 8, 11, 14, 17, 22, 30} or {5, 8, 12, 16, 22, 30}) do   -- nearest ring that has a safe spot
 		for a = 0, 15 do
 			local ang = a * math.pi / 8
 			try(pos + Vector3.new(math.cos(ang) * r, 0, math.sin(ang) * r))
@@ -1111,11 +1274,29 @@ local function findEscape(pos, bossPos)
 	end
 	return nil
 end
+-- The dodge goal is re-issued EVERY FRAME: the game's TargetController re-plants us
+-- (MoveTo(own pos) on target/range changes) between our 0.05s ticks, and a single
+-- MoveTo got us ~5 studs in 0.75s instead of the 16 a held order gives.
+local dodgeGoal = nil
+getgenv().__PHP_DBG = {hazards = hazards, hazardHits = hazardHits, findEscape = findEscape,
+	safeEverywhere = safeEverywhere, inFightArena = inFightArena, shrinkRadius = shrinkRadius,
+	arena = function() return fightArena end}
+local dodgeHB
+dodgeHB = RunService.Heartbeat:Connect(function()
+	if not alive() then dodgeHB:Disconnect(); return end
+	getgenv().__PHP_DGOAL = dodging and dodgeGoal or nil
+	if dodging and dodgeGoal then
+		local _, h = myChar()
+		if h then h:MoveTo(dodgeGoal) end
+	end
+end)
 task.spawn(function()
 	local lastRoll = 0
 	while alive() do
 		task.wait(0.05)
 		local now = os.clock()
+		stats.dodgeTick = now
+		if not dodging then dodgeGoal = nil end
 		for id, h in pairs(hazards) do if now > h.tEnd then hazards[id] = nil end end
 		if not e.phDodge or not next(hazards) then dodging = false; continue end
 		local _, hum, hrp = myChar()
@@ -1129,11 +1310,59 @@ task.spawn(function()
 				end
 			end
 		end
-		local soonest, bossPos = nil, nil
+		local dg = inDG()
+		local soonest, bossPos, urgent = nil, nil, false
 		for _, h in pairs(hazards) do
 			if hazardHits(h, pos) then
-				soonest = math.min(soonest or math.huge, h.tEnd - now)
+				if dg and h.shape == "mark" then urgent = true end   -- seals potions: always roll out
+				-- time to the actual impact (tEnd carries slack; pools have none)
+				local left = (dg and h.impact and not h.persist and now < h.impact) and (h.impact - now) or (h.tEnd - now)
+				soonest = math.min(soonest or math.huge, left)
 				bossPos = bossPos or h.boss
+			end
+		end
+		-- Star up and we're close to the boss: back off even if no spoke is on us right
+		-- now -- the follow-up star (rotated half a step) lands in today's gaps, and
+		-- near the boss there is no gap wide enough to stand in
+		if dg and not soonest then
+			for _, h in pairs(hazards) do
+				local bp = typeof(h.boss) == "Vector3" and h.boss or (h.shapes[1] and typeof(h.shapes[1].center) == "Vector3" and h.shapes[1].center)
+				if h.shape == "star" and bp and flatDist(pos, bp) < 20 and h.impact and now < h.impact + 1.2 then
+					soonest = math.max(h.impact - now, 0.3); bossPos = bp
+					break
+				end
+			end
+		end
+		-- A mark is FOLLOWING us and about to lock: be already running when it locks, so
+		-- after the lock we only need the last ~11 studs with full speed (+ the roll)
+		-- instead of starting from a standstill. Run along the arena, away from danger.
+		if dg and not soonest then
+			local preLock = false
+			for _, h in pairs(hazards) do
+				-- whole windup: be at full speed by the lock, never starting from a standstill
+				if h.followMe and not h.locked and h.tLock - now < 1.6 and h.tLock - now > -0.2 then preLock = true end
+			end
+			if preLock then
+				local md = hum.MoveDirection
+				local bestP, bestS
+				for a = 0, 11 do
+					local ang = a * math.pi / 6
+					local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+					local p = pos + dir * 14
+					if inFightArena(p, 3) and safeEverywhere(p) and safeEverywhere(pos + dir * 7) and sameFloor(p, pos.Y) then
+						local s = (md.Magnitude > 0.3 and (1 - md.Unit:Dot(dir)) * 6 or 0)
+						if fightArena then s = s + flatDist(p, fightArena.center) * 0.15 end
+						if not bestS or s < bestS then bestP, bestS = p, s end
+					end
+				end
+				if bestP then
+					if not dodging and PW then pcall(PW.stop) end
+					dodging = true
+					dodgeGoal = bestP
+					hum:MoveTo(bestP)
+					stats.farm = "วงตามตัว: วิ่งรอหลบ"
+					continue
+				end
 			end
 		end
 		if not soonest then
@@ -1146,7 +1375,16 @@ task.spawn(function()
 		if ff and ff.Parent and ff.PrimaryPart and (tonumber(ff:GetAttribute("Health")) or 0) > 0 then
 			bossPos = ff.PrimaryPart.Position
 		end
-		local esc = findEscape(pos, bossPos)
+		local esc = findEscape(pos, bossPos, hum.MoveDirection)
+		if not esc and dg then
+			-- enraged double stars (Spirit Star + Eclipse, each with a rotated follow-up)
+			-- leave no gap at our usual margin -> we stood still and ate 4 spokes. Take the
+			-- best thin gap there is instead of tanking everything.
+			relaxMargin = 0.8
+			local okE, e2 = pcall(findEscape, pos, bossPos, hum.MoveDirection)
+			relaxMargin = nil
+			if okE then esc = e2 end
+		end
 		if not esc then
 			-- nowhere safe inside the arena: take the hit, keep fighting
 			if dodging then hum:MoveTo(pos) end
@@ -1159,6 +1397,7 @@ task.spawn(function()
 				if PW then pcall(PW.stop) end   -- the game walker would override our MoveTo
 			end
 			dodging = true   -- AUTO + target stay set: we keep shooting while stepping out
+			dodgeGoal = dg and esc or nil   -- per-frame re-issue: dungeon only
 			hum:MoveTo(esc)
 			stats.farm = "หลบสกิลบอส"
 			-- Dash-roll (the game's Q dodge: ~11 studs burst + Dodge remote) when
@@ -1173,7 +1412,16 @@ task.spawn(function()
 			-- floor (arena edge / cliff), rolling throws us OFF the plateau -> walk instead
 			local rollSafe = want.Magnitude > 0.5 and sameFloor(pos + want.Unit * 12, pos.Y)
 				and sameFloor(pos + want.Unit * 6, pos.Y)
-			if okMC and MoveCtl.dodge and rollSafe and now - lastRoll > 0.95 and (cantWalk or lastChance) then
+			-- a potion-sealing mark is about to lock on us: keep the roll (0.9s cd) for it
+			local saveRoll = false
+			if dg and not urgent then
+				for _, h2 in pairs(hazards) do
+					if h2.followMe and not h2.locked and h2.tLock - now < 1.2 then saveRoll = true end
+				end
+			end
+			local wantRoll = dg and (not saveRoll and now - lastRoll > 0.92 and (cantWalk or lastChance or urgent or soonest < 0.95))
+				or (not dg and now - lastRoll > 0.95 and (cantWalk or lastChance))   -- field: original rule
+			if okMC and MoveCtl.dodge and rollSafe and wantRoll then
 				lastRoll = now
 				task.spawn(function()
 					for _ = 1, 6 do   -- up to ~6 frames for MoveDirection to line up
@@ -1607,9 +1855,41 @@ local function dgWalk(hum, hrp, run, goal)
 	end
 end
 local dgMark = {pos = nil, at = 0}
+-- HP potion ourselves at 50% (the game's AUTO waits lower). Lantern Hex SEALS potions
+-- (SealedUntil attr) -- nothing to drink then, so don't waste the call.
+local okCC, CombatC = pcall(require, plr.PlayerScripts.Client.Controllers.CombatController)
+local dgPotAt = 0
+local function dgPotion(hum)
+	if not okCC or type(CombatC) ~= "table" or not CombatC.usePotion then return end
+	-- potions heal a FIXED amount (yellow 6000 of ~53k max = 11%) on a 1s cooldown while
+	-- boss hits take 20-25%: drink on cooldown from 85% down, strongest potion we own
+	-- a potion-sealing mark is coming for us: top up NOW, we can't drink for 5s after
+	local markIncoming = false
+	for _, h in pairs(hazards) do
+		if h.followMe and not h.locked then markIncoming = true; break end
+	end
+	local limit = markIncoming and 0.97 or 0.85
+	if hum.MaxHealth <= 0 or hum.Health <= 0 or hum.Health / hum.MaxHealth > limit then return end
+	if (tonumber(plr:GetAttribute("SealedUntil")) or 0) > workspace:GetServerTimeNow() then return end
+	if os.clock() - dgPotAt < 1.05 then return end
+	dgPotAt = os.clock()
+	local inv = plr:FindFirstChild("Inventory")
+	local okI, Items = pcall(require, RS.Shared.Config.Items)
+	local bestId, bestHeal
+	if inv and okI and Items.defs then
+		for id, n in pairs(inv:GetAttributes()) do
+			local d = Items.defs[id]
+			if d and tonumber(d.heal) and (tonumber(n) or 0) > 0 and (not bestHeal or d.heal > bestHeal) then
+				bestId, bestHeal = id, d.heal
+			end
+		end
+	end
+	if bestId and CombatC.useItem then pcall(CombatC.useItem, bestId) else pcall(CombatC.usePotion, "hp") end
+end
 local function dgTick(hum, hrp)
 	local run = dgRun(hrp)
 	if not run then return false end
+	dgPotion(hum)
 	lootPhase = nil; lastBoss = nil
 	local now = os.clock()
 	local pos = hrp.Position
@@ -1648,41 +1928,191 @@ local function dgTick(hum, hrp)
 	dgStats.chestAt = nil
 	-- current room: the stage attr says which; monsters of our run only
 	local center, radius = dgRoom(run, run.stage)
-	fightArena = center and {center = center, radius = radius} or nil
-	local best, bestScore
+	-- HOLD THE MIDDLE (user: "ลากบอสออกไกลเกินเลือดดี / พยายามอยู่ center"): pulling
+	-- the boss away from its room makes it regen to full. We stand on the room centre,
+	-- only shoot what's in range from there, step at most DG_STEP_R out toward a far
+	-- one, and the dodge loop's escape spots are clamped to DG_ARENA_R of the centre.
+	-- the leash only matters in the boss room; ordinary rooms may be crossed freely
+	-- (ranged mobs at the edge never walk in, and we stood there "waiting" forever)
+	local bossRoom = run.stage >= nStages
+	-- boss room: the throne boss hovers at the room centre; keep inside r40 of it (no
+	-- leash) with room to dodge. Ordinary rooms: the whole room.
+	-- user: "ยืนยิงแล้วหลบแถวๆวงเขียวตรงกลาง (r9)": orbit just outside the sigil, dodge
+	-- within 24 of the centre
+	local DG_HOLD_R, DG_ARENA_R = 5, 32
+	-- boss room: step out up to 24 to keep adds in bow range -- standing "out of range"
+	-- while the ring keeps closing is what made the late fight so cramped
+	local DG_STEP_R = bossRoom and 24 or radius + 6
+	fightArena = center and {center = center, radius = bossRoom and math.min(radius - 4, DG_ARENA_R) or radius + 4} or nil
+	local boss, mobs = nil, {}
 	for _, m in ipairs(workspace.Monsters:GetChildren()) do
 		local mid = m:GetAttribute("MonsterId")
 		if m.PrimaryPart and type(mid) == "string" and mid:sub(1, #run.prefix) == run.prefix
 			and math.abs(m.PrimaryPart.Position.Z - run.laneZ) < 160
 			and (tonumber(m:GetAttribute("Health")) or 0) > 0 then
 			local mp = m.PrimaryPart.Position
-			-- prefer the current room, then whatever's nearest us
-			local inRoom = center and flatDist(mp, center) <= radius + 8
-			local score = (inRoom and 0 or 500) + flatDist(mp, pos)
-			if not best or score < bestScore then best, bestScore = m, score end
+			-- this room only (or something already in range of us): never go hunting
+			-- leftovers down the corridor
+			local reachM = ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5
+			if (center and flatDist(mp, center) <= radius + 10) or flatDist(mp, pos) <= reachM then
+				if m:GetAttribute("IsBoss") == true then boss = m else mobs[#mobs + 1] = m end
+			end
 		end
 	end
-	if best then
-		fightFocus = best:GetAttribute("IsBoss") == true and best or nil
-		pathReset()
-		local r
+	-- boss is immune while its adds are up (Shielded): clear the adds first
+	local pool = mobs
+	if boss and (boss:GetAttribute("Shielded") ~= true or #mobs == 0) then pool = {boss} end
+	local channeling = boss and os.clock() < dgChannelUntil
+	if channeling and boss:GetAttribute("Shielded") ~= true then pool = {boss} end   -- break the charge
+	-- SHIELD PHASE: the boss is immune and its adds (spawned out at the room edge) HEAL
+	-- it every tick -- we stood "out of range" while it went 30% -> 57%. Go get them,
+	-- anywhere in the room; back to the centre once they're dead.
+	-- ...but only so far: wandering out to 40-53 dragged the boss along and that's where
+	-- we died. Step <=20 toward them (bow range covers the rest), not while sealed.
+	local sealedNow = (tonumber(plr:GetAttribute("SealedUntil")) or 0) > workspace:GetServerTimeNow()
+	local addHunt = bossRoom and boss and boss:GetAttribute("Shielded") == true and #mobs > 0 and not sealedNow
+	if addHunt then
+		DG_STEP_R = 20
+		fightArena = center and {center = center, radius = math.min(radius - 3, 32)} or nil
+	end
+	-- a star is up: allow backing off to r32 so the dodge can get out where the gaps are
+	if bossRoom then
+		for _, h in pairs(hazards) do
+			if h.shape == "star" and fightArena then
+				fightArena = {center = fightArena.center, radius = math.max(fightArena.radius, math.min(radius - 3, 32))}
+				break
+			end
+		end
+	end
+	-- SEALED (no potions for 5s): play safe -- hold the spot by the centre, shoot only
+	-- what's already in range, dodge; no stepping out after anything
+	if bossRoom and sealedNow then DG_STEP_R = 0 end
+	if #pool > 0 then
+		local anchor = center and Vector3.new(center.X, pos.Y, center.Z) or pos
+		local function reachOf(m) return ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5 end
+		local function inReach(m, from)
+			local mp = m.PrimaryPart.Position
+			return flatDist(mp, from) <= reachOf(m) and math.abs(mp.Y - from.Y) < 40
+		end
+		-- keep the current target while it's still valid (no flip-flop), else nearest the centre
+		local best
+		local cur = TC.current
+		for _, m in ipairs(pool) do if m == cur then best = m end end
+		if not best then
+			local bestD
+			for _, m in ipairs(pool) do
+				local d = flatDist(m.PrimaryPart.Position, anchor) - reachOf(m)
+				if not bestD or d < bestD then best, bestD = m, d end
+			end
+		end
+		fightFocus = boss
 		local bp = best.PrimaryPart.Position
-		local reach = ATTACK_RANGE + (tonumber(best:GetAttribute("Radius")) or 1) - 0.5
-		if flatDist(bp, pos) <= reach and math.abs(bp.Y - pos.Y) < 40 then
-			-- the throne boss floats ~17 studs up: engageTarget's floor check would call
-			-- that "out of reach" and start hop-kicks. Flat range is what the game uses.
+		-- where to stand: the centre if it reaches; else step toward it, capped at DG_STEP_R
+		-- the room centre, always (user: "พยายามอยู่ center" / "ลากบอสออกโง่ๆ"): standing
+		-- off the boss made us back away as it followed = dragging it. Dodges step out,
+		-- then we come straight back here.
+		local stand = anchor
+		-- BOSS ROOM (user: "ไม่ต้องยืนใต้ตีนบอส แค่ยืนวน center ไม่ออกนอกวงเวลาวงบีบ"):
+		-- circle the room centre at ~14 studs on the side AWAY from the boss -- never
+		-- under it, never far enough to drag it -- shrinking with the closing ring.
+		if bossRoom and center then
+			-- user: "ยืนเว้นระยะห่างน่าจะตายยากขึ้น": orbit ~22 out from the centre on the
+			-- far side of the boss. Anchored to the CENTRE, not the boss, so we never back
+			-- away as it follows (that was the drag) -- just a wider circle around the sigil.
+			local R = 22
+			local sr0 = shrinkRadius()
+			if sr0 then R = math.min(R, math.max(sr0 - SHRINK_MARGIN - 5, 3)) end
+			local bp0 = boss and boss.PrimaryPart and boss.PrimaryPart.Position
+			local dir
+			if bp0 and flatDist(bp0, anchor) > 4 then
+				dir = Vector3.new(anchor.X - bp0.X, 0, anchor.Z - bp0.Z).Unit
+			else
+				-- boss sitting on the centre: hold our spot on the circle (standing still =
+				-- full damage; constant walking only stretched the fight into the tiny ring)
+				local cur = Vector3.new(pos.X - anchor.X, 0, pos.Z - anchor.Z)
+				local ang = (cur.Magnitude > 1 and math.atan2(cur.Z, cur.X) or 0)
+				dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+			end
+			stand = anchor + dir * R
+		end
+		if not inReach(best, stand) then
+			local dir = Vector3.new(bp.X - stand.X, 0, bp.Z - stand.Z)
+			local need = math.min(dir.Magnitude - reachOf(best) + 3, DG_STEP_R)
+			if dir.Magnitude > 0.5 and need > 0 then stand = stand + dir.Unit * need end
+		end
+		-- shrinking ring up: stay well inside its live radius (it keeps closing)
+		local sr, sc = shrinkRadius()
+		if sr then
+			local lim = math.max(sr - SHRINK_MARGIN - 3, 2)
+			local v = Vector3.new(stand.X - sc.X, 0, stand.Z - sc.Z)
+			if v.Magnitude > lim then
+				stand = Vector3.new(sc.X, pos.Y, sc.Z) + (v.Magnitude > 0.5 and v.Unit * lim or Vector3.zero)
+			end
+		end
+		-- never park in a poison pool / live telegraph: nearest clean spot next to it
+		if not safeEverywhere(stand) then
+			local alt = findEscape(stand, boss and boss.PrimaryPart and boss.PrimaryPart.Position or nil)
+			if alt then stand = Vector3.new(alt.X, pos.Y, alt.Z) end
+		end
+		local reachable = inReach(best, stand) or (inReach(best, pos) and inFightArena(pos, 0))
+		if reachable then
 			setAuto(true)
 			if TC.current ~= best then pcall(TC.set, best) end
 			ride(false)
-			r = "fight"
 		else
-			r = engageTarget(hum, hrp, best, fightFocus ~= nil)
-			if r == "stuck" then r = "chase"; pcall(TC.set, nil) end
+			-- out of range even from the edge of our zone: don't target it (the game's
+			-- AUTO chase would drag us -- and the boss -- out); let it come to us
+			if TC.current then pcall(TC.set, nil) end
+			setAuto(false)
 		end
-		if r == "fight" then dgMark.at = now end
+		local off = flatDist(pos, stand)
+		-- a telegraph is still about to land and we're clear of it: STAY. Walking back to
+		-- the orbit spot now cuts straight through the beam we just stepped out of.
+		-- only when the walk back actually crosses it (else keep moving / shooting)
+		local pending = false
+		if not dodging and off > DG_HOLD_R and safeEverywhere(pos) then
+			for _, k in ipairs({0.25, 0.5, 0.75, 1}) do
+				local q = pos:Lerp(Vector3.new(stand.X, pos.Y, stand.Z), k)
+				for _, h in pairs(hazards) do   -- telegraphs about to land, not lingering pools
+					if not h.persist and hazardHits(h, q) then pending = true; break end
+				end
+				if pending then break end
+			end
+		end
+		if pending then
+			pathReset()
+			if PW and PW.isWalking and PW.isWalking() then pcall(PW.stop) end
+			hum:MoveTo(pos)
+			dgMark.at = now
+		elseif not dodging and off > DG_HOLD_R then
+			-- the router (with its jump/hop unstick kicks) only OUTSIDE the room: inside, the
+			-- floor is a flat open disc, and "stuck" there just meant we stood shooting --
+			-- which is what made the character hop around all fight
+			local outside = center and flatDist(pos, anchor) > radius + 2
+			if (stuckFor > 2.5 or dgMark.pathing) and outside then
+				-- walking straight isn't getting there (pillar / ledge): the game's walker
+				-- routes it -- and must NOT be stopped every tick (that froze us at the wall);
+				-- stay on the route until we've arrived
+				dgMark.pathing = true
+				pathTo(hum, hrp, stand)
+			else
+				if PW and PW.isWalking and PW.isWalking() then pcall(PW.stop) end   -- would override MoveTo
+				pathReset()
+				if not outside then dgMark.pathing = false end
+				if center and flatDist(pos, anchor) > radius + 15 then dgWalk(hum, hrp, run, stand) else hum:MoveTo(stand) end
+			end
+		else
+			if not dodging then dgMark.pathing = false end
+			pathReset()
+			dgMark.at = now
+		end
 		local hp = math.floor((tonumber(best:GetAttribute("Health")) or 0) / math.max(tonumber(best:GetAttribute("MaxHealth")) or 1, 1) * 100)
-		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: %s %s (%d%%)"):format(run.stage, nStages,
-			r == "fight" and "ตี" or "ไปหา", best.Name, hp)
+		local what = reachable and "ตี" or "รอเข้าระยะ"
+		if channeling then what = "ทุบให้ร่ายแตก! " .. what end
+		if sr then what = ("[วงบีบ r%d] "):format(sr) .. what end
+		if boss and best ~= boss and boss:GetAttribute("Shielded") == true then what = what .. "ลูกน้อง(บอสมีโล่)" end
+		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: %s %s (%d%%)%s"):format(run.stage, nStages, what, best.Name, hp,
+			off > DG_HOLD_R and " · กลับกลางห้อง" or "")
 		return true
 	end
 	-- room empty (next wave spawning / gate just opened): stand in the room's middle
@@ -1700,6 +2130,62 @@ local function dgTick(hum, hrp)
 	return true
 end
 
+-- AUTO RESPAWN inside a run: the KNOCKED OUT card's RESPAWN button is
+-- Net.event("Revive"):FireServer("respawn"). Only while respawns are left
+-- (DungeonLives) -- at 0 the button would mean leaving the run.
+-- Fallback: press the card's own RESPAWN button (fires its real click handlers), in
+-- case the bare remote call isn't enough. Never the town / leave buttons.
+local function dgClickRespawn()
+	local pg = plr:FindFirstChildOfClass("PlayerGui")
+	if not pg or type(getconnections) ~= "function" then return false end
+	for _, b in ipairs(pg:GetDescendants()) do
+		if b:IsA("GuiButton") and b.Visible then
+			local txt = (b:IsA("TextButton") and b.Text or "")
+			for _, l in ipairs(b:GetDescendants()) do
+				if l:IsA("TextLabel") then txt = txt .. " " .. l.Text end
+			end
+			local up = txt:upper()
+			if (up:find("RESPAWN") or txt:find("เกิดใหม่")) and not up:find("TOWN") and not txt:find("เมือง")
+				and not up:find("LEAVE") and not txt:find("ออก") then
+				local fired = false
+				for _, sig in ipairs({b.Activated, b.MouseButton1Click}) do
+					local okC, cons = pcall(getconnections, sig)
+					if okC then for _, c in ipairs(cons) do pcall(function() c:Fire() end); fired = true end end
+				end
+				if fired then return true end
+			end
+		end
+	end
+	return false
+end
+task.spawn(function()
+	local downAt, lastTry, tries = nil, 0, 0
+	while alive() do
+		task.wait(0.5)
+		local okR, errR = pcall(function()
+			local now = workspace:GetServerTimeNow()
+			local du = tonumber(plr:GetAttribute("DownUntil")) or 0
+			local _, hum0 = myChar()
+			local isDown = plr:GetAttribute("DungeonRun") ~= nil and (du > now or (hum0 ~= nil and hum0.Health <= 0))
+			if not isDown then
+				if downAt then dgStats.respawn = ("เกิดใหม่แล้ว หลังตาย %.0f วิ (กด %d ครั้ง)"):format(os.clock() - downAt, tries) end
+				downAt = nil; tries = 0
+				return
+			end
+			downAt = downAt or os.clock()
+			local lives = tonumber(plr:GetAttribute("DungeonLives")) or 0
+			dgStats.respawn = ("ตายอยู่ %.0f วิ · เหลือเกิด %d · กดไป %d ครั้ง"):format(os.clock() - downAt, lives, tries)
+			if not e.phDgOn or lives <= 0 then return end
+			if os.clock() - downAt < 1.5 or os.clock() - lastTry < 2 then return end
+			lastTry = os.clock(); tries = tries + 1
+			dgStats.status = ("ตาย: กดเกิดใหม่ (เหลือ %d)"):format(lives)
+			Net.event("Revive"):FireServer("respawn")
+			if tries >= 2 then dgClickRespawn() end   -- remote alone didn't take: click the button
+		end)
+		if not okR then dgStats.respawnErr = tostring(errR) end
+	end
+end)
+
 -- server pushes: auto-join ready checks, count results
 local dgConn
 pcall(function()
@@ -1711,8 +2197,10 @@ pcall(function()
 		elseif data.kind == "cancel" then
 			dgStats.waitUntil = 0
 			dgStats.status = "ready check ยกเลิก (" .. tostring(data.reason or "?") .. ")"
-		elseif data.kind == "loading" or data.kind == "start" then
+		elseif data.kind == "loading" or data.kind == "start" or data.kind == "restart" then
 			dgStats.waitUntil = 0
+			dgStats.startedAt = os.clock()
+			shrinkZone = nil   -- new run: the old boss ring is gone
 		elseif data.kind == "result" then
 			dgStats.runs = dgStats.runs + 1
 			if data.win ~= false then dgStats.wins = dgStats.wins + 1 end
@@ -1723,10 +2211,13 @@ pcall(function()
 			if e.phDgReplay then
 				local id = data.dungeon or plr:GetAttribute("DungeonRun")
 				local diff = data.diff or plr:GetAttribute("DungeonDiff")
+				local resAt = os.clock()
 				task.spawn(function()
-					task.wait(2.5)   -- let the card open (the game also preloads loot art)
+					task.wait(0.8)   -- the vote is a remote call; no need to wait for the card's art
 					for _ = 1, 4 do
 						if not alive() or not e.phDgReplay then return end
+						-- the vote already went through (new run started): stop re-voting
+						if (dgStats.startedAt or 0) > resAt then dgStats.status = "REPLAY: เริ่มรอบใหม่"; return end
 						local r = dgCall("replay", id, diff)
 						if r.ok then
 							dgStats.status = r.waiting and "กด REPLAY แล้ว รอทุกคนโหวต" or "REPLAY: เริ่มรอบใหม่"
@@ -1821,8 +2312,26 @@ task.spawn(function()
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
 		if not hrp then stats.farm = inDungeon and "ดันเจี้ยน: รอเกิดใหม่" or "รอเกิดใหม่"; wdAt = os.clock(); continue end
+		-- AUTO RUN: our own MoveTo counts as walking (16) -- the game only runs (x1.5 = 24)
+		-- for shift / its run toggle / its walker / a mount. Keep the run toggle on.
+		if okMC and MoveCtl.toggleRun and MoveCtl.isRunning then
+			if inDungeon then   -- dungeon only
+				local okRun, running = pcall(MoveCtl.isRunning)
+				if okRun and not running then
+					pcall(MoveCtl.toggleRun); getgenv().__PHP_RUNON = true
+				end
+			elseif getgenv().__PHP_RUNON then
+				-- back outside: hand the run toggle back the way we found it (Auto Boss untouched)
+				getgenv().__PHP_RUNON = nil
+				pcall(MoveCtl.toggleRun)
+			end
+		end
 		-- the dodge loop owns movement while a skill telegraph covers us
-		if dodging then wdAt = os.clock(); pathReset(); continue end
+		if dodging then
+			wdAt = os.clock(); pathReset()
+			if inDungeon and e.phDgOn then pcall(dgPotion, hum) end   -- still drink while stepping out
+			continue
+		end
 		if inDungeon then
 			wdAt = os.clock()
 			if getgenv().__PHP_OLDRANGE and GSettings then   -- stay-put's tight autoRange off in here
