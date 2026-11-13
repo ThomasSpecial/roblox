@@ -2232,7 +2232,7 @@ task.spawn(function()
 			downAt = downAt or os.clock()
 			local lives = tonumber(plr:GetAttribute("DungeonLives")) or 0
 			dgStats.respawn = ("ตายอยู่ %.0f วิ · เหลือเกิด %d · กดไป %d ครั้ง"):format(os.clock() - downAt, lives, tries)
-			if not e.phDgOn or lives <= 0 then return end
+			if not (e.phDgOn or e.phAutoRejoin) or lives <= 0 then return end
 			if os.clock() - downAt < 1.5 or os.clock() - lastTry < 2 then return end
 			lastTry = os.clock(); tries = tries + 1
 			dgStats.status = ("ตาย: กดเกิดใหม่ (เหลือ %d)"):format(lives)
@@ -2279,7 +2279,7 @@ pcall(function()
 				-- hold the vote until the chest's drops are picked up (capped: the game sends
 				-- everyone home ~15s after the result)
 				local tW = os.clock()
-				while dgLootPhase and e.phDgOn and os.clock() - tW < 10 and alive() do
+				while dgLootPhase and (e.phDgOn or e.phAutoRejoin) and os.clock() - tW < 10 and alive() do
 					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
 					task.wait(0.2)
 				end
@@ -2378,7 +2378,8 @@ end)
 task.spawn(function()
 	while alive() do
 		task.wait(1)
-		if not e.phDgReplay then if not plr:GetAttribute("DungeonRun") then dgStats.status = "ปิดอยู่" end; continue end
+		-- Auto Start Dungeon (phAutoRejoin) also drives this: in town -> go in
+		if not (e.phDgReplay or e.phAutoRejoin) then if not plr:GetAttribute("DungeonRun") then dgStats.status = "ปิดอยู่" end; continue end
 		if plr:GetAttribute("DungeonRun") then dgStats.status = "อยู่ในรอบ"; continue end
 		if not DG or not DG.enabled() then dgStats.status = "เกมปิดดันเจี้ยนอยู่"; continue end
 		local now = os.clock()
@@ -2441,10 +2442,10 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.12)
 		local inDungeon = plr:GetAttribute("DungeonRun") ~= nil
-		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
 		-- inside a dungeon run the field logic (warp stones, farm spot, field bosses,
 		-- watchdog hops) must never run: a Warp from in here would drag us out
-		if inDungeon and not e.phDgOn then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
+		if inDungeon and not (e.phDgOn or e.phAutoRejoin) then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
 		if not hrp then stats.farm = inDungeon and "ดันเจี้ยน: รอเกิดใหม่" or "รอเกิดใหม่"; wdAt = os.clock(); continue end
@@ -2465,7 +2466,7 @@ task.spawn(function()
 		-- the dodge loop owns movement while a skill telegraph covers us
 		if dodging then
 			wdAt = os.clock(); pathReset()
-			if inDungeon and e.phDgOn then pcall(dgPotion, hum) end   -- still drink while stepping out
+			if inDungeon and (e.phDgOn or e.phAutoRejoin) then pcall(dgPotion, hum) end   -- still drink while stepping out
 			continue
 		end
 		if inDungeon then
@@ -3298,7 +3299,7 @@ DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที�
 		if type(v) == "table" then v = v[1] or next(v) end
 		if dgByLabel[v] then e.phDgPick = dgByLabel[v]; sv() end
 	end}, "PHDgPick")
-DLs:Toggle({Name = "Auto Rejoin (หลุด/โดนเตะ → เข้าเกมใหม่เอง แล้ว Replay พาเข้าดันต่อ)", Default = e.phAutoRejoin,
+DLs:Toggle({Name = "Auto Start Dungeon (อยู่เมือง → เข้าดัน+ตีเอง · หลุด/โดนเตะ → เข้าเกมใหม่แล้วไปต่อ)", Default = e.phAutoRejoin,
 	Callback = function(v) e.phAutoRejoin = v; sv() end}, "PHAutoRejoin")
 DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีวันนี้หมด", Default = e.phDgUseKeys,
 	Callback = function(v) e.phDgUseKeys = v; sv() end}, "PHDgUseKeys")
