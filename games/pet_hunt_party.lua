@@ -71,6 +71,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
 	phDgAccept = false,     -- party member: auto-join the leader's ready check
 	phDgPick = "crypt:hard", phDgUseKeys = true, phDgKeepKeys = 0,
+	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -1855,6 +1856,53 @@ local function dgWalk(hum, hrp, run, goal)
 	end
 end
 local dgMark = {pos = nil, at = 0}
+-- CHEST LOOT (user: "เปิดกล่องในดันเสร็จ รอเก็บของด้วย"): after the boss chest opens,
+-- sweep what it drops (workspace.LootDrops) before the REPLAY vote restarts the run.
+-- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
+local dgLootPhase = nil
+local dgChestPos = nil
+local function dgStartLoot()
+	local now = os.clock()
+	local _, _, hrp0 = myChar()
+	dgLootPhase = {center = dgChestPos or (hrp0 and hrp0.Position), minT = now + 2.5, untilT = now + 12,
+		ignore = {}, nearAt = {}}
+	-- drops already lying around belong to someone else / were already handled
+	local lf = workspace:FindFirstChild("LootDrops")
+	for _, p in ipairs(lf and lf:GetChildren() or {}) do dgLootPhase.ignore[p] = true end
+end
+-- returns true while it's driving the character
+local function dgLootTick(hum, hrp)
+	local lp = dgLootPhase
+	if not lp then return false end
+	local now = os.clock()
+	if now > lp.untilT or not lp.center then dgLootPhase = nil; return false end
+	local pos = hrp.Position
+	local best, bestD
+	local lf = workspace:FindFirstChild("LootDrops")
+	for _, p in ipairs(lf and lf:GetChildren() or {}) do
+		if p:IsA("BasePart") and not lp.ignore[p] and flatDist(p.Position, lp.center) < 70 then
+			local d = flatDist(p.Position, pos)
+			-- stood on it 4.5s and it's still there: not ours to take
+			if d < 8 then
+				lp.nearAt[p] = lp.nearAt[p] or now
+				if now - lp.nearAt[p] > 4.5 then lp.ignore[p] = true end
+			end
+			if not lp.ignore[p] and (not best or d < bestD) then best, bestD = p, d end
+		end
+	end
+	if best then
+		setAuto(false)
+		if bestD > 4 then hum:MoveTo(Vector3.new(best.Position.X, pos.Y, best.Position.Z)) end
+		stats.farm = "ดันเจี้ยน: เก็บของจากหีบ"
+		return true
+	end
+	if now < lp.minT then
+		stats.farm = "ดันเจี้ยน: รอของจากหีบตก"
+		return true
+	end
+	dgLootPhase = nil
+	return false
+end
 -- HP potion ourselves at 50% (the game's AUTO waits lower). Lantern Hex SEALS potions
 -- (SealedUntil attr) -- nothing to drink then, so don't waste the call.
 local okCC, CombatC = pcall(require, plr.PlayerScripts.Client.Controllers.CombatController)
@@ -1891,6 +1939,7 @@ local function dgTick(hum, hrp)
 	if not run then return false end
 	dgPotion(hum)
 	lootPhase = nil; lastBoss = nil
+	if dgLootTick(hum, hrp) then return true end
 	local now = os.clock()
 	local pos = hrp.Position
 	if not dgMark.pos or (pos - dgMark.pos).Magnitude > 3 then dgMark.pos = pos; dgMark.at = now end
@@ -2197,10 +2246,15 @@ pcall(function()
 		elseif data.kind == "cancel" then
 			dgStats.waitUntil = 0
 			dgStats.status = "ready check ยกเลิก (" .. tostring(data.reason or "?") .. ")"
+		elseif data.kind == "chest" then
+			dgChestPos = typeof(data.position) == "Vector3" and data.position or nil
+		elseif data.kind == "chestOpen" then
+			dgStartLoot()
 		elseif data.kind == "loading" or data.kind == "start" or data.kind == "restart" then
 			dgStats.waitUntil = 0
 			dgStats.startedAt = os.clock()
 			shrinkZone = nil   -- new run: the old boss ring is gone
+			dgLootPhase = nil; dgChestPos = nil
 		elseif data.kind == "result" then
 			dgStats.runs = dgStats.runs + 1
 			if data.win ~= false then dgStats.wins = dgStats.wins + 1 end
@@ -2214,6 +2268,13 @@ pcall(function()
 				local resAt = os.clock()
 				task.spawn(function()
 					task.wait(0.8)   -- the vote is a remote call; no need to wait for the card's art
+				-- hold the vote until the chest's drops are picked up (capped: the game sends
+				-- everyone home ~15s after the result)
+				local tW = os.clock()
+				while dgLootPhase and e.phDgOn and os.clock() - tW < 10 and alive() do
+					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
+					task.wait(0.2)
+				end
 					for _ = 1, 4 do
 						if not alive() or not e.phDgReplay then return end
 						-- the vote already went through (new run started): stop re-voting
@@ -2238,6 +2299,35 @@ end)
 if dgConn then
 	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
 end
+
+-- AUTO REJOIN: the "Disconnected / kicked" prompt sets GuiService's error message.
+-- Teleport back into this game (a fresh server). Real's environment doesn't survive
+-- the hop by itself -- cp_boot.lua re-queues itself with queue_on_teleport and loads
+-- this script again, whose saved settings (Auto Dungeon / Auto Replay) take it from
+-- town straight back into the dungeon.
+pcall(function()
+	local GuiService = game:GetService("GuiService")
+	local TeleportService = game:GetService("TeleportService")
+	local rejoining = false
+	local function rejoin(why)
+		if rejoining or not e.phAutoRejoin or not alive() then return end
+		rejoining = true
+		dgStats.status = "หลุด: กำลังเข้าเกมใหม่ (" .. tostring(why):sub(1, 40) .. ")"
+		task.spawn(function()
+			task.wait(3)
+			for _ = 1, 30 do   -- servers can refuse for a while; keep trying ~5 min
+				if not e.phAutoRejoin then break end
+				pcall(function() TeleportService:Teleport(game.PlaceId, plr) end)
+				task.wait(10)
+			end
+			rejoining = false
+		end)
+	end
+	local c = GuiService.ErrorMessageChanged:Connect(function(msg)
+		if type(msg) == "string" and msg ~= "" then rejoin(msg) end
+	end)
+	task.spawn(function() while alive() do task.wait(1) end; c:Disconnect() end)
+end)
 
 -- AUTO REPLAY: back in town -> enter again (solo, or as party leader). A party member
 -- can't start a run; it rides the leader's ready check (auto-joined above).
@@ -3162,6 +3252,8 @@ DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที�
 		if type(v) == "table" then v = v[1] or next(v) end
 		if dgByLabel[v] then e.phDgPick = dgByLabel[v]; sv() end
 	end}, "PHDgPick")
+DLs:Toggle({Name = "Auto Rejoin (หลุด/โดนเตะ → เข้าเกมใหม่เอง แล้ว Replay พาเข้าดันต่อ)", Default = e.phAutoRejoin,
+	Callback = function(v) e.phAutoRejoin = v; sv() end}, "PHAutoRejoin")
 DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีวันนี้หมด", Default = e.phDgUseKeys,
 	Callback = function(v) e.phDgUseKeys = v; sv() end}, "PHDgUseKeys")
 DLs:Slider({Name = "└ เก็บกุญแจไว้อย่างน้อย (ถึงแล้วหยุดเข้า)", Minimum = 0, Maximum = 100, Default = tonumber(e.phDgKeepKeys) or 0,
