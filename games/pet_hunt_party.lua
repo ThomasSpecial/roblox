@@ -67,6 +67,10 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
+	phDgOn = false,         -- Auto Dungeon: clear rooms / boss / open the boss chest while in a run
+	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
+	phDgAccept = false,     -- party member: auto-join the leader's ready check
+	phDgPick = "crypt:hard", phDgUseKeys = true, phDgKeepKeys = 0,
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -1520,6 +1524,283 @@ local function wbWanted()
 end
 wbWantedFwd = wbWanted
 
+-- ------------------------------------------------------------------ DUNGEON
+-- Runs live in workspace.Dungeons; rooms sit in a straight line along +X per slot
+-- (Config.Dungeons.roomCenter(def, slot, stage), slots 520 apart on Z), joined by a
+-- 9-wide corridor. Monsters are ordinary workspace.Monsters entries with MonsterId
+-- "dg_<dungeon>_<diff>_<slot>_<kind><n>". Remote Net.func("Dungeon"):
+--   "state" -> {inRun, keys, free{id=n}, clears, keyPrice}   "enter", id, diff
+--   "ready", bool (party ready check)   "leave" (with the boss chest up = opens it
+--   for everyone first, then back to town)   "loaded" (the game's loader calls it)
+-- Server pushes Effect("Dungeon", {kind = ready|readyState|cancel|loading|start|
+-- stage|restart|gate|elites|miniboss|boss|chest|chestOpen|result}).
+local DG = nil
+pcall(function() DG = require(RS.Shared.Config.Dungeons) end)
+local dgStats = {runs = 0, wins = 0, lastSec = nil, status = "-", waitUntil = 0, lastTry = 0,
+	backAt = 0, chestAt = nil, keys = nil, free = nil, lastErr = nil}
+getgenv().__PHP_DG = dgStats
+local function dgCall(...)
+	local ok, r = pcall(function(...) return Net.func("Dungeon"):InvokeServer(...) end, ...)
+	if ok and type(r) == "table" then return r end
+	return {ok = false}
+end
+local function dgPick()
+	local id, diff = tostring(e.phDgPick or "crypt:hard"):match("^([^:]+):(.+)$")
+	return id or "crypt", diff or "hard"
+end
+-- {def, slot, stage, prefix} for the run we're in (nil outside a run)
+local function dgRun(hrp)
+	local id = plr:GetAttribute("DungeonRun")
+	local def = id and DG and DG.byId[id]
+	if not def then return nil end
+	local slot, bestD = 0, nil
+	for s = 0, math.max((DG.slots or 8) - 1, 0) do
+		local ok, c = pcall(DG.roomCenter, def, s, 1)
+		if ok and c then
+			local d = math.abs(c.Z - hrp.Position.Z)
+			if not bestD or d < bestD then slot, bestD = s, d end
+		end
+	end
+	local stage = math.clamp(tonumber(plr:GetAttribute("DungeonStage")) or 1, 1, #def.stages)
+	local diff = plr:GetAttribute("DungeonDiff") or "normal"
+	-- the number in the id is the difficulty tier, NOT the slot: our run's monsters are
+	-- told apart from other parties' runs by lane (slots sit 520 apart on Z)
+	local okC, c1 = pcall(DG.roomCenter, def, slot, 1)
+	return {def = def, id = id, slot = slot, stage = stage, laneZ = okC and c1 and c1.Z or hrp.Position.Z,
+		prefix = ("dg_%s_%s_"):format(id, diff)}
+end
+local function dgRoom(run, stage)
+	local ok, c = pcall(DG.roomCenter, run.def, run.slot, stage)
+	return ok and c or nil, run.def.stages[stage] and run.def.stages[stage].radius or 30
+end
+-- the boss chest's prompt (spawns after the boss dies, near the throne room)
+local function dgChestPrompt(run, hrp)
+	local c = dgRoom(run, #run.def.stages) or hrp.Position
+	local best, bestD
+	local function consider(p)
+		if p:IsA("ProximityPrompt") and p.Enabled then
+			local part = p.Parent
+			if part and part:IsA("Attachment") then part = part.Parent end
+			if part and part:IsA("BasePart") then
+				local d = flatDist(part.Position, c)
+				if d < 140 and (not best or d < bestD) then best, bestD = p, d end
+			end
+		end
+	end
+	local root = workspace:FindFirstChild("Dungeons")
+	for _, p in ipairs(root and root:GetDescendants() or {}) do consider(p) end
+	for _, ch in ipairs(workspace:GetChildren()) do
+		if ch:IsA("Model") and ch.Name:lower():find("chest") then
+			for _, p in ipairs(ch:GetDescendants()) do consider(p) end
+		end
+	end
+	return best
+end
+-- walk along the room line: get onto the corridor's Z first, then straight along X
+local function dgWalk(hum, hrp, run, goal)
+	local pos = hrp.Position
+	local slotZ = (dgRoom(run, 1) or goal).Z
+	if math.abs(goal.X - pos.X) > 20 and math.abs(pos.Z - slotZ) > 4 then
+		hum:MoveTo(Vector3.new(pos.X, pos.Y, slotZ))
+	else
+		hum:MoveTo(Vector3.new(goal.X, pos.Y, goal.Z))
+	end
+end
+local dgMark = {pos = nil, at = 0}
+local function dgTick(hum, hrp)
+	local run = dgRun(hrp)
+	if not run then return false end
+	lootPhase = nil; lastBoss = nil
+	local now = os.clock()
+	local pos = hrp.Position
+	if not dgMark.pos or (pos - dgMark.pos).Magnitude > 3 then dgMark.pos = pos; dgMark.at = now end
+	local stuckFor = now - dgMark.at
+	local nStages = #run.def.stages
+	-- BOSS CHEST: walk to it and open it; if no prompt turns up / the server ignores
+	-- it for 20s, "leave" -- with the chest up that opens it for everyone first
+	if plr:GetAttribute("DungeonChest") == true then
+		dgStats.chestAt = dgStats.chestAt or now
+		fightArena = nil; fightFocus = nil
+		local prompt = dgChestPrompt(run, hrp)
+		local part = prompt and prompt.Parent
+		if part and part:IsA("Attachment") then part = part.Parent end
+		setAuto(false)
+		if part then
+			local d = flatDist(part.Position, pos)
+			if d > math.max((prompt.MaxActivationDistance or 10) - 3, 4) then
+				if stuckFor > 3 then pathTo(hum, hrp, part.Position) else dgWalk(hum, hrp, run, part.Position) end
+				stats.farm = ("ดันเจี้ยน: ไปเปิดหีบบอส (ห่าง %.0f)"):format(d)
+			else
+				pathReset()
+				pcall(fireproximityprompt, prompt)
+				stats.farm = "ดันเจี้ยน: เปิดหีบบอส"
+			end
+		else
+			stats.farm = "ดันเจี้ยน: หาหีบบอส"
+		end
+		if now - dgStats.chestAt > 20 then
+			dgStats.chestAt = now   -- retry window, not a spam loop
+			task.spawn(dgCall, "leave")
+			stats.farm = "ดันเจี้ยน: เปิดหีบให้ทุกคน (Leave)"
+		end
+		return true
+	end
+	dgStats.chestAt = nil
+	-- current room: the stage attr says which; monsters of our run only
+	local center, radius = dgRoom(run, run.stage)
+	fightArena = center and {center = center, radius = radius} or nil
+	local best, bestScore
+	for _, m in ipairs(workspace.Monsters:GetChildren()) do
+		local mid = m:GetAttribute("MonsterId")
+		if m.PrimaryPart and type(mid) == "string" and mid:sub(1, #run.prefix) == run.prefix
+			and math.abs(m.PrimaryPart.Position.Z - run.laneZ) < 160
+			and (tonumber(m:GetAttribute("Health")) or 0) > 0 then
+			local mp = m.PrimaryPart.Position
+			-- prefer the current room, then whatever's nearest us
+			local inRoom = center and flatDist(mp, center) <= radius + 8
+			local score = (inRoom and 0 or 500) + flatDist(mp, pos)
+			if not best or score < bestScore then best, bestScore = m, score end
+		end
+	end
+	if best then
+		fightFocus = best:GetAttribute("IsBoss") == true and best or nil
+		pathReset()
+		local r
+		local bp = best.PrimaryPart.Position
+		local reach = ATTACK_RANGE + (tonumber(best:GetAttribute("Radius")) or 1) - 0.5
+		if flatDist(bp, pos) <= reach and math.abs(bp.Y - pos.Y) < 40 then
+			-- the throne boss floats ~17 studs up: engageTarget's floor check would call
+			-- that "out of reach" and start hop-kicks. Flat range is what the game uses.
+			setAuto(true)
+			if TC.current ~= best then pcall(TC.set, best) end
+			ride(false)
+			r = "fight"
+		else
+			r = engageTarget(hum, hrp, best, fightFocus ~= nil)
+			if r == "stuck" then r = "chase"; pcall(TC.set, nil) end
+		end
+		if r == "fight" then dgMark.at = now end
+		local hp = math.floor((tonumber(best:GetAttribute("Health")) or 0) / math.max(tonumber(best:GetAttribute("MaxHealth")) or 1, 1) * 100)
+		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: %s %s (%d%%)"):format(run.stage, nStages,
+			r == "fight" and "ตี" or "ไปหา", best.Name, hp)
+		return true
+	end
+	-- room empty (next wave spawning / gate just opened): stand in the room's middle
+	fightFocus = nil
+	if center and flatDist(pos, center) > 10 then
+		setAuto(false)
+		if stuckFor > 3 then pathTo(hum, hrp, center) else pathReset(); dgWalk(hum, hrp, run, center) end
+		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: เดินไปห้องถัดไป (ห่าง %.0f)"):format(run.stage, nStages, flatDist(pos, center))
+	else
+		pathReset()
+		setAuto(true)
+		dgMark.at = now
+		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: รอมอนเวฟถัดไป"):format(run.stage, nStages)
+	end
+	return true
+end
+
+-- server pushes: auto-join ready checks, count results
+local dgConn
+pcall(function()
+	dgConn = Net.event("Effect").OnClientEvent:Connect(function(kind, data)
+		if not alive() or kind ~= "Dungeon" or type(data) ~= "table" then return end
+		if data.kind == "ready" and (e.phDgAccept or e.phDgReplay) then
+			dgStats.status = ("รับคำเชิญ %s แล้ว"):format(tostring(data.leader or "หัวหน้า"))
+			task.delay(0.6, function() if alive() then dgCall("ready", true) end end)
+		elseif data.kind == "cancel" then
+			dgStats.waitUntil = 0
+			dgStats.status = "ready check ยกเลิก (" .. tostring(data.reason or "?") .. ")"
+		elseif data.kind == "loading" or data.kind == "start" then
+			dgStats.waitUntil = 0
+		elseif data.kind == "result" then
+			dgStats.runs = dgStats.runs + 1
+			if data.win ~= false then dgStats.wins = dgStats.wins + 1 end
+			dgStats.lastSec = tonumber(data.seconds)
+			dgStats.backAt = os.clock() + (tonumber(data.returnIn) or (DG and DG.returnDelay) or 15)
+			-- the result card's REPLAY button = Dungeon:replay(id, diff), a party vote:
+			-- once everyone voted the same run restarts without the trip to town
+			if e.phDgReplay then
+				local id = data.dungeon or plr:GetAttribute("DungeonRun")
+				local diff = data.diff or plr:GetAttribute("DungeonDiff")
+				task.spawn(function()
+					task.wait(2.5)   -- let the card open (the game also preloads loot art)
+					for _ = 1, 4 do
+						if not alive() or not e.phDgReplay then return end
+						local r = dgCall("replay", id, diff)
+						if r.ok then
+							dgStats.status = r.waiting and "กด REPLAY แล้ว รอทุกคนโหวต" or "REPLAY: เริ่มรอบใหม่"
+							dgStats.replays = (dgStats.replays or 0) + 1
+							return
+						end
+						dgStats.status = "กด REPLAY ไม่ผ่าน: " .. tostring(r.error or "?")
+						task.wait(2)
+					end
+				end)
+			end
+		elseif data.kind == "replayState" then
+			local n = type(data.votes) == "table" and #data.votes or 0
+			dgStats.status = ("โหวต REPLAY แล้ว %d คน"):format(n)
+		end
+	end)
+end)
+if dgConn then
+	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
+end
+
+-- AUTO REPLAY: back in town -> enter again (solo, or as party leader). A party member
+-- can't start a run; it rides the leader's ready check (auto-joined above).
+task.spawn(function()
+	while alive() do
+		task.wait(1)
+		if not e.phDgReplay then if not plr:GetAttribute("DungeonRun") then dgStats.status = "ปิดอยู่" end; continue end
+		if plr:GetAttribute("DungeonRun") then dgStats.status = "อยู่ในรอบ"; continue end
+		if not DG or not DG.enabled() then dgStats.status = "เกมปิดดันเจี้ยนอยู่"; continue end
+		local now = os.clock()
+		if now < dgStats.backAt + 3 then dgStats.status = "รอกลับเมือง"; continue end
+		local inParty = (plr:GetAttribute("PartyId") or "") ~= ""
+		if inParty and plr:GetAttribute("PartyLeader") ~= true then
+			dgStats.status = "เป็นลูกปาร์ตี้: รอหัวหน้ากดเข้า (ยอมรับให้เอง)"
+			continue
+		end
+		if now < dgStats.waitUntil then dgStats.status = "รอทุกคนกดพร้อม"; continue end
+		if now - dgStats.lastTry < 8 then continue end
+		dgStats.lastTry = now
+		local id, diff = dgPick()
+		local def = DG.byId[id]
+		local dd = def and def.difficultyById and def.difficultyById[diff]
+		if not (def and dd) or def.soon then dgStats.status = "ดันเจี้ยนที่เลือกยังไม่เปิด"; continue end
+		local need = DG.minLevel(dd) or 0
+		if (tonumber(plr:GetAttribute("Level")) or 1) < need then dgStats.status = ("เลเวลไม่ถึง (ต้อง %d)"):format(need); continue end
+		local st = dgCall("state")
+		if st.ok then
+			dgStats.keys = tonumber(st.keys) or 0
+			dgStats.free = type(st.free) == "table" and tonumber(st.free[id]) or 0
+			if st.inRun then dgStats.status = "อยู่ในรอบ"; continue end
+		end
+		-- free runs first; keys only if allowed and above the keep-floor. Never buys keys.
+		if def.keys and not def.unlimited and (dgStats.free or 0) <= 0 then
+			if not e.phDgUseKeys then dgStats.status = "รอบฟรีหมด (ปิดใช้กุญแจ)"; continue end
+			if (dgStats.keys or 0) <= (tonumber(e.phDgKeepKeys) or 0) then
+				dgStats.status = ("กุญแจเหลือ %d (เก็บไว้ %d) หยุดเข้า"):format(dgStats.keys or 0, tonumber(e.phDgKeepKeys) or 0)
+				continue
+			end
+		end
+		local r = dgCall("enter", id, diff)
+		if r.ok and r.waiting then
+			dgStats.waitUntil = os.clock() + ((DG.readySeconds or 20) + 5)
+			dgStats.status = "เรียกปาร์ตี้ (ready check)"
+		elseif r.ok then
+			dgStats.status = "กำลังเข้าดันเจี้ยน"
+			dgStats.lastTry = os.clock() + 7   -- loading screen
+		else
+			dgStats.lastErr = r.error and tostring(r.error) or "เข้าไม่ได้"
+			dgStats.status = "เข้าไม่ได้: " .. dgStats.lastErr
+			dgStats.lastTry = os.clock() + 7
+		end
+	end
+end)
+
 local wdPos, wdAt = nil, os.clock()
 local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on the spot / last target
 -- how far (flat studs) stay-put may step off the spot to fight. Unset = by class:
@@ -1532,12 +1813,29 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.12)
-		if not (e.phFarm or e.phBossOn or e.phWBOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		local inDungeon = plr:GetAttribute("DungeonRun") ~= nil
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		-- inside a dungeon run the field logic (warp stones, farm spot, field bosses,
+		-- watchdog hops) must never run: a Warp from in here would drag us out
+		if inDungeon and not e.phDgOn then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
-		if not hrp then stats.farm = "รอเกิดใหม่"; wdAt = os.clock(); continue end
+		if not hrp then stats.farm = inDungeon and "ดันเจี้ยน: รอเกิดใหม่" or "รอเกิดใหม่"; wdAt = os.clock(); continue end
 		-- the dodge loop owns movement while a skill telegraph covers us
 		if dodging then wdAt = os.clock(); pathReset(); continue end
+		if inDungeon then
+			wdAt = os.clock()
+			if getgenv().__PHP_OLDRANGE and GSettings then   -- stay-put's tight autoRange off in here
+				pcall(function() GSettings.set("autoRange", getgenv().__PHP_OLDRANGE) end)
+				getgenv().__PHP_OLDRANGE = nil; getgenv().__PHP_SETRANGE = nil
+			end
+			stayAnchored = false
+			local okT, errT = pcall(dgTick, hum, hrp)
+			if not okT then stats.farm = "ดันเจี้ยน error: " .. tostring(errT) end
+			continue
+		end
+		-- not in a run and Auto Dungeon is the only mode on: idle in town (replay loop drives)
+		if not (e.phFarm or e.phBossOn or e.phWBOn) then stats.farm = "รอรอบดันเจี้ยนถัดไป"; pathReset(); wdAt = os.clock(); continue end
 
 		-- WATCHDOG (unattended insurance): if the character is totally frozen -- no
 		-- 4-stud move for 30s -- it's wedged in a state pathTo can't see. Teleport-hop
@@ -2185,6 +2483,7 @@ local TG = W:TabGroup()
 local Tabs = {
 	Farm = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723343321"}),
 	Boss = TG:Tab({Name = "Auto Boss", Image = "rbxassetid://10723346959"}),
+	Dungeon = TG:Tab({Name = "ดันเจี้ยน", Image = "rbxassetid://10723396107"}),
 	Sell = TG:Tab({Name = "Auto Sell", Image = "rbxassetid://10709769841"}),
 	Gear = TG:Tab({Name = "เก็บ/สวม", Image = "rbxassetid://10723345576"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
@@ -2327,6 +2626,78 @@ BL:Label({Text = "เกมประกาศก่อนลง 2 นาที �
 local BR = Tabs.Boss:Section({Side = "Right"})
 BR:Header({Text = "สถานะบอสฟิลด์"})
 local bossLbl = BR:Label({Text = "-"})
+
+-- Dungeon tab
+local DLs = Tabs.Dungeon:Section({Side = "Left"})
+DLs:Header({Text = "Auto Dungeon"})
+DLs:Toggle({Name = "เปิด Auto Dungeon (ตีในดันเจี้ยนเอง: ห้อง → บอส → เปิดหีบ)", Default = e.phDgOn,
+	Callback = function(v) e.phDgOn = v; sv() end}, "PHDgOn")
+DLs:Toggle({Name = "Auto Replay (กดปุ่ม REPLAY หน้าจบดันให้เอง)", Default = e.phDgReplay,
+	Callback = function(v) e.phDgReplay = v; sv() end}, "PHDgReplay")
+DLs:Toggle({Name = "Auto Join ปาร์ตี้ (ลูกปาร์ตี้: กด Join ให้เองตอนหัวหน้าเรียก)", Default = e.phDgAccept,
+	Callback = function(v) e.phDgAccept = v; sv() end}, "PHDgAccept")
+local dgOpts, dgByLabel, dgDefault = {}, {}, nil
+for _, d in ipairs(DG and DG.list or {}) do
+	if not d.soon then
+		for _, df in ipairs(d.difficulties or {}) do
+			local lbl = ("%s · %s (Lv.%d+)"):format(d.name or d.id, df.name or df.id, tonumber(df.level) or 0)
+			table.insert(dgOpts, lbl)
+			dgByLabel[lbl] = d.id .. ":" .. df.id
+			if dgByLabel[lbl] == e.phDgPick then dgDefault = lbl end
+		end
+	end
+end
+DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที่จะเข้า (Replay)", Multi = false, Required = true,
+	Options = dgOpts, Default = dgDefault or dgOpts[1],
+	Callback = function(v)
+		if type(v) == "table" then v = v[1] or next(v) end
+		if dgByLabel[v] then e.phDgPick = dgByLabel[v]; sv() end
+	end}, "PHDgPick")
+DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีวันนี้หมด", Default = e.phDgUseKeys,
+	Callback = function(v) e.phDgUseKeys = v; sv() end}, "PHDgUseKeys")
+DLs:Slider({Name = "└ เก็บกุญแจไว้อย่างน้อย (ถึงแล้วหยุดเข้า)", Minimum = 0, Maximum = 100, Default = tonumber(e.phDgKeepKeys) or 0,
+	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
+	Callback = function(v) e.phDgKeepKeys = math.floor(v + 0.5); sv() end}, "PHDgKeepKeys")
+DLs:Label({Text = "จบดัน → กด REPLAY ให้เองทันที (โหวต: ทุกคนในปาร์ตี้ต้องกด ครบแล้วเริ่มรอบใหม่เลย)\nถ้าโหวตไม่ครบจนกลับเมือง: เดี่ยว/หัวหน้า → กดเข้าใหม่ให้ · ลูกปาร์ตี้ → รอหัวหน้าเรียก\nใช้รอบฟรีก่อน แล้วค่อยใช้กุญแจ · ไม่ซื้อกุญแจให้เด็ดขาด\nในดันเจี้ยน: ตีมอนห้องปัจจุบัน → เดินห้องถัดไป → บอส (หลบสกิล) → เปิดหีบ"})
+local DRs = Tabs.Dungeon:Section({Side = "Right"})
+DRs:Header({Text = "สถานะดันเจี้ยน"})
+local dgLbl = DRs:Label({Text = "-"})
+task.spawn(function()
+	local lastState = 0
+	while alive() do
+		pcall(function()
+			-- keys / free runs refresh every 20s while in town (cheap server read)
+			if not plr:GetAttribute("DungeonRun") and os.clock() - lastState > 20 then
+				lastState = os.clock()
+				local st = dgCall("state")
+				if st.ok then
+					local id = dgPick()
+					dgStats.keys = tonumber(st.keys) or dgStats.keys
+					dgStats.free = type(st.free) == "table" and tonumber(st.free[id]) or dgStats.free
+				end
+			end
+			local lines = {}
+			local run = plr:GetAttribute("DungeonRun")
+			if run then
+				local left = math.max(0, math.floor((tonumber(plr:GetAttribute("DungeonEnds")) or 0) - workspace:GetServerTimeNow()))
+				table.insert(lines, ("ในรอบ: %s (%s)"):format(DG and DG.byId[run] and DG.byId[run].name or run, tostring(plr:GetAttribute("DungeonDiff"))))
+				table.insert(lines, ("ด่าน %s/%s · เวฟ %s/%s · เหลือมอน %s"):format(tostring(plr:GetAttribute("DungeonStage")), tostring(plr:GetAttribute("DungeonStages")),
+					tostring(plr:GetAttribute("DungeonWave")), tostring(plr:GetAttribute("DungeonWaves")), tostring(plr:GetAttribute("DungeonLeft"))))
+				table.insert(lines, ("ชีวิต %s/%s · เวลาเหลือ %d:%02d%s"):format(tostring(plr:GetAttribute("DungeonLives")), tostring(plr:GetAttribute("DungeonLivesMax")),
+					left // 60, left % 60, plr:GetAttribute("DungeonChest") and " · หีบบอสรอเปิด" or ""))
+			else
+				table.insert(lines, "ไม่ได้อยู่ในดันเจี้ยน")
+			end
+			table.insert(lines, ("Replay: %s"):format(dgStats.status))
+			table.insert(lines, ("กุญแจ %s ดอก · รอบฟรีวันนี้ %s"):format(tostring(dgStats.keys or "?"), tostring(dgStats.free or "?")))
+			table.insert(lines, ("จบไปแล้ว %d รอบ (ชนะ %d)%s"):format(dgStats.runs, dgStats.wins,
+				dgStats.lastSec and (" · รอบล่าสุด %d:%02d"):format(dgStats.lastSec // 60, dgStats.lastSec % 60) or ""))
+			table.insert(lines, "ฟาร์ม: " .. tostring(stats.farm))
+			dgLbl:UpdateName(table.concat(lines, "\n"))
+		end)
+		task.wait(1)
+	end
+end)
 
 -- Sell tab
 local SLs = Tabs.Sell:Section({Side = "Left"})
