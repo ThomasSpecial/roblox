@@ -51,7 +51,8 @@ local function alive() return getgenv().__G == G end
 local SF = "HTBoss/state.json"
 local SK = {"hbEnabled", "hbBosses", "hbFarmPos", "hbAutoAtFarm", "hbSellOn", "hbSellPick", "hbUseWarp",
             "hbAutoRespawn", "hbRetryBoss", "hbCoatOn", "hbCoatPick", "hbPreArrive", "hbDodge", "hbDash",
-            "hbHop", "hbHopWait", "hbHopDelay", "hbReconnect"}
+            "hbHop", "hbHopWait", "hbHopDelay", "hbReconnect",
+            "hfOn", "hfZone", "hgEquipOn", "hgSalvOn", "hgSalvPick"}
 pcall(function() if not isfolder("HTBoss") then makefolder("HTBoss") end end)
 local function sv()
 	local d = {}
@@ -75,6 +76,11 @@ if e.hbHop == nil then e.hbHop = false end
 if tonumber(e.hbHopWait) == nil then e.hbHopWait = 30 end   -- wait for a boss spawning within this
 if tonumber(e.hbHopDelay) == nil then e.hbHopDelay = 0 end  -- linger this long before hopping (0 = now)
 if e.hbReconnect == nil then e.hbReconnect = true end
+if e.hfOn == nil then e.hfOn = false end                         -- Auto Farm (default off)
+if type(e.hfZone) ~= "string" then e.hfZone = "ตามเลเวล (อัตโนมัติ)" end
+if e.hgEquipOn == nil then e.hgEquipOn = false end               -- Auto Equip Best (default off)
+if e.hgSalvOn == nil then e.hgSalvOn = false end                 -- Auto Salvage (default off)
+if type(e.hgSalvPick) ~= "table" then e.hgSalvPick = {} end
 
 local sessionStart = os.clock() -- for the server-hop join-grace below
 
@@ -514,7 +520,7 @@ local function bossWorthGoing(id)
 	return left ~= nil and left > -15 and left < 180
 end
 
-local function stopRequested() return not alive() or not e.hbEnabled end
+local function stopRequested() return not alive() or (not e.hbEnabled and not e.hfOn) end
 
 -- ----------------------------------------------------------- server hopping
 -- When none of the SELECTED bosses are alive here and the soonest one is further
@@ -1322,21 +1328,94 @@ end
 -- character parked at the spot with Auto switched off.
 local needReturn = true
 
+-- ---------------------------------------------------------------- auto farm
+-- Auto Farm: pick a field (by level, or the one chosen), walk/warp there, switch
+-- the game's own Auto on and let it hunt. Fields come from MapData (LevelText
+-- "Lv.51–58", BossRoom flag) and their rectangles from NavMapJson.Zones {X,Z,SX,SZ}.
+local MapData = require(RS.Shared:WaitForChild("MapData"))
+local FARM_AUTO = "ตามเลเวล (อัตโนมัติ)"
+local FIELDS = {}
+for id, z in pairs(MapData) do
+	if type(z) == "table" and not z.BossRoom and tostring(id):match("^Field%d+$") then
+		local lo, hi = tostring(z.LevelText or ""):match("(%d+)%D+(%d+)")
+		lo = tonumber(lo) or tonumber(tostring(z.LevelText or ""):match("(%d+)")) or 1
+		hi = tonumber(hi) or lo
+		table.insert(FIELDS, {id = id, name = z.DisplayName or id, lo = lo, hi = hi, order = tonumber(z.Order) or 0,
+			label = ("%s (%s)"):format(z.DisplayName or id, z.LevelText or "?")})
+	end
+end
+table.sort(FIELDS, function(a, b) return a.order < b.order end)
+local FIELD_BY_LABEL = {}
+for _, f in ipairs(FIELDS) do FIELD_BY_LABEL[f.label] = f end
+
+-- fields we couldn't reach (walk came back "stuck" = still gated) -> skip a while
+local farmBlocked = {}
+-- the field to farm right now (nil = Auto Farm off / nothing fits)
+local function farmField()
+	if not e.hfOn then return nil end
+	-- a field picked from the list is a CAP, not a destination: we still only go as
+	-- deep as is unlocked (picking Ice Golem at Lv58 warped us at a gate we can't pass)
+	local cap = 12
+	if e.hfZone and e.hfZone ~= FARM_AUTO and FIELD_BY_LABEL[e.hfZone] then cap = FIELD_BY_LABEL[e.hfZone].order end
+	-- PROGRESSION (user: start at Lv1, move on as each next zone unlocks, max = ice):
+	-- the deepest field that is (a) at/under our level and (b) actually OPEN -- every
+	-- zone before it in the chain has its exit gate open. Gates = LocalPlayer attr
+	-- BossGatesJson {zoneId = true} (GateLockClient: BossLock part collides unless
+	-- BossGatesJson[its BossId]); level gates open on reaching the level, boss-room
+	-- gates only once that room's boss is beaten. Capped at Field12 Ice Golem Peak.
+	local lv = tonumber(plr:GetAttribute("Level")) or 1
+	local okG, gates = pcall(HS.JSONDecode, HS, plr:GetAttribute("BossGatesJson") or "{}")
+	gates = okG and type(gates) == "table" and gates or {}
+	local function open(order)
+		for id, z in pairs(MapData) do
+			if type(z) == "table" and tonumber(z.Order) and tonumber(z.Order) < order and gates[id] ~= true then return false end
+		end
+		return true
+	end
+	local best
+	for _, f in ipairs(FIELDS) do
+		if f.order <= cap and f.lo <= lv and (farmBlocked[f.id] or 0) < os.clock() and open(f.order)
+			and (not best or f.order > best.order) then best = f end
+	end
+	return best or FIELDS[1]
+end
+local function fieldRect(f)
+	local z = f and (navMap().Zones or {})[f.id]
+	if not (z and tonumber(z.X) and tonumber(z.Z)) then return nil end
+	return {x = tonumber(z.X), z = tonumber(z.Z), sx = tonumber(z.SX) or 300, sz = tonumber(z.SZ) or 300}
+end
+local function inRect(r, p, margin)
+	margin = margin or 0
+	return math.abs(p.X - r.x) <= r.sx / 2 + margin and math.abs(p.Z - r.z) <= r.sz / 2 + margin
+end
+local farmStats = {field = "-", trips = 0}
+
 local function returnToFarm()
 	if not needReturn then return end
 	local fp = e.hbFarmPos
+	-- Auto Farm on: the "farm spot" is the chosen field's middle
+	local ff = farmField()
+	local fr = ff and fieldRect(ff)
+	if fr then fp = {x = fr.x, y = 0, z = fr.z} end
 	if type(fp) ~= "table" or not fp.x then needReturn = false; return end
 	local _, _, hrp = myChar()
 	if not hrp then return end
-	if flatDist(hrp.Position, Vector2.new(fp.x, fp.z)) > 6 then
+	if fr and inRect(fr, hrp.Position, -10) then
+		-- already inside the field: no need to walk to its exact middle
+	elseif flatDist(hrp.Position, Vector2.new(fp.x, fp.z)) > (fr and 20 or 6) then
 		setAuto(false)
 		clearTarget()
 		setState("Walking back to farm spot")
 		local r = travelTo(fp.x, fp.z, 6, function()
 			-- Auto switched on mid-walk (F key / game button) = the player took over.
-			return stopRequested() or wantedBoss() ~= nil or upcomingBoss() ~= nil or autoOn()
+			return stopRequested() or (e.hbEnabled and (wantedBoss() ~= nil or upcomingBoss() ~= nil)) or autoOn()
 		end)
 		if r == "dead" then return end
+		if r == "stuck" and ff then
+			-- still gated (couldn't reach it): drop back to the previous field for 10 min
+			farmBlocked[ff.id] = os.clock() + 600
+			return
+		end
 		if r == "abort" and not autoOn() then return end
 	end
 	needReturn = false
@@ -1444,6 +1523,89 @@ task.spawn(function()
 	end
 end)
 
+-- ------------------------------------------------- auto equip best + salvage
+-- Equip best = the bag's own "Best" button: Remotes.EquipItem:FireServer("@best").
+-- Salvage (ย่อย) = the bag's Dismantle mode: Remotes.BagSalvage:FireServer({refs}).
+-- Game rule (InventoryClient.canSalvage): only gear Tier I-V (GearJson[ref].T 1..5),
+-- never locked or equipped. Extra safety here (same as Auto Sell): never anything
+-- worn by another job, in a saved loadout, the weapon, or refined at all.
+-- Together: equip best FIRST, give it a moment to land, THEN salvage the rest --
+-- so a fresh upgrade gets worn instead of dismantled.
+local SALV_TIERS = {"ย่อย Tier I", "ย่อย Tier II", "ย่อย Tier III", "ย่อย Tier IV", "ย่อย Tier V"}
+local gearStats = {equips = 0, salvaged = 0, last = "-"}
+local function salvScan()
+	local gear, locks, refine = pjson("GearJson"), pjson("LocksJson"), pjson("RefineJson")
+	local keep = {}
+	for _, ref in pairs(pjson("EquipJson")) do keep[ref] = true end
+	for ref in pairs(pjson("OtherWornJson")) do keep[ref] = true end
+	collectRefs(pjson("LoadoutJson"), keep)
+	local weapon = plr:GetAttribute("WeaponId")
+	if weapon then keep[weapon] = true end
+	local list = {}
+	for ref, v in pairs(gear) do
+		local t = type(v) == "table" and tonumber(v.T)
+		if not t then
+			local ok, d = pcall(GearUtil.Resolve, ref, gear)
+			t = ok and d and tonumber(d.Tier)
+		end
+		if t and SALV_TIERS[t] and e.hgSalvPick[SALV_TIERS[t]]
+			and not locks[ref] and not keep[ref] and (tonumber(refine[ref]) or 0) <= 0 then
+			table.insert(list, ref)
+		end
+	end
+	return list
+end
+local function gearTick()
+	if e.hgEquipOn then
+		pcall(function() remotes.EquipItem:FireServer("@best") end)
+		gearStats.equips += 1
+		gearStats.last = "ใส่ของดีสุดแล้ว " .. os.date("%H:%M:%S")
+		if e.hgSalvOn then task.wait(2.5) end   -- let the swap land before salvaging
+	end
+	if e.hgSalvOn then
+		local list = salvScan()
+		if #list > 0 then
+			remotes.BagSalvage:FireServer(list)
+			gearStats.salvaged += #list
+			gearStats.last = ("ย่อย %d ชิ้น (%s)"):format(#list, os.date("%H:%M:%S"))
+		elseif not e.hgEquipOn then
+			gearStats.last = "ไม่มีของให้ย่อย"
+		end
+	end
+end
+task.spawn(function()
+	while alive() do
+		if e.hgEquipOn or e.hgSalvOn then pcall(gearTick) end
+		task.wait(30)
+	end
+end)
+-- The "Dismantle Complete / ย่อยสำเร็จ" popup lives in PlayerGui.LumiSalvageResult
+-- (InventoryClient builds it on every BagSalvage reply). While Auto ย่อย is on keep
+-- that ScreenGui disabled so it never pops up; hand it back when the toggle goes off.
+task.spawn(function()
+	local hidden = false
+	while alive() do
+		pcall(function()
+			local g = plr.PlayerGui:FindFirstChild("LumiSalvageResult")
+			if g then
+				if e.hgSalvOn then
+					if g.Enabled then g.Enabled = false end
+					hidden = true
+					-- and drop the popups themselves, or they'd all reappear when re-enabled
+					local holder = g:FindFirstChild("Holder")
+					for _, c in ipairs(holder and holder:GetChildren() or {}) do
+						if not c:IsA("UIScale") then c:Destroy() end
+					end
+				elseif hidden then
+					g.Enabled = true; hidden = false
+				end
+			end
+		end)
+		task.wait(0.5)
+	end
+	pcall(function() local g = plr.PlayerGui:FindFirstChild("LumiSalvageResult"); if g then g.Enabled = true end end)
+end)
+
 -- ---------------------------------------------------------------- weapon imbue
 -- Items weapon_coat_<fire|water|wind|earth> (Kind usable, 30 min, same element
 -- stacks up to 3 h, another element replaces it). Used with
@@ -1523,9 +1685,31 @@ task.spawn(function()
 		for _, b in ipairs(BOSSES) do
 			if not bossAlive(b.id) then diedCount[b.id] = nil end
 		end
-		if not e.hbEnabled then
+		if not e.hbEnabled and not e.hfOn then
 			setState("Idle (Auto Boss off)")
 			task.wait(1)
+		elseif not e.hbEnabled then
+			-- AUTO FARM ONLY: keep to the field, game Auto on, back after a death
+			local _, _, hrp = myChar()
+			if not hrp then
+				handleDeath()
+				task.wait(1)
+			else
+				local ff = farmField()
+				local fr = ff and fieldRect(ff)
+				farmStats.field = ff and ff.label or "-"
+				if not fr then
+					setState("Auto Farm", "หาโซนฟาร์มไม่เจอ")
+				elseif not inRect(fr, hrp.Position, 15) then
+					needReturn = true
+					farmStats.trips += 1
+					returnToFarm()
+				else
+					if not autoOn() then setAuto(true) end
+					setState("Auto Farm", ff.label)
+				end
+				task.wait(1)
+			end
 		elseif not myChar() then
 			handleDeath()
 			task.wait(1)
@@ -1555,6 +1739,15 @@ task.spawn(function()
 					serverHop() -- no selected boss here/soon: jump to another server
 				end
 			else
+				-- Auto Farm on too: drifted out of the field (or a level-up moved the
+				-- pick to a new field) -> walk back / on
+				if e.hfOn then
+					local ff = farmField()
+					local fr = ff and fieldRect(ff)
+					local _, _, hrp0 = myChar()
+					farmStats.field = ff and ff.label or "-"
+					if fr and hrp0 and not inRect(fr, hrp0.Position, 15) then needReturn = true end
+				end
 				returnToFarm()
 				if not (wantedBoss() or upcomingBoss()) then
 					if e.hbHop then
@@ -1584,11 +1777,74 @@ local W = Lib:Window({Title = "Hunting Together", Subtitle = "Auto Boss", DragSt
 getgenv().__W = W
 local TG = W:TabGroup()
 local Tabs = {
+	Farm = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
 	Boss = TG:Tab({Name = "Auto Boss", Image = "rbxassetid://10723343321"}),
+	Gear = TG:Tab({Name = "ใส่ของ/ย่อย", Image = "rbxassetid://10709769841"}),
 	Sell = TG:Tab({Name = "Auto Sell", Image = "rbxassetid://10709769841"}),
 	Coat = TG:Tab({Name = "ใบธาตุ", Image = "rbxassetid://10723346959"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
+
+-- ---- Auto Farm tab
+local FL = Tabs.Farm:Section({Side = "Left"})
+FL:Header({Text = "Auto Farm"})
+FL:Toggle({Name = "เปิด Auto Farm (ไปโซน + เปิด Auto ของเกม)", Default = e.hfOn,
+	Callback = function(v)
+		e.hfOn = v; sv()
+		if v then needReturn = true end
+		if not v and not e.hbEnabled then pcall(function() local _, hum, hrp = myChar(); if hum then hum:MoveTo(hrp.Position) end end) end
+	end}, "hfOn")
+local zoneOpts = {FARM_AUTO}
+for _, f in ipairs(FIELDS) do table.insert(zoneOpts, f.label) end
+FL:Dropdown({Name = "โซนสูงสุดที่จะไป (ไปเท่าที่ปลดล็อกแล้ว)", Multi = false, Required = true,
+	Options = zoneOpts, Default = FIELD_BY_LABEL[e.hfZone] and e.hfZone or FARM_AUTO,
+	Callback = function(v)
+		if type(v) == "table" then v = v[1] or next(v) end
+		if type(v) == "string" then e.hfZone = v; sv(); needReturn = true end
+	end}, "hfZone")
+FL:Label({Text = "ไปโซนลึกสุดที่ปลดล็อกแล้ว (เลเวลถึง + ประตูเปิด) ไม่เกินโซนที่เลือก · ตามเลเวล = สูงสุด Ice Golem Peak\nประตูห้องบอสเปิดเมื่อฆ่าบอสห้องนั้น (ใช้ Auto Boss ช่วยได้)\nเปิดคู่ Auto Boss ได้: บอสเกิดไปตีบอสก่อน ตีเสร็จกลับมาฟาร์มต่อ\nตาย → เกิดที่หมู่บ้าน แล้วเดิน/วาร์ปกลับโซนเอง"})
+local FR = Tabs.Farm:Section({Side = "Right"})
+FR:Header({Text = "สถานะ"})
+local farmStateLbl = FR:Label({Text = "-"})
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			local ff = farmField()
+			farmStateLbl:UpdateName(("โซน: %s\n%s %s\nเดินกลับโซน: %d ครั้ง"):format(
+				ff and ff.label or "-", stats.state, stats.detail ~= "-" and stats.detail or "", farmStats.trips))
+		end)
+		task.wait(1)
+	end
+end)
+
+-- ---- Equip best / salvage tab
+local GL = Tabs.Gear:Section({Side = "Left"})
+GL:Header({Text = "ใส่ของดีสุด + ย่อยของ"})
+GL:Toggle({Name = "Auto Equip Best (กดปุ่ม Best ของเกมทุก 30 วิ)", Default = e.hgEquipOn,
+	Callback = function(v) e.hgEquipOn = v; sv() end}, "hgEquipOn")
+GL:Toggle({Name = "Auto ย่อย (Dismantle) ตาม Tier ที่เลือก", Default = e.hgSalvOn,
+	Callback = function(v) e.hgSalvOn = v; sv() end}, "hgSalvOn")
+local salvSel = {}
+for label, on in pairs(e.hgSalvPick) do if on then table.insert(salvSel, label) end end
+GL:Dropdown({Name = "Tier ที่จะย่อย", Multi = true, Required = false,
+	Options = SALV_TIERS, Default = salvSel,
+	Callback = function(sel)
+		local set = {}
+		for name, on in pairs(sel) do if on then set[name] = true end end
+		e.hgSalvPick = set; sv()
+	end}, "hgSalvPick")
+GL:Label({Text = "เปิดคู่กัน: ใส่ของดีสุดก่อน รอ 2.5 วิ แล้วค่อยย่อยที่เหลือ\nไม่ย่อย: ของที่ใส่อยู่ ล็อกไว้ ใส่ในอาชีพอื่น อยู่ในชุดที่เซฟ หรือตีบวกแล้ว\nเกมย่อยได้แค่ Tier I-V (Tier VI ไม่ย่อย) · ระวังชนกับ Auto Sell ถ้าเลือก Tier เดียวกัน"})
+local GR = Tabs.Gear:Section({Side = "Right"})
+GR:Header({Text = "สถานะ"})
+local gearLbl = GR:Label({Text = "-"})
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			gearLbl:UpdateName(("กด Best: %d ครั้ง\nย่อยไปแล้ว: %d ชิ้น\nล่าสุด: %s"):format(gearStats.equips, gearStats.salvaged, gearStats.last))
+		end)
+		task.wait(2)
+	end
+end)
 
 local L = Tabs.Boss:Section({Side = "Left"})
 L:Header({Text = "Auto Boss"})
