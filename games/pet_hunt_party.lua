@@ -2452,7 +2452,7 @@ task.spawn(function()
 		-- AUTO RUN: our own MoveTo counts as walking (16) -- the game only runs (x1.5 = 24)
 		-- for shift / its run toggle / its walker / a mount. Keep the run toggle on.
 		if okMC and MoveCtl.toggleRun and MoveCtl.isRunning then
-			if inDungeon then   -- dungeon only
+			if inDungeon or e.phBossOn or e.phWBOn then   -- dungeon / Auto Boss / Auto World Boss
 				local okRun, running = pcall(MoveCtl.isRunning)
 				if okRun and not running then
 					pcall(MoveCtl.toggleRun); getgenv().__PHP_RUNON = true
@@ -2571,14 +2571,29 @@ task.spawn(function()
 					setAuto(false); pathTo(hum, hrp, stone)
 					stats.farm = ("ไปหินวาร์ป -> %s (ห่าง %.0f)"):format(wf, sd)
 				elseif stone then
+					-- The warp is now a 3s CAST (HomeCast effect, 3-2-1 over the head) that
+					-- the game cancels the moment we move. So: come to a full stop first,
+					-- fire once, then stand still -- no re-fire inside the cast (re-firing
+					-- every 2.5s restarted it before it could land = the "slow warp").
 					setAuto(false); pathReset()
 					if PW then pcall(PW.stop) end   -- never carry a walk across a warp
 					lootPhase = nil
-					if os.clock() - lastWarpFire > 2.5 then
-						pcall(function() Net.event("Warp"):FireServer(wf) end)
-						lastWarpFire = os.clock()
+					local vel = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z).Magnitude
+					local since = os.clock() - lastWarpFire
+					if since > 5.5 then
+						if vel > 1.5 then
+							hum:MoveTo(hrp.Position)   -- still sliding in: stop, fire next tick
+							stats.farm = "วาร์ปไป " .. wf .. " (หยุดนิ่งก่อนร่าย)"
+						else
+							hum:MoveTo(hrp.Position)
+							pcall(function() Net.event("Warp"):FireServer(wf) end)
+							lastWarpFire = os.clock()
+							stats.farm = "วาร์ปไป " .. wf .. " (ยืนร่าย 3 วิ)"
+						end
+					else
+						stats.farm = ("วาร์ปไป %s (ยืนร่าย %.1f วิ)"):format(wf, math.max(0, 3.2 - since))
 					end
-					stats.farm = "วาร์ปไป " .. wf
+					wdAt = os.clock()
 				else
 					stats.farm = "หา WarpStone ไม่เจอ"
 				end
