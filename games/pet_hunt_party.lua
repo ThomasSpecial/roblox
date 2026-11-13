@@ -72,6 +72,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgAccept = false,     -- party member: auto-join the leader's ready check
 	phDgPick = "crypt:hard", phDgUseKeys = true, phDgKeepKeys = 0,
 	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
+	phDgBuyKeys = false,    -- out of keys -> buy one (250k gold) -- only on, user's explicit request
+	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -1282,15 +1284,17 @@ local dodgeGoal = nil
 getgenv().__PHP_DBG = {hazards = hazards, hazardHits = hazardHits, findEscape = findEscape,
 	safeEverywhere = safeEverywhere, inFightArena = inFightArena, shrinkRadius = shrinkRadius,
 	arena = function() return fightArena end}
-local dodgeHB
-dodgeHB = RunService.Heartbeat:Connect(function()
-	if not alive() then dodgeHB:Disconnect(); return end
-	getgenv().__PHP_DGOAL = dodging and dodgeGoal or nil
-	if dodging and dodgeGoal then
-		local _, h = myChar()
-		if h then h:MoveTo(dodgeGoal) end
-	end
-end)
+do
+	local dodgeHB
+	dodgeHB = RunService.Heartbeat:Connect(function()
+		if not alive() then dodgeHB:Disconnect(); return end
+		getgenv().__PHP_DGOAL = dodging and dodgeGoal or nil
+		if dodging and dodgeGoal then
+			local _, h = myChar()
+			if h then h:MoveTo(dodgeGoal) end
+		end
+	end)
+end
 task.spawn(function()
 	local lastRoll = 0
 	while alive() do
@@ -1861,6 +1865,7 @@ local dgMark = {pos = nil, at = 0}
 -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
 local dgLootPhase = nil
 local dgChestPos = nil
+local dgBuyKeyFwd = nil   -- = dgTryBuyKey (defined further down, next to the town loop)
 local function dgStartLoot()
 	local now = os.clock()
 	local _, _, hrp0 = myChar()
@@ -1905,9 +1910,11 @@ local function dgLootTick(hum, hrp)
 end
 -- HP potion ourselves at 50% (the game's AUTO waits lower). Lantern Hex SEALS potions
 -- (SealedUntil attr) -- nothing to drink then, so don't waste the call.
+local dgPotion
+do
 local okCC, CombatC = pcall(require, plr.PlayerScripts.Client.Controllers.CombatController)
 local dgPotAt = 0
-local function dgPotion(hum)
+function dgPotion(hum)
 	if not okCC or type(CombatC) ~= "table" or not CombatC.usePotion then return end
 	-- potions heal a FIXED amount (yellow 6000 of ~53k max = 11%) on a 1s cooldown while
 	-- boss hits take 20-25%: drink on cooldown from 85% down, strongest potion we own
@@ -1933,6 +1940,7 @@ local function dgPotion(hum)
 		end
 	end
 	if bestId and CombatC.useItem then pcall(CombatC.useItem, bestId) else pcall(CombatC.usePotion, "hp") end
+end
 end
 local function dgTick(hum, hrp)
 	local run = dgRun(hrp)
@@ -2275,6 +2283,12 @@ pcall(function()
 					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
 					task.wait(0.2)
 				end
+				-- out of free runs and keys: buy one now so the REPLAY vote can go through
+				if dgBuyKeyFwd and e.phDgBuyKeys and e.phDgUseKeys then
+					local st = dgCall("state")
+					local free = st.ok and type(st.free) == "table" and tonumber(st.free[id]) or 0
+					if st.ok and free <= 0 then pcall(dgBuyKeyFwd, tonumber(st.keys) or 0) end
+				end
 					for _ = 1, 4 do
 						if not alive() or not e.phDgReplay then return end
 						-- the vote already went through (new run started): stop re-voting
@@ -2298,6 +2312,36 @@ pcall(function()
 end)
 if dgConn then
 	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
+end
+
+-- AUTO BUY KEY (only with the toggle on): out of free runs and at/below the keep-floor
+-- -> buy ONE key (DG.keyPrice gold) via the dungeon panel's own "buyKey" call, never
+-- taking gold below the floor. Returns true when a key was bought.
+do   -- (block: the main chunk is at Luau's 200-local limit)
+local dgBuyAt = 0
+local function dgTryBuyKey(keys)
+	if not (e.phDgBuyKeys and e.phDgUseKeys) then return false end
+	if (tonumber(keys) or 0) > (tonumber(e.phDgKeepKeys) or 0) then return false end
+	if os.clock() - dgBuyAt < 3 then return false end
+	local price = tonumber(DG and DG.keyPrice) or 250000
+	local gold = tonumber(plr:GetAttribute("Gold")) or 0
+	local floor = (tonumber(e.phDgGoldFloor) or 0) * 1e6
+	if gold - price < floor then
+		dgStats.status = ("กุญแจหมด: ทองไม่พอซื้อ (เหลือ %.1fM เก็บไว้ %dM)"):format(gold / 1e6, tonumber(e.phDgGoldFloor) or 0)
+		return false
+	end
+	dgBuyAt = os.clock()
+	local r = dgCall("buyKey")
+	if r.ok then
+		dgStats.keys = tonumber(r.keys) or ((tonumber(keys) or 0) + 1)
+		dgStats.bought = (dgStats.bought or 0) + 1
+		dgStats.status = ("ซื้อกุญแจแล้ว (รวมซื้อ %d ดอก)"):format(dgStats.bought)
+		return true
+	end
+	dgStats.status = "ซื้อกุญแจไม่ได้: " .. tostring(r.error or "?")
+	return false
+end
+dgBuyKeyFwd = dgTryBuyKey
 end
 
 -- AUTO REJOIN: the "Disconnected / kicked" prompt sets GuiService's error message.
@@ -2362,8 +2406,10 @@ task.spawn(function()
 		-- free runs first; keys only if allowed and above the keep-floor. Never buys keys.
 		if def.keys and not def.unlimited and (dgStats.free or 0) <= 0 then
 			if not e.phDgUseKeys then dgStats.status = "รอบฟรีหมด (ปิดใช้กุญแจ)"; continue end
-			if (dgStats.keys or 0) <= (tonumber(e.phDgKeepKeys) or 0) then
-				dgStats.status = ("กุญแจเหลือ %d (เก็บไว้ %d) หยุดเข้า"):format(dgStats.keys or 0, tonumber(e.phDgKeepKeys) or 0)
+			if (dgStats.keys or 0) <= (tonumber(e.phDgKeepKeys) or 0) and not dgBuyKeyFwd(dgStats.keys) then
+				if not e.phDgBuyKeys then
+					dgStats.status = ("กุญแจเหลือ %d (เก็บไว้ %d) หยุดเข้า"):format(dgStats.keys or 0, tonumber(e.phDgKeepKeys) or 0)
+				end
 				continue
 			end
 		end
@@ -3259,6 +3305,11 @@ DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีว
 DLs:Slider({Name = "└ เก็บกุญแจไว้อย่างน้อย (ถึงแล้วหยุดเข้า)", Minimum = 0, Maximum = 100, Default = tonumber(e.phDgKeepKeys) or 0,
 	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
 	Callback = function(v) e.phDgKeepKeys = math.floor(v + 0.5); sv() end}, "PHDgKeepKeys")
+DLs:Toggle({Name = "ซื้อกุญแจเองเมื่อหมด (ดอกละ 250k ทอง · ต้องเปิด 'ใช้กุญแจ' ด้วย)", Default = e.phDgBuyKeys,
+	Callback = function(v) e.phDgBuyKeys = v; sv() end}, "PHDgBuyKeys")
+DLs:Slider({Name = "└ เก็บทองไว้อย่างน้อย (ล้าน) ต่ำกว่านี้ไม่ซื้อ", Minimum = 0, Maximum = 200, Default = tonumber(e.phDgGoldFloor) or 5,
+	Precision = 0, DisplayMethod = "Round", Suffix = "M",
+	Callback = function(v) e.phDgGoldFloor = math.floor(v + 0.5); sv() end}, "PHDgGoldFloor")
 DLs:Label({Text = "จบดัน → กด REPLAY ให้เองทันที (โหวต: ทุกคนในปาร์ตี้ต้องกด ครบแล้วเริ่มรอบใหม่เลย)\nถ้าโหวตไม่ครบจนกลับเมือง: เดี่ยว/หัวหน้า → กดเข้าใหม่ให้ · ลูกปาร์ตี้ → รอหัวหน้าเรียก\nใช้รอบฟรีก่อน แล้วค่อยใช้กุญแจ · ไม่ซื้อกุญแจให้เด็ดขาด\nในดันเจี้ยน: ตีมอนห้องปัจจุบัน → เดินห้องถัดไป → บอส (หลบสกิล) → เปิดหีบ"})
 local DRs = Tabs.Dungeon:Section({Side = "Right"})
 DRs:Header({Text = "สถานะดันเจี้ยน"})
