@@ -3159,6 +3159,11 @@ end)
 local dgConn
 pcall(function()
 	dgConn = Net.event("Effect").OnClientEvent:Connect(function(kind, data)
+		-- the warp cast (HomeCast) ended without landing = a hit / a step cancelled it
+		if alive() and kind == "HomeCast" and type(data) == "table" and data.stop
+			and data.character == plr.Character and data.done ~= true then
+			pf.castCut = os.clock()
+		end
 		if not alive() or kind ~= "Dungeon" or type(data) ~= "table" then return end
 		if data.kind == "ready" and (e.phDgAccept or e.phDgReplay or e.phTowerEnter) then
 			dgStats.status = ("รับคำเชิญ %s แล้ว"):format(tostring(data.leader or "หัวหน้า"))
@@ -3484,6 +3489,34 @@ task.spawn(function()
 					setAuto(false); pathTo(hum, hrp, stone)
 					stats.farm = ("ไปหินวาร์ป -> %s (ห่าง %.0f)"):format(wf, sd)
 				elseif stone then
+					-- user: "เวลาโดนมอนตีแล้วมันวาร์ปไม่ไป": the server cancels the cast on a hit.
+					-- Shoot whatever is on us from the stone first, then cast. A monster we
+					-- can't finish in 12s (other terrace, out of reach) is ignored.
+					local threat, td
+					local nowT = os.clock()
+					pf.threatSeen = pf.threatSeen or setmetatable({}, {__mode = "k"})
+					for _, m in ipairs(workspace.Monsters:GetChildren()) do
+						local mp = m.PrimaryPart
+						if mp and (tonumber(m:GetAttribute("Health")) or 0) > 0 and m:GetAttribute("Dummy") ~= true then
+							local d = flatDist(mp.Position, hrp.Position)
+							if d < 35 and math.abs(mp.Position.Y - hrp.Position.Y) < 20 then
+								pf.threatSeen[m] = pf.threatSeen[m] or nowT
+								if nowT - pf.threatSeen[m] < 12 and (not threat or d < td) then threat, td = m, d end
+							end
+						end
+					end
+					-- mid-cast (fired <3.3s ago, not cut): stand still, shooting/chasing would cancel it
+					local casting = nowT - lastWarpFire < 3.3 and (pf.castCut or 0) < lastWarpFire
+					if threat and not casting then
+						pathReset()
+						if PW then pcall(PW.stop) end
+						hum:MoveTo(hrp.Position)
+						setAuto(true)
+						if TC.current ~= threat then pcall(TC.set, threat) end
+						stats.farm = ("เคลียร์มอนก่อนร่ายวาร์ป -> %s: %s (ห่าง %.0f)"):format(wf, threat.Name, td)
+						wdAt = os.clock()
+						continue
+					end
 					-- The warp is now a 3s CAST (HomeCast effect, 3-2-1 over the head) that
 					-- the game cancels the moment we move. So: come to a full stop first,
 					-- fire once, then stand still -- no re-fire inside the cast (re-firing
@@ -3493,7 +3526,8 @@ task.spawn(function()
 					lootPhase = nil
 					local vel = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z).Magnitude
 					local since = os.clock() - lastWarpFire
-					if since > 5.5 then
+					-- cast cut short (hit) -> no need to sit out the 5.5s, recast as soon as clear
+					if since > 5.5 or (pf.castCut or 0) > lastWarpFire then
 						if vel > 1.5 then
 							hum:MoveTo(hrp.Position)   -- still sliding in: stop, fire next tick
 							stats.farm = "วาร์ปไป " .. wf .. " (หยุดนิ่งก่อนร่าย)"
@@ -3892,7 +3926,15 @@ local function sellScan()
 	local list, gold = {}, 0
 	for uid, piece in pairs(g.gear) do
 		local def = Equipment.defs[piece.id]
-		if def and not piece.locked and not equipped[uid] and (tonumber(def.sellPrice) or 0) > 0
+		-- user picked "ขายเฉพาะอาวุธเริ่มต้น": the 0-Gold Lv.1 starter gear (training_*,
+		-- novice_*, prayer_book) goes with Tier I. Every other 0-Gold piece is still skipped.
+		local pid = tostring(piece.id)
+		local starter = def and (tonumber(def.sellPrice) or 0) <= 0 and tonumber(def.level) == 1
+			and (pid:match("^training_") or pid:match("^novice_") or pid == "prayer_book")
+			and tierOf(def) == 0 and e.phSellTiers[TIER_LABELS[0]]
+		if starter and not piece.locked and not equipped[uid] and not NEVER_SELL[tierOf(def)] then
+			table.insert(list, uid)
+		elseif def and not piece.locked and not equipped[uid] and (tonumber(def.sellPrice) or 0) > 0
 			and not NEVER_SELL[tierOf(def)] then
 			local tier = tierOf(def)
 			local label = TIER_LABELS[tier]
