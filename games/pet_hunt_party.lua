@@ -64,6 +64,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phAutoWarp = true,      -- walk to a WarpStone and warp to the right field (incl. after a death->town)
 	phDodge = true,         -- step out of boss/monster skill telegraphs (BossCast red zones)
 	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
+	phNav = true,           -- field walks follow our scanned NavMap (PetHunt/nav/*.json, A*); no map/no path -> old walker
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
@@ -134,6 +135,730 @@ local function fieldAt(pos)
 	if ok and type(f) == "table" and f.id then return f end
 	return nil
 end
+
+-- [NAV BEGIN] generated from pethunt_nav.lua by sync_nav.py -- edit that file, not this block
+local Nav = (function()
+-- Pet Hunt NavMap core: load grid scanned per field, A* + string-pull, walker.
+-- Returns a single table so it costs one local in the main chunk.
+local Nav = {}
+do
+	local HS = game:GetService("HttpService")
+	local DIR = "PetHunt/nav/"
+	local UP_STEP = 1.6      -- max climb between orthogonal cells (studs)
+	local DROP = 18          -- max drop allowed
+	local maps = {}
+	Nav.maps = maps
+	Nav.SCAN_V = 3   -- bump when the scanner changes: older files rescan when their field is next visited
+
+	local function decode(d)
+		local W, H = d.w, d.h
+		local hts = table.create(W * H)
+		local k = 0
+		for v in (d.hts .. ","):gmatch("([^,]*),") do
+			k += 1
+			hts[k] = (v ~= "") and (tonumber(v) / 10 + d.base) or false
+		end
+		local haz, wall = table.create(W * H), table.create(W * H)
+		for i = 1, W * H do
+			haz[i] = d.haz:byte(i) == 49
+			wall[i] = tonumber(d.wall:sub(i, i), 16) or 0
+		end
+		-- edge-adjacent cells get a small cost so routes stay off cliff lips
+		local edge = table.create(W * H, false)
+		for j = 0, H - 1 do
+			for i = 0, W - 1 do
+				local idx = j * W + i + 1
+				local h = hts[idx]
+				if h then
+					for dj = -1, 1 do
+						for di = -1, 1 do
+							local ni, nj = i + di, j + dj
+							local nh = (ni >= 0 and nj >= 0 and ni < W and nj < H) and hts[nj * W + ni + 1]
+							-- off-map / hole beside us, or a wall taller than a step: body would rub it
+							if not nh or nh > h + UP_STEP then
+								edge[idx] = true
+							end
+						end
+					end
+				end
+			end
+		end
+		return { name = d.field, cell = d.cell, x0 = d.x0, z0 = d.z0, w = W, h = H,
+			hts = hts, haz = haz, wall = wall, edge = edge, poi = d.poi, bad = {} }
+	end
+
+	function Nav.load(field)
+		if maps[field] then return maps[field] end
+		local path = DIR .. field .. ".json"
+		if not (isfile and isfile(path)) then return nil end
+		local ok, d = pcall(function() return HS:JSONDecode(readfile(path)) end)
+		if not ok or type(d) ~= "table" then return nil end
+		local m = decode(d)
+		maps[field] = m
+		return m
+	end
+
+	function Nav.inside(m, p)
+		local i = math.floor((p.X - m.x0) / m.cell + 0.5)
+		local j = math.floor((p.Z - m.z0) / m.cell + 0.5)
+		return i >= 0 and j >= 0 and i < m.w and j < m.h
+	end
+
+	function Nav.cellOf(m, p)
+		return math.floor((p.X - m.x0) / m.cell + 0.5), math.floor((p.Z - m.z0) / m.cell + 0.5)
+	end
+
+	function Nav.worldOf(m, i, j)
+		local h = m.hts[j * m.w + i + 1]
+		return Vector3.new(m.x0 + i * m.cell, (h or 0) + 3, m.z0 + j * m.cell)
+	end
+
+	-- wall bit between (i,j) and neighbour (i+di, j+dj)
+	local function walled(m, i, j, di, dj)
+		local W = m.w
+		if dj < 0 or (dj == 0 and di < 0) then
+			i, j, di, dj = i + di, j + dj, -di, -dj
+		end
+		local bit = (di == 1 and dj == 0) and 1 or (di == 0 and dj == 1) and 2 or (di == 1 and dj == 1) and 4 or 8
+		return bit32.band(m.wall[j * W + i + 1] or 0, bit) ~= 0
+	end
+
+	local function stepOk(m, i, j, di, dj)
+		local W, H = m.w, m.h
+		local ni, nj = i + di, j + dj
+		if ni < 0 or nj < 0 or ni >= W or nj >= H then return false end
+		local a, b = m.hts[j * W + i + 1], m.hts[nj * W + ni + 1]
+		if not a or not b then return false end
+		local dh = b - a
+		local lim = (di ~= 0 and dj ~= 0) and UP_STEP * 1.42 or UP_STEP
+		if dh > lim and dh <= 2.6 and (di == 0 or dj == 0) then
+			-- top of a ramp: 3-stud samples land short of the wedge's top edge, so the last
+			-- sample reads ~2 below the floor it joins. Allowed only while already climbing.
+			local pi, pj = i - di, j - dj
+			local prev = (pi >= 0 and pj >= 0 and pi < W and pj < H) and m.hts[pj * W + pi + 1]
+			if prev and a - prev >= 0.5 then lim = 2.6 end
+		end
+		if dh > lim or dh < -DROP then return false end
+		if walled(m, i, j, di, dj) then return false end
+		if m.bad[(j * W + i) * 9 + (dj + 1) * 3 + (di + 1)] then return false end
+		if di ~= 0 and dj ~= 0 then
+			-- no corner cutting: both orthogonal legs must be legal
+			if not stepOk(m, i, j, di, 0) or not stepOk(m, i + di, j, 0, dj) then return false end
+			if not stepOk(m, i, j, 0, dj) or not stepOk(m, i, j + dj, di, 0) then return false end
+		end
+		return true
+	end
+	Nav.stepOk = stepOk
+
+	-- nearest walkable cell to world point within r cells
+	function Nav.snap(m, p, r)
+		local ci, cj = Nav.cellOf(m, p)
+		local best, bi, bj = math.huge, nil, nil
+		for dj = -(r or 4), (r or 4) do
+			for di = -(r or 4), (r or 4) do
+				local i, j = ci + di, cj + dj
+				if i >= 0 and j >= 0 and i < m.w and j < m.h then
+					local h = m.hts[j * m.w + i + 1]
+					local enterable = false
+					if h then
+						for _, d in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+							if Nav.stepOk(m, i + d[1], j + d[2], -d[1], -d[2]) then enterable = true break end
+						end
+					end
+					if enterable then
+						local d = di * di + dj * dj + math.abs(h - p.Y) * 0.3
+						if d < best then best, bi, bj = d, i, j end
+					end
+				end
+			end
+		end
+		return bi, bj
+	end
+
+	local NB = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
+
+	-- partial = true: if the goal can't be reached, return the route to the reachable cell
+	-- closest to it (goal across a bridge / on a pillar top) instead of nil
+	function Nav.astar(m, si, sj, gi, gj, maxIter, partial)
+		local W = m.w
+		local start, goal = sj * W + si, gj * W + gi
+		if start == goal then return { { si, sj } } end
+		local g, came, closed = { [start] = 0 }, {}, {}
+		local heap, hn = { { 0, start } }, 1
+		local function push(f, n)
+			hn += 1
+			heap[hn] = { f, n }
+			local c = hn
+			while c > 1 do
+				local p = c // 2
+				if heap[p][1] <= heap[c][1] then break end
+				heap[p], heap[c] = heap[c], heap[p]
+				c = p
+			end
+		end
+		local function pop()
+			local top = heap[1]
+			heap[1] = heap[hn]
+			heap[hn] = nil
+			hn -= 1
+			local c = 1
+			while true do
+				local l, r, s = c * 2, c * 2 + 1, c
+				if l <= hn and heap[l][1] < heap[s][1] then s = l end
+				if r <= hn and heap[r][1] < heap[s][1] then s = r end
+				if s == c then break end
+				heap[s], heap[c] = heap[c], heap[s]
+				c = s
+			end
+			return top
+		end
+		local function hcost(n)
+			local dx, dz = math.abs(n % W - gi), math.abs(n // W - gj)
+			return math.max(dx, dz) + 0.414 * math.min(dx, dz)
+		end
+		local function build(last)
+			local out, n = {}, last
+			while n do
+				table.insert(out, 1, { n % W, n // W })
+				n = came[n]
+			end
+			return out
+		end
+		local it = 0
+		local bestN, bestH = start, hcost(start)
+		while hn > 0 do
+			it += 1
+			if it > (maxIter or 40000) then break end
+			local cur = pop()[2]
+			if cur == goal then return build(goal) end
+			if not closed[cur] then
+				closed[cur] = true
+				local hc = hcost(cur)
+				if hc < bestH then bestN, bestH = cur, hc end
+				local ci, cj = cur % W, cur // W
+				for _, d in ipairs(NB) do
+					if stepOk(m, ci, cj, d[1], d[2]) then
+						local nb = (cj + d[2]) * W + ci + d[1]
+						if not closed[nb] then
+							local cost = (d[1] ~= 0 and d[2] ~= 0) and 1.414 or 1
+							local idx = nb + 1
+							if m.haz[idx] then cost *= 8 end
+							if m.edge[idx] then cost += 1.5 end
+							local ng = g[cur] + cost
+							if not g[nb] or ng < g[nb] then
+								g[nb] = ng
+								came[nb] = cur
+								push(ng + hcost(nb), nb)
+							end
+						end
+					end
+				end
+			end
+		end
+		if partial and bestN ~= start then return build(bestN), true end
+		return nil
+	end
+
+	-- can we walk straight from cell a to cell b? (supercover line, each step legal)
+	local function lineOk(m, ai, aj, bi, bj)
+		local i, j = ai, aj
+		local dx, dz = bi - ai, bj - aj
+		local sx, sz = dx > 0 and 1 or -1, dz > 0 and 1 or -1
+		local nx, nz = math.abs(dx), math.abs(dz)
+		local ix, iz = 0, 0
+		while ix < nx or iz < nz do
+			local t1 = (0.5 + ix) / math.max(nx, 1e-9)
+			local t2 = (0.5 + iz) / math.max(nz, 1e-9)
+			local di, dj = 0, 0
+			if nx == 0 then t1 = math.huge end
+			if nz == 0 then t2 = math.huge end
+			if math.abs(t1 - t2) < 1e-9 then
+				di, dj = sx, sz ix += 1 iz += 1
+			elseif t1 < t2 then
+				di = sx ix += 1
+			else
+				dj = sz iz += 1
+			end
+			if not stepOk(m, i, j, di, dj) then return false end
+			local idx = (j + dj) * m.w + i + di + 1
+			if m.haz[idx] or m.edge[idx] then return false end
+			i, j = i + di, j + dj
+		end
+		return true
+	end
+
+	function Nav.smooth(m, cells)
+		if #cells <= 2 then return cells end
+		local out = { cells[1] }
+		local a = 1
+		while a < #cells do
+			local b = #cells
+			while b > a + 1 and not lineOk(m, cells[a][1], cells[a][2], cells[b][1], cells[b][2]) do
+				b -= 1
+			end
+			out[#out + 1] = cells[b]
+			a = b
+		end
+		return out
+	end
+
+	-- full plan: world from -> world to; returns list of Vector3 waypoints (or nil, reason)
+	-- partial = true: unreachable / off-map goal -> route to the closest reachable cell
+	function Nav.plan(m, from, to, partial)
+		local si, sj = Nav.snap(m, from, 3)
+		if not si then return nil, "start-off-map" end
+		local gi, gj = Nav.snap(m, to, 6)
+		if not gi then
+			if not partial then return nil, "goal-off-map" end
+			gi, gj = Nav.cellOf(m, to)
+			gi, gj = math.clamp(gi, 0, m.w - 1), math.clamp(gj, 0, m.h - 1)
+		end
+		local cells = Nav.astar(m, si, sj, gi, gj, nil, partial)
+		if not cells then return nil, "no-path" end
+		local pts = {}
+		for _, c in ipairs(Nav.smooth(m, cells)) do pts[#pts + 1] = Nav.worldOf(m, c[1], c[2]) end
+		return pts, cells
+	end
+
+	function Nav.markBad(m, p, q)
+		local ai, aj = Nav.cellOf(m, p)
+		local bi, bj = Nav.cellOf(m, q)
+		local di, dj = math.clamp(bi - ai, -1, 1), math.clamp(bj - aj, -1, 1)
+		m.bad[(aj * m.w + ai) * 9 + (dj + 1) * 3 + (di + 1)] = true
+	end
+
+	-- Field folder must be streamed in. Collidable floors are often CanQuery=false, so they are
+	-- flipped on for the duration of the scan and restored after. yieldFn() is called between rows.
+	function Nav.scan(field, yieldFn)
+		local World = workspace:FindFirstChild("World")
+		if not World then return nil, "no-world" end
+		local folders = {}
+		if field == "town" then
+			for _, n in ipairs({ "Town", "Shrine", "PartyStage", "CostumeShowcase" }) do
+				if World:FindFirstChild(n) then folders[#folders + 1] = World[n] end
+			end
+		elseif World:FindFirstChild("Field_" .. field) then
+			folders[1] = World["Field_" .. field]
+		end
+		if #folders == 0 then return nil, "no-field" end
+		local F = folders[1]
+		local CELL = 3
+		local mn, mx, nparts = nil, nil, 0
+		for _, fo in ipairs(folders) do
+			for _, d in ipairs(fo:GetDescendants()) do
+				if d:IsA("BasePart") then
+					nparts += 1
+					if d.CanCollide and d.Size.Magnitude < 2000 then
+						local p = d.Position
+						mn = mn and Vector3.new(math.min(mn.X, p.X), math.min(mn.Y, p.Y), math.min(mn.Z, p.Z)) or p
+						mx = mx and Vector3.new(math.max(mx.X, p.X), math.max(mx.Y, p.Y), math.max(mx.Z, p.Z)) or p
+					end
+				end
+			end
+		end
+		if nparts < 500 or not mn then return nil, "not-streamed" end
+		local x0 = math.floor(mn.X / CELL) * CELL - 6
+		local z0 = math.floor(mn.Z / CELL) * CELL - 6
+		local W = math.ceil((mx.X - x0 + 6) / CELL) + 1
+		local H = math.ceil((mx.Z - z0 + 6) / CELL) + 1
+		local TOPY, BOTY = mx.Y + 60, mn.Y - 80
+		local base = math.floor(mn.Y - 80)
+		local changed = {}
+		for _, d in ipairs(workspace.World:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then
+				-- v2: the LevelGate Arch over every bridge entrance is head-high overhead, not a
+				-- floor: the down ray hit its top and the bridge entrance read as a 20-stud wall
+				local arch = d.Name == "Arch" and d.Parent and d.Parent.Name == "LevelGate"
+				if arch and d.CanQuery then
+					d.CanQuery = false
+					changed[#changed + 1] = d
+				elseif not arch and not d.CanQuery then
+					d.CanQuery = true
+					changed[#changed + 1] = d
+				end
+			end
+		end
+		local hts, haz, wall, hitInst = {}, {}, {}, {}
+		local ok, err = pcall(function()
+			local rp = RaycastParams.new()
+			rp.FilterType = Enum.RaycastFilterType.Include
+			rp.FilterDescendantsInstances = { workspace.World }
+			rp.RespectCanCollide = true
+			local lavas = {}
+			for _, fo in ipairs(folders) do
+				for _, d in ipairs(fo:GetDescendants()) do
+					if d:IsA("BasePart") and (d.Name == "Lava" or d.Name == "Acid" or d.Name == "Spikes") then lavas[#lavas + 1] = d end
+				end
+			end
+			for j = 0, H - 1 do
+				for i = 0, W - 1 do
+					local x, z = x0 + i * CELL, z0 + j * CELL
+					local idx = j * W + i + 1
+					local y = nil
+					local r = workspace:Raycast(Vector3.new(x, TOPY, z), Vector3.new(0, BOTY - TOPY, 0), rp)
+					if r and r.Instance.Name ~= "Ocean" and r.Normal.Y >= 0.55 then
+						y = r.Position.Y
+						if workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, 4.8, 0), rp) then y = nil end
+					end
+					hts[idx] = y
+					hitInst[idx] = y and r.Instance or nil
+					local hz = 0
+					if y then
+						local p = Vector3.new(x, y, z)
+						for _, l in ipairs(lavas) do
+							local lp = l.CFrame:PointToObjectSpace(p)
+							if math.abs(lp.X) <= l.Size.X / 2 + 1.5 and math.abs(lp.Z) <= l.Size.Z / 2 + 1.5 and math.abs(lp.Y) <= l.Size.Y / 2 + 3 then
+								hz = 1
+								break
+							end
+						end
+					end
+					haz[idx] = hz
+				end
+				if yieldFn and j % 10 == 0 then yieldFn(j / H * 0.5) end
+			end
+			-- v3: stamp every collidable block part onto the grid. A 3-stud grid can miss a
+			-- 2x2x2 cube entirely and the waist ray passes over it (jungle 3246,25: a cube pile
+			-- stuck the bot every visit). Cell blocked if a part within 1.2 studs of its centre
+			-- rises > 1.4 above that cell's floor and starts below head height. Wedges (ramps)
+			-- and tilted parts are left to the rays; the part a cell stands on is skipped.
+			local np = 0
+			for _, fo in ipairs(folders) do
+				for _, d in ipairs(fo:GetDescendants()) do
+					if d:IsA("Part") and d.CanCollide and d.Shape == Enum.PartType.Block
+						and math.abs(d.Orientation.X) < 1 and math.abs(d.Orientation.Z) < 1 then
+						local cf, sz, c = d.CFrame, d.Size, d.Position
+						local top, bot = c.Y + sz.Y / 2, c.Y - sz.Y / 2
+						local hx = math.abs(cf.RightVector.X) * sz.X / 2 + math.abs(cf.LookVector.X) * sz.Z / 2 + 1.2
+						local hz = math.abs(cf.RightVector.Z) * sz.X / 2 + math.abs(cf.LookVector.Z) * sz.Z / 2 + 1.2
+						local i0 = math.max(0, math.ceil((c.X - hx - x0) / CELL))
+						local i1 = math.min(W - 1, math.floor((c.X + hx - x0) / CELL))
+						local j0 = math.max(0, math.ceil((c.Z - hz - z0) / CELL))
+						local j1 = math.min(H - 1, math.floor((c.Z + hz - z0) / CELL))
+						for jj = j0, j1 do
+							for ii = i0, i1 do
+								local idx = jj * W + ii + 1
+								local fy = hts[idx]
+								if fy and hitInst[idx] ~= d and top > fy + 1.5 and bot < fy + 5.5 then
+									local lp = cf:PointToObjectSpace(Vector3.new(x0 + ii * CELL, c.Y, z0 + jj * CELL))
+									if math.abs(lp.X) <= sz.X / 2 + 1.2 and math.abs(lp.Z) <= sz.Z / 2 + 1.2 then
+										hts[idx] = nil
+									end
+								end
+							end
+						end
+						np += 1
+						if yieldFn and np % 400 == 0 then yieldFn(0.5) end
+					end
+				end
+			end
+			local dirs = { { 1, 0, 1 }, { 0, 1, 2 }, { 1, 1, 4 }, { -1, 1, 8 } }
+			for j = 0, H - 1 do
+				for i = 0, W - 1 do
+					local idx = j * W + i + 1
+					local y, mbits = hts[idx], 0
+					if y then
+						for _, d in ipairs(dirs) do
+							local ni, nj = i + d[1], j + d[2]
+							if ni >= 0 and ni < W and nj < H then
+								local y2 = hts[nj * W + ni + 1]
+								if y2 then
+									local wy = math.max(y, y2) + 2.2
+									local a = Vector3.new(x0 + i * CELL, wy, z0 + j * CELL)
+									local b = Vector3.new(x0 + ni * CELL, wy, z0 + nj * CELL)
+									if workspace:Raycast(a, b - a, rp) or workspace:Raycast(b, a - b, rp) then mbits += d[3] end
+								end
+							end
+						end
+					end
+					wall[idx] = mbits
+				end
+				if yieldFn and j % 10 == 0 then yieldFn(0.5 + j / H * 0.5) end
+			end
+		end)
+		for _, d in ipairs(changed) do d.CanQuery = not d.CanQuery end
+		if not ok then return nil, tostring(err) end
+		local hs, hzs, ws, walk = {}, {}, {}, 0
+		local hex = "0123456789abcdef"
+		for k = 1, W * H do
+			local y = hts[k]
+			if y then walk += 1 end
+			hs[k] = y and tostring(math.floor((y - base) * 10 + 0.5)) or ""
+			hzs[k] = tostring(haz[k])
+			ws[k] = hex:sub((wall[k] or 0) + 1, (wall[k] or 0) + 1)
+		end
+		local poi = { ramps = {} }
+		for _, fo in ipairs(folders) do
+			local stone = fo:FindFirstChild("WarpStone")
+			if stone and not poi.warp then local c = stone:GetPivot().Position poi.warp = { c.X, c.Y, c.Z } end
+			local arena = fo:FindFirstChild("BossArena")
+			if arena and not poi.arena then local c = arena:GetPivot().Position poi.arena = { c.X, c.Y, c.Z } end
+			for _, d in ipairs(fo:GetDescendants()) do
+				if d.Name == "StairRamp" then poi.ramps[#poi.ramps + 1] = { d.Position.X, d.Position.Y, d.Position.Z } end
+			end
+		end
+		-- zone config (Shared.Config.Zones): spawn regions, arena, gate, exit, terraces, town NPCs.
+		-- Config vectors are flat (Y=0); Y is filled from the scanned floor under that point.
+		local function floorY(x, z)
+			local i = math.floor((x - x0) / CELL + 0.5)
+			local j = math.floor((z - z0) / CELL + 0.5)
+			for r = 0, 3 do
+				for dj = -r, r do
+					for di = -r, r do
+						local ii, jj = i + di, j + dj
+						if ii >= 0 and jj >= 0 and ii < W and jj < H then
+							local y = hts[jj * W + ii + 1]
+							if y then return math.floor(y * 10 + 0.5) / 10 end
+						end
+					end
+				end
+			end
+			return nil
+		end
+		local function v3(v)
+			if typeof(v) ~= "Vector3" then return nil end
+			return { math.floor(v.X * 10 + 0.5) / 10, floorY(v.X, v.Z) or v.Y, math.floor(v.Z * 10 + 0.5) / 10 }
+		end
+		pcall(function()
+			local Z = require(game:GetService("ReplicatedStorage").Shared.Config.Zones)
+			local zone = {}
+			if field == "town" then
+				for k, v in pairs(Z.town) do
+					if typeof(v) == "Vector3" then zone[k] = v3(v) end
+				end
+				zone.name = Z.town.name
+				if Z.shrine and typeof(Z.shrine.center) == "Vector3" then
+					zone.shrine = { c = v3(Z.shrine.center), r = Z.shrine.radius, name = Z.shrine.name }
+				end
+			else
+				local w = Z.warpById and Z.warpById[field]
+				local b = w and w.base
+				if b then
+					zone.name, zone.boss, zone.levels, zone.gold = b.name, b.boss, b.levels, w.gold
+					zone.entrance = v3(b.entrance)
+					if b.exit then zone.exit = { c = v3(b.exit.center), r = b.exit.radius } end
+					if b.arena then zone.arena = { c = v3(b.arena.center), r = b.arena.radius, level = b.arena.level } end
+					if b.gate then
+						zone.gate = { at = v3(b.gate.at), back = v3(b.gate.back), boss = b.gate.boss, level = b.gate.level }
+					end
+					zone.spawns = {}
+					for _, s in ipairs(b.spawns or {}) do
+						local rg = s.region or {}
+						zone.spawns[#zone.spawns + 1] = { monster = s.monster, count = s.count, c = v3(rg.center),
+							size = rg.size and { rg.size.X, rg.size.Y } or nil }
+					end
+					zone.terraces = {}
+					for _, t in ipairs(b.terraces or {}) do
+						zone.terraces[#zone.terraces + 1] = { c = v3(t.center), r = t.radius, level = t.level }
+					end
+				end
+			end
+			poi.zone = zone
+		end)
+		local data = { v = Nav.SCAN_V, field = field, cell = CELL, x0 = x0, z0 = z0, w = W, h = H, base = base,
+			hts = table.concat(hs, ","), haz = table.concat(hzs), wall = table.concat(ws), poi = poi,
+			parts = nparts, scanned = os.time(), placeVersion = game.PlaceVersion }
+		if not isfolder("PetHunt") then makefolder("PetHunt") end
+		if not isfolder("PetHunt/nav") then makefolder("PetHunt/nav") end
+		writefile(DIR .. field .. ".json", HS:JSONEncode(data))
+		maps[field] = decode(data)
+		return maps[field], ("%dx%d walk=%d parts=%d"):format(W, H, walk, nparts)
+	end
+
+	-- read just the header of a saved map (for "needs rescan?" checks)
+	function Nav.savedInfo(field)
+		local path = DIR .. field .. ".json"
+		if not (isfile and isfile(path)) then return nil end
+		local ok, d = pcall(function() return HS:JSONDecode(readfile(path)) end)
+		if not ok then return nil end
+		return { parts = d.parts or 0, placeVersion = d.placeVersion, scanned = d.scanned, v = d.v or 1 }
+	end
+
+	-- stuck log: PetHunt/nav/stuck.json  [{f,x,y,z,gx,gz,t}]
+	function Nav.logStuck(m, p, goal)
+		local path = DIR .. "stuck.json"
+		local list = {}
+		pcall(function() list = HS:JSONDecode(readfile(path)) end)
+		list[#list + 1] = { f = m.name, x = math.floor(p.X), y = math.floor(p.Y), z = math.floor(p.Z),
+			gx = math.floor(goal.X), gz = math.floor(goal.Z), t = os.time() }
+		while #list > 200 do table.remove(list, 1) end
+		pcall(writefile, path, HS:JSONEncode(list))
+	end
+
+	-- Per-tick driver for a caller that re-asks every ~0.1s (the main script's pathTo).
+	-- st = persistent state table. Returns true when it issued the movement this tick;
+	-- false = no map / no path / gave up -> caller uses its old walker.
+	local function flatD(a, b) return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude end
+	function Nav.drive(st, fid, hum, hrp, goal)
+		if not fid then return false end
+		st.scanTried = st.scanTried or {}
+		local m = maps[fid] or Nav.load(fid)
+		if m and not st.verChecked then
+			st.verChecked = {}
+		end
+		if m and st.verChecked and not st.verChecked[fid] then
+			-- game updated since the scan -> rescan in the background (old map stays in use meanwhile)
+			st.verChecked[fid] = true
+			local info = Nav.savedInfo(fid)
+			if info and (info.placeVersion ~= game.PlaceVersion or (info.v or 1) < Nav.SCAN_V) then
+				task.spawn(function()
+					task.wait(2)
+					if Nav.scan(fid, function() task.wait() end) then st.pts, st.outTarget = nil, nil end
+				end)
+			end
+		end
+		if not m then
+			if not st.scanTried[fid] then
+				st.scanTried[fid] = true
+				task.spawn(function() task.wait(3) Nav.scan(fid, function() task.wait() end) end)
+			end
+			return false
+		end
+		local pos = hrp.Position
+		if not Nav.inside(m, pos) then return false end
+		local now = os.clock()
+		if st.failUntil and now < st.failUntil and st.failGoal and flatD(st.failGoal, goal) < 8 then return false end
+		local target = goal
+		local outside = not Nav.inside(m, goal)
+		if outside then
+			-- goal is in another field (e.g. the nearest WarpStone is across the bridge):
+			-- A* toward it with partial=true ends at the reachable cell closest to it = the
+			-- bridge end; the bridge itself is the old walker's (it used to start from mid-
+			-- field and wedge into the pocket beside snow's east ramp every time)
+			if st.outGoal and flatD(st.outGoal, goal) < 6 and st.outTarget then
+				target = st.outTarget
+			else
+				local pts = Nav.plan(m, pos, goal, true)
+				if not pts then st.failUntil, st.failGoal = now + 6, goal return false end
+				target = pts[#pts]
+				st.outGoal, st.outTarget = goal, target
+			end
+			if flatD(target, pos) < 5 then return false end
+		end
+		if now - (st.last or 0) > 0.6 then st.pts = nil end   -- caller paused: start fresh
+		st.last = now
+		if not st.pts or flatD(st.goal, target) > 6 or st.field ~= fid or now - st.planAt > 12 then
+			if not st.goal or flatD(st.goal, target) > 6 then st.stuckN = 0 end
+			local pts = Nav.plan(m, pos, target, true)
+			if not pts then
+				st.failUntil, st.failGoal, st.pts = now + 6, goal, nil
+				return false
+			end
+			st.pts, st.i, st.goal, st.field, st.planAt = pts, 2, target, fid, now
+			st.markPos, st.markAt, st.jumped = pos, now, false
+		end
+		local pts = st.pts
+		-- advance: close enough, or already past it along the segment (fast mounts overshoot)
+		while st.i <= #pts do
+			local wp = pts[st.i]
+			local last = st.i == #pts
+			if flatD(wp, pos) <= (last and 3 or 3.5) then
+				st.i += 1
+			elseif not last then
+				local prev = pts[st.i - 1]
+				local seg = Vector3.new(wp.X - prev.X, 0, wp.Z - prev.Z)
+				local rel = Vector3.new(pos.X - wp.X, 0, pos.Z - wp.Z)
+				if seg.Magnitude > 0.1 and seg.Unit:Dot(rel) > 0 and flatD(wp, pos) < 10 then st.i += 1 else break end
+			else
+				break
+			end
+		end
+		if st.i > #pts then
+			hum:MoveTo(target)   -- route done; goal may sit inside a solid (obelisk) -> push at it
+			return true
+		end
+		local wp = pts[st.i]
+		hum:MoveTo(wp)
+		if wp.Y - pos.Y > 2.2 and now - (st.jumpAt or 0) > 0.6 then hum.Jump = true st.jumpAt = now end
+		-- stuck handling: jump at 1s, give up this edge at 2.5s (mark bad + log + replan)
+		if (pos - st.markPos).Magnitude > 1.5 then
+			st.markPos, st.markAt, st.jumped = pos, now, false
+		else
+			local still = now - st.markAt
+			if still > 1 and not st.jumped then
+				hum.Jump = true
+				st.jumped = true
+			elseif still > 2.5 then
+				Nav.markBad(m, pos, wp)
+				Nav.logStuck(m, pos, wp)
+				st.stuckN = (st.stuckN or 0) + 1
+				st.pts = nil
+				if st.stuckN >= 4 then st.failUntil, st.failGoal = now + 10, goal end
+				st.markPos, st.markAt = pos, now
+			end
+		end
+		return true
+	end
+
+	-- Walk to goal along the navmap. opts: alive() -> bool, arrive (studs), timeout (s), onStatus(str)
+	-- returns true | false, reason
+	function Nav.walk(m, goal, opts)
+		opts = opts or {}
+		local plr = game:GetService("Players").LocalPlayer
+		local arrive = opts.arrive or 4
+		local deadline = os.clock() + (opts.timeout or 60)
+		local replans = 0
+		local function alive() return (not opts.alive) or opts.alive() end
+		-- goal may sit inside something solid (obelisk, boss pedestal): the nearest enterable
+		-- cell is the real target, and reaching it counts as arrival
+		local gi, gj = Nav.snap(m, goal, 6)
+		local goalCell = gi and Nav.worldOf(m, gi, gj)
+		local function arrived(p)
+			if Vector3.new(goal.X - p.X, 0, goal.Z - p.Z).Magnitude <= arrive then return true end
+			return goalCell ~= nil and Vector3.new(goalCell.X - p.X, 0, goalCell.Z - p.Z).Magnitude <= 2.5
+		end
+		while alive() and os.clock() < deadline do
+			local ch = plr.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+			if not hum or not hrp or hum.Health <= 0 then return false, "dead" end
+			if arrived(hrp.Position) then return true end
+			local pts, why = Nav.plan(m, hrp.Position, goal)
+			if not pts then return false, why end
+			local stuckAt = nil
+			for k = 2, #pts do
+				local wp = pts[k]
+				local last = k == #pts
+				local lastPos, lastProg = hrp.Position, os.clock()
+				local jumped = false
+				while alive() and os.clock() < deadline do
+					if hum.Health <= 0 then return false, "dead" end
+					local p = hrp.Position
+					local d = Vector3.new(wp.X - p.X, 0, wp.Z - p.Z).Magnitude
+					if d <= (last and arrive or 2.5) then break end
+					hum:MoveTo(wp)
+					if (p - lastPos).Magnitude > 1 then
+						lastPos, lastProg, jumped = p, os.clock(), false
+					elseif os.clock() - lastProg > 0.9 and not jumped then
+						hum.Jump = true
+						jumped = true
+					elseif os.clock() - lastProg > 2.2 then
+						stuckAt = { p, wp }
+						break
+					end
+					if opts.onStatus then opts.onStatus(("nav %d/%d"):format(k, #pts)) end
+					task.wait(0.1)
+				end
+				if stuckAt then break end
+			end
+			if not stuckAt then
+				if arrived(hrp.Position) then return true end
+			elseif Vector3.new(goal.X - stuckAt[1].X, 0, goal.Z - stuckAt[1].Z).Magnitude <= arrive + 4 then
+				-- blocked right at the goal (boss body, pedestal): close enough
+				return true
+			else
+				Nav.markBad(m, stuckAt[1], stuckAt[2])
+				Nav.logStuck(m, stuckAt[1], stuckAt[2])
+				replans += 1
+				if replans > 4 then return false, "stuck" end
+			end
+		end
+		return false, alive() and "timeout" or "cancelled"
+	end
+end
+return Nav
+end)()
+-- [NAV END]
 
 -- Every combat field OPEN right now. Z.allFields lists all 12 biomes (Z.fields only
 -- has the 7 original); fields past Moon Base are released by time via opensAt, and
@@ -520,6 +1245,7 @@ local function pathReset()
 	pf.gen = (pf.gen or 0) + 1   -- invalidates any route still computing in the background
 	pf.goal = nil; pf.wps = {}; pf.i = 1; pf.bestGoalD = math.huge
 	pf.goalProgAt = os.clock(); pf.hopping = false; pf.markPos = nil; pf.markAt = os.clock()
+	if pf.nav then pf.nav.pts = nil end
 	-- stop the game walker ONLY if it's still on OUR travel goal -- the game's own
 	-- chase (after TC.set) also drives PathWalker and must not be cancelled
 	if PW and pf.pwGoal then
@@ -573,6 +1299,23 @@ local function pathTo(hum, hrp, goalPos)
 		end
 	end
 	if flatDist(hrp.Position, goalPos) > 40 then ride(true) end
+	-- NAVMAP (user: "เดินติด" / "เอา navmapjson มาใช้จริง"): our own scanned grid of the
+	-- field -> A* over ramps/terraces, walked waypoint by waypoint. Runs BEFORE the old arena-exit
+	-- push below: that push fired beside snow's arena ramp and drove us into the wall
+	-- forever ("เดินติดมุมนี้ประจำ"). Falls through to the old code when there's no map,
+	-- no path, or it gave up on this goal.
+	if e.phNav and not plr:GetAttribute("DungeonRun") then
+		pf.nav = pf.nav or {}
+		getgenv().__PHP_NAVST = pf.nav   -- read-only diagnostics handle
+		local f = fieldAt(hrp.Position)
+		local okN, drove = pcall(Nav.drive, pf.nav, f and f.id, hum, hrp, goalPos)
+		if okN and drove then
+			if PW and pf.pwGoal then pcall(PW.stop); pf.pwGoal = nil end
+			stats.navWalk = (stats.navWalk or 0) + 1
+			return
+		end
+		if not okN then stats.navErr = tostring(drove) end
+	end
 	-- LEAVING A BOSS ARENA: the plateau's only way down is its StairRamp; the walker
 	-- sometimes can't find it from on top. Known route: rim end of the ramp -> down.
 	do
@@ -738,10 +1481,19 @@ end
 -- returns: stand point (walk target), distance from us to the obelisk center
 local function nearestStone(pos)
 	local best, bestD
+	-- NavMap on: THIS field's stone (any stone warps anywhere). The nearest one is often
+	-- across a bridge whose LevelGate we can't walk through -> jittered at the bridge end
+	-- for minutes (walkwatch: wizard/splash/snow "ไปหินวาร์ป ... ห่าง 93/145").
+	local here = e.phNav and fieldAt(pos)
 	for _, s in ipairs(warpStones()) do
 		local d = (s.center - pos).Magnitude
+		if here then
+			local sf = fieldAt(s.center)
+			if not (sf and sf.id == here.id) then d = d + 100000 end
+		end
 		if not best or d < bestD then best, bestD = s, d end
 	end
+	if best and bestD >= 100000 then bestD = (best.center - pos).Magnitude end
 	if not best then return nil, nil end
 	local c = best.center
 	local dx, dz = pos.X - c.X, pos.Z - c.Z
@@ -1616,6 +2368,32 @@ end)
 local chestIgnore = setmetatable({}, {__mode = "k"})   -- chests that won't open for us
 local chestNear = setmetatable({}, {__mode = "k"})     -- chest -> when we got next to it
 local lootPhase = nil      -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
+-- WHOSE DROP (user: "worldboss จบ แล้วมันวิ่งเก็บของคนอื่น" / "มีคนยืนฟามใกล้ๆ มันก็วิ่งไปเก็บ"):
+-- the game's LootDrops controller keeps a record per rendered drop -- {mine, owner, parts}
+-- in upvalue 2 of LootDrops.tap. Parts of a record with mine == false are another
+-- player's: never walk to them. Unknown parts fall through to the old heuristics below.
+local lootOwn = {at = 0, other = {}}
+function lootOwn.isOther(p)
+	local now = os.clock()
+	if now - lootOwn.at > 0.4 then
+		lootOwn.at = now
+		local set = {}
+		pcall(function()
+			local c = controllers()
+			local mod = c and c:FindFirstChild("LootDrops")
+			local list = mod and debug.getupvalues(require(mod).tap)[2]
+			for _, en in pairs(type(list) == "table" and list or {}) do
+				if type(en) == "table" and en.mine == false and type(en.parts) == "table" then
+					for _, q in pairs(en.parts) do
+						if typeof(q) == "Instance" then set[q] = true end
+					end
+				end
+			end
+		end)
+		lootOwn.other = set
+	end
+	return lootOwn.other[p] == true
+end
 -- LootDrops also shows OTHER players' drops, which we can't pick up: ignore what was
 -- already lying there when our boss died, and anything we've stood on for 1.5s that
 -- didn't vanish (= not ours) -- otherwise we circle someone else's loot for 10s.
@@ -1633,7 +2411,8 @@ local function nearestLoot(center, pos)
 			lp.nearAt[p] = lp.nearAt[p] or now
 			if now - lp.nearAt[p] > 4.5 then lp.ignore[p] = true end
 		end
-		if p:IsA("BasePart") and not (lp and lp.ignore[p]) and flatDist(p.Position, center) < ((lp and lp.radius) or 80) then
+		if p:IsA("BasePart") and not (lp and lp.ignore[p]) and flatDist(p.Position, center) < ((lp and lp.radius) or 80)
+			and not lootOwn.isOther(p) then
 			local d = flatDist(p.Position, pos)
 			if not best or d < bestD then best, bestD = p, d end
 		end
@@ -1885,7 +2664,7 @@ local function dgLootTick(hum, hrp)
 	local best, bestD
 	local lf = workspace:FindFirstChild("LootDrops")
 	for _, p in ipairs(lf and lf:GetChildren() or {}) do
-		if p:IsA("BasePart") and not lp.ignore[p] and flatDist(p.Position, lp.center) < 70 then
+		if p:IsA("BasePart") and not lp.ignore[p] and flatDist(p.Position, lp.center) < 70 and not lootOwn.isOther(p) then
 			local d = flatDist(p.Position, pos)
 			-- stood on it 4.5s and it's still there: not ours to take
 			if d < 8 then
@@ -3475,6 +4254,8 @@ STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟ�
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
 STs:Toggle({Name = "Auto Warp (วาร์ปไปฟิลด์ที่ถูก / ตายแล้ววาร์ปกลับจากเมือง)", Default = e.phAutoWarp,
 	Callback = function(v) e.phAutoWarp = v; sv() end}, "PHAutoWarp")
+STs:Toggle({Name = "เดินด้วย NavMap (แผนที่สแกนเอง ไม่ติดทางลาด/ขั้นพื้น)", Default = e.phNav,
+	Callback = function(v) e.phNav = v; sv() end}, "PHNav")
 STs:Toggle({Name = "Auto Ride (ขี่สัตว์ตอนเดินไกล / ลงเองตอนเข้าระยะตี)", Default = e.phRide,
 	Callback = function(v) e.phRide = v; sv() end}, "PHRide")
 STs:Label({Text = "กำลังจะมา: Auto World Boss (บอสโลกทุก 30 นาที)"})
