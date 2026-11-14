@@ -65,6 +65,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDodge = true,         -- step out of boss/monster skill telegraphs (BossCast red zones)
 	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
 	phNav = true,           -- field walks follow our scanned NavMap (PetHunt/nav/*.json, A*); no map/no path -> old walker
+	phTowerOn = false,      -- Auto Infinity Tower: fight each floor, walk into the TowerWarp ring to climb, dodge the x10 bosses
+	phTowerEnter = false,   -- in town: enter the Endless Tower by itself (solo / as party leader)
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
@@ -2771,6 +2773,12 @@ local function dgTick(hum, hrp)
 	-- the leash only matters in the boss room; ordinary rooms may be crossed freely
 	-- (ranged mobs at the edge never walk in, and we stood there "waiting" forever)
 	local bossRoom = run.stage >= nStages
+	-- AUTO INFINITY TOWER (user: "auto ตี auto เดินเข้าวงไปชั้นถัดไป หลบบอส"): the tower is
+	-- one stage per floor, so "last stage" made EVERY floor the boss room (22-stud orbit
+	-- all climb). Only the x10 floors have the boss.
+	local tower = run.def.endless == true
+	local tFloor = tonumber(plr:GetAttribute("TowerFloor")) or 0
+	if tower then bossRoom = tFloor % 10 == 0 end
 	-- boss room: the throne boss hovers at the room centre; keep inside r40 of it (no
 	-- leash) with room to dodge. Ordinary rooms: the whole room.
 	-- user: "ยืนยิงแล้วหลบแถวๆวงเขียวตรงกลาง (r9)": orbit just outside the sigil, dodge
@@ -2823,6 +2831,40 @@ local function dgTick(hum, hrp)
 	-- SEALED (no potions for 5s): play safe -- hold the spot by the centre, shoot only
 	-- what's already in range, dodge; no stepping out after anything
 	if bossRoom and sealedNow then DG_STEP_R = 0 end
+	-- TOWER: floor cleared (last wave, nothing left) -> walk into the TowerWarp ring (r7,
+	-- 30 studs off the floor centre) and stand there; the climb starts once everyone in
+	-- the party is inside (TowerWarpIn / TowerWarpNeed)
+	if tower and #pool == 0 then
+		local left = tonumber(plr:GetAttribute("DungeonLeft")) or 1
+		local wv = tonumber(plr:GetAttribute("DungeonWave")) or 0
+		local wvs = tonumber(plr:GetAttribute("DungeonWaves")) or 1
+		if left <= 0 and wv >= wvs then
+			local warp, wd
+			local root = workspace:FindFirstChild("Dungeons")
+			for _, mdl in ipairs(root and root:GetChildren() or {}) do
+				local tw = mdl:FindFirstChild("TowerWarp")
+				if tw then
+					local okP, wp = pcall(function() return tw:GetPivot().Position end)
+					if okP and wp and center and flatDist(wp, center) < radius + 20 and (not warp or flatDist(wp, pos) < wd) then
+						warp, wd = wp, flatDist(wp, pos)
+					end
+				end
+			end
+			if warp then
+				fightFocus = nil
+				if TC.current then pcall(TC.set, nil) end
+				setAuto(false)
+				pathReset()
+				if PW and PW.isWalking and PW.isWalking() then pcall(PW.stop) end
+				if wd > 2 then hum:MoveTo(Vector3.new(warp.X, pos.Y, warp.Z)) else hum:MoveTo(pos) end
+				dgMark.at = now
+				stats.farm = ("Tower ชั้น %d: เข้าวงวาร์ปขึ้นชั้นถัดไป (%s/%s คน)%s"):format(tFloor,
+					tostring(plr:GetAttribute("TowerWarpIn") or 0), tostring(plr:GetAttribute("TowerWarpNeed") or 1),
+					wd > 2 and (" · ห่าง %.0f"):format(wd) or "")
+				return true
+			end
+		end
+	end
 	if #pool > 0 then
 		local anchor = center and Vector3.new(center.X, pos.Y, center.Z) or pos
 		local function reachOf(m) return ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5 end
@@ -2947,8 +2989,8 @@ local function dgTick(hum, hrp)
 		if channeling then what = "ทุบให้ร่ายแตก! " .. what end
 		if sr then what = ("[วงบีบ r%d] "):format(sr) .. what end
 		if boss and best ~= boss and boss:GetAttribute("Shielded") == true then what = what .. "ลูกน้อง(บอสมีโล่)" end
-		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: %s %s (%d%%)%s"):format(run.stage, nStages, what, best.Name, hp,
-			off > DG_HOLD_R and " · กลับกลางห้อง" or "")
+		stats.farm = (tower and ("Tower ชั้น %d%s: "):format(tFloor, bossRoom and " (บอส)" or "") or ("ดันเจี้ยน ด่าน %d/%d: "):format(run.stage, nStages))
+			.. ("%s %s (%d%%)%s"):format(what, best.Name, hp, off > DG_HOLD_R and " · กลับกลางห้อง" or "")
 		return true
 	end
 	-- room empty (next wave spawning / gate just opened): stand in the room's middle
@@ -3011,7 +3053,7 @@ task.spawn(function()
 			downAt = downAt or os.clock()
 			local lives = tonumber(plr:GetAttribute("DungeonLives")) or 0
 			dgStats.respawn = ("ตายอยู่ %.0f วิ · เหลือเกิด %d · กดไป %d ครั้ง"):format(os.clock() - downAt, lives, tries)
-			if not (e.phDgOn or e.phAutoRejoin) or lives <= 0 then return end
+			if not (e.phDgOn or e.phAutoRejoin or (e.phTowerOn and plr:GetAttribute("DungeonRun") == "endless")) or lives <= 0 then return end
 			if os.clock() - downAt < 1.5 or os.clock() - lastTry < 2 then return end
 			lastTry = os.clock(); tries = tries + 1
 			dgStats.status = ("ตาย: กดเกิดใหม่ (เหลือ %d)"):format(lives)
@@ -3027,7 +3069,7 @@ local dgConn
 pcall(function()
 	dgConn = Net.event("Effect").OnClientEvent:Connect(function(kind, data)
 		if not alive() or kind ~= "Dungeon" or type(data) ~= "table" then return end
-		if data.kind == "ready" and (e.phDgAccept or e.phDgReplay) then
+		if data.kind == "ready" and (e.phDgAccept or e.phDgReplay or e.phTowerEnter) then
 			dgStats.status = ("รับคำเชิญ %s แล้ว"):format(tostring(data.leader or "หัวหน้า"))
 			task.delay(0.6, function() if alive() then dgCall("ready", true) end end)
 		elseif data.kind == "cancel" then
@@ -3158,7 +3200,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(1)
 		-- Auto Start Dungeon (phAutoRejoin) also drives this: in town -> go in
-		if not (e.phDgReplay or e.phAutoRejoin) then if not plr:GetAttribute("DungeonRun") then dgStats.status = "ปิดอยู่" end; continue end
+		if not (e.phDgReplay or e.phAutoRejoin or e.phTowerEnter) then if not plr:GetAttribute("DungeonRun") then dgStats.status = "ปิดอยู่" end; continue end
 		if plr:GetAttribute("DungeonRun") then dgStats.status = "อยู่ในรอบ"; continue end
 		if not DG or not DG.enabled() then dgStats.status = "เกมปิดดันเจี้ยนอยู่"; continue end
 		local now = os.clock()
@@ -3172,6 +3214,7 @@ task.spawn(function()
 		if now - dgStats.lastTry < 8 then continue end
 		dgStats.lastTry = now
 		local id, diff = dgPick()
+		if e.phTowerEnter then id, diff = "endless", "ranked" end   -- Auto Infinity Tower entry wins
 		local def = DG.byId[id]
 		local dd = def and def.difficultyById and def.difficultyById[diff]
 		if not (def and dd) or def.soon then dgStats.status = "ดันเจี้ยนที่เลือกยังไม่เปิด"; continue end
@@ -3221,10 +3264,10 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.12)
 		local inDungeon = plr:GetAttribute("DungeonRun") ~= nil
-		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin or e.phTowerOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
 		-- inside a dungeon run the field logic (warp stones, farm spot, field bosses,
 		-- watchdog hops) must never run: a Warp from in here would drag us out
-		if inDungeon and not (e.phDgOn or e.phAutoRejoin) then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
+		if inDungeon and not (e.phDgOn or e.phAutoRejoin or (e.phTowerOn and plr:GetAttribute("DungeonRun") == "endless")) then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
 		if not hooks() then stats.farm = "รอเข้าเกม"; continue end
 		local _, hum, hrp = myChar()
 		if not hrp then stats.farm = inDungeon and "ดันเจี้ยน: รอเกิดใหม่" or "รอเกิดใหม่"; wdAt = os.clock(); continue end
@@ -3245,7 +3288,7 @@ task.spawn(function()
 		-- the dodge loop owns movement while a skill telegraph covers us
 		if dodging then
 			wdAt = os.clock(); pathReset()
-			if inDungeon and (e.phDgOn or e.phAutoRejoin) then pcall(dgPotion, hum) end   -- still drink while stepping out
+			if inDungeon and (e.phDgOn or e.phAutoRejoin or (e.phTowerOn and plr:GetAttribute("DungeonRun") == "endless")) then pcall(dgPotion, hum) end   -- still drink while stepping out
 			continue
 		end
 		if inDungeon then
@@ -4072,6 +4115,10 @@ local DLs = Tabs.Dungeon:Section({Side = "Left"})
 DLs:Header({Text = "Auto Dungeon"})
 DLs:Toggle({Name = "เปิด Auto Dungeon (ตีในดันเจี้ยนเอง: ห้อง → บอส → เปิดหีบ)", Default = e.phDgOn,
 	Callback = function(v) e.phDgOn = v; sv() end}, "PHDgOn")
+DLs:Toggle({Name = "Auto Infinity Tower (ตีทุกชั้น → เดินเข้าวงวาร์ปขึ้นชั้นถัดไป · หลบสกิลบอสชั้น 10/20/...)", Default = e.phTowerOn,
+	Callback = function(v) e.phTowerOn = v; sv() end}, "PHTowerOn")
+DLs:Toggle({Name = "Auto เข้า Infinity Tower จากเมือง (เดี่ยว / เป็นหัวปาร์ตี้ · ลูกปาร์ตี้ = กดพร้อมให้)", Default = e.phTowerEnter,
+	Callback = function(v) e.phTowerEnter = v; sv() end}, "PHTowerEnter")
 DLs:Toggle({Name = "Auto Replay (กดปุ่ม REPLAY หน้าจบดันให้เอง)", Default = e.phDgReplay,
 	Callback = function(v) e.phDgReplay = v; sv() end}, "PHDgReplay")
 DLs:Toggle({Name = "Auto Join ปาร์ตี้ (ลูกปาร์ตี้: กด Join ให้เองตอนหัวหน้าเรียก)", Default = e.phDgAccept,
