@@ -65,6 +65,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDodge = true,         -- step out of boss/monster skill telegraphs (BossCast red zones)
 	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
 	phNav = true,           -- field walks follow our scanned NavMap (PetHunt/nav/*.json, A*); no map/no path -> old walker
+	phGoalFarm = false,     -- no selected boss up -> warp to the biome whose "Defeat 5,000 monsters" goal is closest to done and farm it
 	phTowerOn = false,      -- Auto Infinity Tower: fight each floor, walk into the TowerWarp ring to climb, dodge the x10 bosses
 	phTowerEnter = false,   -- in town: enter the Endless Tower by itself (solo / as party leader)
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
@@ -1009,7 +1010,21 @@ local skipUntil = {}          -- monster -> os.clock() deadline
 -- only a "return here after a boss trip" point and pickTarget roamed the whole field
 -- (user: "ตั้งจุดฟามไว้ แต่มันเดินไปฟามจุดอื่น"). Flat XZ distance -- terrain is terraced.
 local ANCHOR_RADIUS = 70
+-- GOAL FARM (user: "ไปไล่เก็บมอนพวกนี้ให้น่อย หมายถึงพอบอสไม่มี"): Goals > Biomes =
+-- "Defeat 5,000 monsters in <field>" (stat zone:<id>). goalFarm.pick() (defined next to
+-- fieldUnlocked) returns the unfinished one closest to done; while we're IN that field
+-- the farm spot elsewhere is ignored and the whole field is farmed.
+local goalFarm = {at = 0, field = nil, left = nil}
+function goalFarm.here(pos)
+	if not e.phGoalFarm or not goalFarm.pick then return false end
+	local g = goalFarm.pick()
+	local f = g and fieldAt(pos)
+	return f ~= nil and f.id == g
+end
 local function farmAnchor(hrp)
+	-- goal farm (user: "ยืนฟามเป็นกองๆก็ได้ ไม่ต้องขยับไปมา พอครบแล้วค่อยเปลี่ยน"): the goal
+	-- field's biggest spawn cluster becomes the farm spot until that goal is done
+	if goalFarm.here(hrp.Position) then return goalFarm.spot and goalFarm.spot(goalFarm.field) end
 	local fp = e.phFarmPos
 	if type(fp) ~= "table" or not fp.x then return nil end
 	local a = Vector3.new(fp.x, fp.y, fp.z)
@@ -1027,6 +1042,7 @@ local function pickTarget(hrp)
 	-- spot is set but in ANOTHER field: auto-warp is taking us home, so don't pick up
 	-- random monsters here on the way (only a selected boss may still be fought)
 	local spotElsewhere = e.phAutoWarp and type(e.phFarmPos) == "table" and e.phFarmPos.x and not anchor
+		and not goalFarm.here(hrp.Position)
 	local bossId = myField and myField.boss
 	-- nearHi: strongest within NEAR_RADIUS (what we actually fight)
 	-- nearest: closest anything within FARM_RADIUS (roam toward it when none near)
@@ -1101,6 +1117,9 @@ local function pickTarget(hrp)
 		end
 		return bossPick.m
 	end
+	-- goal farm: every kill counts the same toward "Defeat 5,000" -> the cheapest one to
+	-- reach, not the one closest to a target level (that walked past nearer monsters)
+	if nearest and goalFarm.here(hrp.Position) then return nearest end
 	if nearBest then return nearBest end    -- nearby monster closest to target level
 	if nearest then return nearest end      -- roam to the closest in-window
 	return fieldMax                         -- none in window: farm the field's best
@@ -1517,6 +1536,73 @@ local function fieldUnlocked(fid)
 	local gold = tonumber(plr:GetAttribute("Gold")) or 0
 	return (not w) or gold >= (tonumber(w.gold) or 0)
 end
+function goalFarm.pick()
+	if os.clock() - goalFarm.at < 5 then return goalFarm.field end
+	goalFarm.at = os.clock()
+	local best, bestLeft
+	pcall(function()
+		local c = controllers()
+		local PS = require(c:FindFirstChild("ProgressState", true))
+		local A = require(RS.Shared.Config.Achievements)
+		local st = PS.state and PS.state.stats or {}
+		local claims = PS.state and PS.state.achievementClaims or {}
+		local left = {}   -- field -> monsters still needed for its biggest unfinished goal
+		for _, a in ipairs(A.list) do
+			local fid = type(a.stat) == "string" and a.stat:match("^zone:(.+)$")
+			if fid and not claims[a.id] then
+				local need = (tonumber(a.goal) or 0) - (tonumber(st[a.stat]) or 0)
+				if need > 0 then left[fid] = math.max(left[fid] or 0, need) end
+			end
+		end
+		for fid, need in pairs(left) do
+			if fieldUnlocked(fid) and (not bestLeft or need < bestLeft) then best, bestLeft = fid, need end
+		end
+	end)
+	goalFarm.field, goalFarm.left = best, bestLeft
+	return best
+end
+-- the biggest monster cluster of a field (Zones spawns, boss excluded), standing height
+-- from the NavMap (floor + 3 = root height) or a ray when the field has no map yet
+function goalFarm.spot(fid)
+	goalFarm.spots = goalFarm.spots or {}
+	if not fid then return nil end
+	if goalFarm.spots[fid] then return goalFarm.spots[fid] end
+	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
+	local w = okZ and Z.warpById and Z.warpById[fid]
+	local b = w and w.base
+	if not b then return nil end
+	local best
+	for _, sp in ipairs(b.spawns or {}) do
+		local rg = sp.region
+		if rg and typeof(rg.center) == "Vector3" and (tonumber(sp.count) or 0) > 1 and sp.monster ~= b.boss
+			and (not best or sp.count > best.count) then
+			best = sp
+		end
+	end
+	if not best then return nil end
+	local c = best.region.center
+	local pos
+	pcall(function()
+		local m = Nav.maps[fid] or Nav.load(fid)
+		if m then
+			local i, j = Nav.cellOf(m, c)
+			local h = (i >= 0 and j >= 0 and i < m.w and j < m.h) and m.hts[j * m.w + i + 1]
+			if not h then i, j = Nav.snap(m, Vector3.new(c.X, (tonumber(b.elevation) or 0) + 12, c.Z), 4) end
+			if i then pos = Nav.worldOf(m, i, j) end
+		end
+	end)
+	if not pos then
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Include
+		rp.FilterDescendantsInstances = {workspace:FindFirstChild("World")}
+		local hit = workspace:Raycast(Vector3.new(c.X, 800, c.Z), Vector3.new(0, -1200, 0), rp)
+		if not hit then return nil end   -- field not streamed in yet: try again next tick
+		pos = hit.Position + Vector3.new(0, 3, 0)
+	end
+	goalFarm.spots[fid] = pos
+	goalFarm.spotMob = best.monster
+	return pos
+end
 local function isCombatField(fid)
 	if not fid or fid == "town" then return false end
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
@@ -1562,6 +1648,11 @@ local function wantedField(curId)
 			end
 		end
 		if pick then return pick end
+	end
+	-- 1b) Goal farm: no selected boss up -> the biome goal closest to done
+	if e.phGoalFarm then
+		local g = goalFarm.pick()
+		if g then return g end
 	end
 	-- 2) A farm spot is set: that's HOME. Go back to its field (warp if needed) and
 	--    farm only there (user: "ตีเฉพาะบอส และมอนตรงจุดที่มาร์ค" -- it was left
@@ -3264,7 +3355,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.12)
 		local inDungeon = plr:GetAttribute("DungeonRun") ~= nil
-		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin or e.phTowerOn) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin or e.phTowerOn or e.phGoalFarm) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
 		-- inside a dungeon run the field logic (warp stones, farm spot, field bosses,
 		-- watchdog hops) must never run: a Warp from in here would drag us out
 		if inDungeon and not (e.phDgOn or e.phAutoRejoin or (e.phTowerOn and plr:GetAttribute("DungeonRun") == "endless")) then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
@@ -3303,7 +3394,7 @@ task.spawn(function()
 			continue
 		end
 		-- not in a run and Auto Dungeon is the only mode on: idle in town (replay loop drives)
-		if not (e.phFarm or e.phBossOn or e.phWBOn) then stats.farm = "รอรอบดันเจี้ยนถัดไป"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phGoalFarm) then stats.farm = "รอรอบดันเจี้ยนถัดไป"; pathReset(); wdAt = os.clock(); continue end
 
 		-- WATCHDOG (unattended insurance): if the character is totally frozen -- no
 		-- 4-stud move for 30s -- it's wedged in a state pathTo can't see. Teleport-hop
@@ -3570,6 +3661,7 @@ task.spawn(function()
 		-- same X/Z higher Y, so a flat check would strand us up there).
 		if e.phBossOn or e.phWBOn then
 			engagingBoss = false
+			if needReturn and goalFarm.here(hrp.Position) then needReturn = false end   -- farming a goal here
 			if needReturn and type(e.phFarmPos) == "table" and e.phFarmPos.x then
 				local fp = Vector3.new(e.phFarmPos.x, e.phFarmPos.y, e.phFarmPos.z)
 				if (hrp.Position - fp).Magnitude > ENGAGE_DIST then
@@ -3654,8 +3746,9 @@ task.spawn(function()
 			-- keep hitting the current one until it dies (no flip-flopping); then the best
 			if not cur and best then pcall(TC.set, best); cur = best end
 			stayTarget = cur
-			stats.farm = cur and ("%s: %s L%d"):format(R == 0 and "ยืนตีที่จุดฟาร์ม" or "ตีรอบจุดฟาร์ม", cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
-				or "ยืนรอมอนเข้าระยะที่จุดฟาร์ม"
+			stats.farm = (cur and ("%s: %s L%d"):format(R == 0 and "ยืนตีที่จุดฟาร์ม" or "ตีรอบจุดฟาร์ม", cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
+				or "ยืนรอมอนเข้าระยะที่จุดฟาร์ม")
+				.. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d (กอง %s)"):format(tostring(goalFarm.field), goalFarm.left or 0, tostring(goalFarm.spotMob)) or "")
 			continue
 		elseif getgenv().__PHP_OLDRANGE and GSettings then
 			-- stay mode off (or no spot here): give the player's autoRange back
@@ -3746,11 +3839,11 @@ task.spawn(function()
 				-- not read that as "frozen" (it was teleport-hopping us away from the
 				-- monsters every 30s -- the "warping away while farming" bug)
 				wdAt = os.clock()
-				stats.farm = ("%s %s L%d"):format(boss and "ตีบอส" or "ตี", t.Name, tonumber(t:GetAttribute("Level")) or 0)
+				stats.farm = ("%s %s L%d"):format(boss and "ตีบอส" or "ตี", t.Name, tonumber(t:GetAttribute("Level")) or 0) .. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d"):format(tostring(goalFarm.field), goalFarm.left or 0) or "")
 			else
 				engagingFarm = false
 				stats.farm = ("%s %s L%d (ห่าง %.0f)"):format(boss and "ไปตีบอส" or "เดินไปหา",
-					t.Name, tonumber(t:GetAttribute("Level")) or 0, d)
+					t.Name, tonumber(t:GetAttribute("Level")) or 0, d) .. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d"):format(tostring(goalFarm.field), goalFarm.left or 0) or "")
 			end
 		end
 	end
@@ -3983,6 +4076,8 @@ FL:Toggle({Name = "└ ข้ามบอสที่ตีผ่านแล้
 	Callback = function(v) e.phBossUnbeaten = v; sv() end}, "PHBossUnbeaten")
 FL:Toggle({Name = "ฟาร์มที่จุดฟาร์ม (ล็อกจุดยืน)", Default = e.phStayPut,
 	Callback = function(v) e.phStayPut = v; sv() end}, "PHStayPut")
+FL:Toggle({Name = "ฟาร์มภารกิจ Biomes ตอนไม่มีบอส (ล่า 5,000 ตัว · ฟิลด์ที่ใกล้ครบก่อน)", Default = e.phGoalFarm,
+	Callback = function(v) e.phGoalFarm = v; goalFarm.at = 0; sv() end}, "PHGoalFarm")
 FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
 	Callback = function(v) e.phStayRadius = math.floor(v + 0.5); sv() end}, "PHStayRadius")
