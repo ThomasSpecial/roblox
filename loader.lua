@@ -1,5 +1,58 @@
 -- Multi-game loader -- one link, dispatches by game.PlaceId.
 -- Add new games by pushing their script under games/ and adding an entry below.
+--
+-- Safe to put in an executor's autoexec folder:
+--   * autoexec fires before the game has loaded -- PlaceId is still 0 and there is no
+--     LocalPlayer yet, which is why friends saw "it doesn't auto execute". We wait.
+--   * re-queues itself with queue_on_teleport, so it runs again after a rejoin /
+--     server hop / the scripts' own Auto Reconnect (executors don't re-run autoexec
+--     on an in-process teleport).
+--   * runs at most ONCE per game session: autoexec + the queued copy + a manual
+--     execute can all fire in the same server -- only the first one loads the game
+--     script. Force a reload with getgenv().TS_RELOAD = true before executing.
+local LOADER_URL = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/loader.lua"
+local genv = (getgenv and getgenv()) or _G
+
+-- one run per DataModel. Compared against `game` itself, not a plain flag: some
+-- executors keep getgenv across a teleport, and a flag would then block the new server.
+if genv.__TS_LOADER_GAME == game and not genv.TS_RELOAD then
+    warn("[Loader] already running in this server -- skipped (set getgenv().TS_RELOAD = true to force)")
+    return
+end
+genv.__TS_LOADER_GAME = game
+genv.TS_RELOAD = nil
+
+-- run again after the next teleport (once per server; the guard above stops doubles).
+-- A script_key set by the user's own autoexec (Luarmor games) is carried along locally.
+local qot = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    or (fluxus and fluxus.queue_on_teleport)
+if qot then
+    local carry = ""
+    if type(genv.script_key) == "string" then
+        carry = ("getgenv().script_key = %q\n"):format(genv.script_key)
+    end
+    pcall(qot, carry .. ([[
+local ok, src
+for _ = 1, 6 do
+    ok, src = pcall(game.HttpGet, game, %q)
+    if ok and type(src) == "string" and #src > 100 then break end
+    task.wait(5)
+end
+if ok and src then local f = loadstring(src) if f then f() end end
+]]):format(LOADER_URL))
+end
+
+-- wait for the game: PlaceId, LocalPlayer and the character all come late in autoexec
+if not game:IsLoaded() then game.Loaded:Wait() end
+local Players = game:GetService("Players")
+while not Players.LocalPlayer do task.wait(0.2) end
+local plr = Players.LocalPlayer
+if not plr.Character then
+    local t0 = os.clock()
+    while not plr.Character and os.clock() - t0 < 30 do task.wait(0.25) end
+end
+task.wait(2)   -- let the game's own client scripts finish their setup
+
 local PLACE_SCRIPTS = {
     [107653945083776] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/roll_anime.lua", -- Roll Anime to Fight!
     [108307565942574] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/full_rng.lua",   -- [NOW!!] RNG Heroes
@@ -40,18 +93,31 @@ local PLACE_SCRIPTS = {
 
 local url = PLACE_SCRIPTS[game.PlaceId]
 if not url then
+    genv.__TS_LOADER_GAME = nil
     warn(("[Loader] No script registered for this game (PlaceId %d, %s)"):format(game.PlaceId, game.Name))
     return
 end
 
-local fetched, body = pcall(game.HttpGet, game, url)
+-- retry: right after joining, HttpGet can fail once or twice
+local fetched, body
+for attempt = 1, 6 do
+    fetched, body = pcall(game.HttpGet, game, url)
+    if fetched and type(body) == "string" and #body > 0 then break end
+    if attempt < 6 then task.wait(5) end
+end
 if not fetched then
+    genv.__TS_LOADER_GAME = nil   -- failed: let a manual re-execute try again
     error("[Loader] Failed to fetch script for PlaceId " .. game.PlaceId .. ": " .. tostring(body))
 end
 
 local compiled, err = loadstring(body)
 if not compiled then
+    genv.__TS_LOADER_GAME = nil
     error("[Loader] Failed to compile script for PlaceId " .. game.PlaceId .. ": " .. tostring(err))
 end
 
-compiled()
+local ran, runErr = pcall(compiled)
+if not ran then
+    genv.__TS_LOADER_GAME = nil
+    error("[Loader] Script error for PlaceId " .. game.PlaceId .. ": " .. tostring(runErr))
+end
