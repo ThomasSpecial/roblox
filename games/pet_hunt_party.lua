@@ -79,6 +79,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
 	phDgBuyKeys = false,    -- out of keys -> buy one (250k gold) -- only on, user's explicit request
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
+	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
@@ -3420,6 +3421,40 @@ pcall(function()
 		end
 	end)
 end)
+-- AUTO SKIP the boss intro cutscene (user: "เวลามันจะเข้าบอส มันจะมี animation ทำ auto skip"):
+-- Controllers.BossIntro builds PlayerGui.BossIntro (camera Scriptable, our root ANCHORED, all
+-- other GUIs hidden) with one TextButton "SKIP >>". Its Activated handler ends the cutscene
+-- locally AND sends Dungeon:skipIntro (a party vote). firesignal / Connection:Fire are no-ops
+-- in Real, so call the Lua listener itself. Fallback: the server vote alone (the cutscene
+-- then still runs out its clock).
+do
+	local function pressSkip(gui)
+		task.wait(0.4)   -- buildGui parents the gui first, then wires the button
+		for _ = 1, 10 do
+			if not (alive() and e.phDgSkipIntro and gui.Parent) then return end
+			local btn = gui:FindFirstChildWhichIsA("TextButton")
+			if btn and not btn.Visible then dgStats.status = "ข้ามฉากเปิดบอสแล้ว"; return end   -- handler ran (it hides itself)
+			local called = false
+			if btn and type(getconnections) == "function" then
+				local okC, cons = pcall(getconnections, btn.Activated)
+				if okC then
+					for _, c in ipairs(cons) do
+						if type(c.Function) == "function" then task.spawn(pcall, c.Function); called = true end
+					end
+				end
+			end
+			if not called then pcall(dgCall, "skipIntro") end
+			task.wait(0.5)
+		end
+	end
+	local pg = plr:WaitForChild("PlayerGui", 10)
+	if pg then
+		local skipConn = pg.ChildAdded:Connect(function(ch)
+			if ch.Name == "BossIntro" and ch:IsA("ScreenGui") and e.phDgSkipIntro and alive() then task.spawn(pressSkip, ch) end
+		end)
+		task.spawn(function() while alive() do task.wait(1) end; pcall(function() skipConn:Disconnect() end) end)
+	end
+end
 if dgConn then
 	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
 end
@@ -4455,6 +4490,8 @@ DLs:Toggle({Name = "Auto เข้า Infinity Tower จากเมือง (�
 	Callback = function(v) e.phTowerEnter = v; sv() end}, "PHTowerEnter")
 DLs:Toggle({Name = "Auto Replay (กดปุ่ม REPLAY หน้าจบดันให้เอง)", Default = e.phDgReplay,
 	Callback = function(v) e.phDgReplay = v; sv() end}, "PHDgReplay")
+DLs:Toggle({Name = "Auto Skip ฉากเปิดตัวบอส (กด SKIP ให้เอง)", Default = e.phDgSkipIntro,
+	Callback = function(v) e.phDgSkipIntro = v; sv() end}, "PHDgSkipIntro")
 DLs:Toggle({Name = "Auto Join ปาร์ตี้ (ลูกปาร์ตี้: กด Join ให้เองตอนหัวหน้าเรียก)", Default = e.phDgAccept,
 	Callback = function(v) e.phDgAccept = v; sv() end}, "PHDgAccept")
 local dgOpts, dgByLabel, dgDefault = {}, {}, nil
