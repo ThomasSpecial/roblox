@@ -79,6 +79,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
 	phDgBuyKeys = false,    -- out of keys -> buy one (250k gold) -- only on, user's explicit request
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
+	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -1016,16 +1017,30 @@ local ANCHOR_RADIUS = 70
 -- fieldUnlocked) returns the unfinished one closest to done; while we're IN that field
 -- the farm spot elsewhere is ignored and the whole field is farmed.
 local goalFarm = {at = 0, field = nil, left = nil}
+-- FARM PROGRESSION (user: "ไม่ฟามมอนตามเวลที่กำหนด ... ปลดล็อกแมพถัดไปได้ มันไม่ไปตีบอส") rides
+-- the same machinery: kind "unlock" = the field holding the boss that gates the next field
+-- (my level already reached it), kind "level" = the field whose monsters best fit the window
+function goalFarm.on() return e.phGoalFarm or e.phCardHunt or (e.phFarm and e.phFarmProg) end
 function goalFarm.here(pos)
-	if not (e.phGoalFarm or e.phCardHunt) or not goalFarm.pick then return false end
+	if not goalFarm.on() or not goalFarm.pick then return false end
 	local g = goalFarm.pick()
 	local f = g and fieldAt(pos)
 	return f ~= nil and f.id == g
 end
+-- the gate boss we're here to kill (unlock mode, standing in its field), else nil
+function goalFarm.ub(fid)
+	if not (e.phFarm and e.phFarmProg) or not fid or not goalFarm.pick then return nil end
+	goalFarm.pick()
+	if goalFarm.kind == "unlock" and goalFarm.field == fid then return goalFarm.mob end
+	return nil
+end
 local function farmAnchor(hrp)
 	-- goal farm (user: "ยืนฟามเป็นกองๆก็ได้ ไม่ต้องขยับไปมา พอครบแล้วค่อยเปลี่ยน"): the goal
 	-- field's biggest spawn cluster becomes the farm spot until that goal is done
-	if goalFarm.here(hrp.Position) then return goalFarm.spot and goalFarm.spot(goalFarm.field, goalFarm.mob) end
+	if goalFarm.here(hrp.Position) then
+		if goalFarm.kind == "unlock" then return nil end   -- free to walk to the boss arena
+		return goalFarm.spot and goalFarm.spot(goalFarm.field, goalFarm.mob)
+	end
 	local fp = e.phFarmPos
 	if type(fp) ~= "table" or not fp.x then return nil end
 	local a = Vector3.new(fp.x, fp.y, fp.z)
@@ -1054,31 +1069,36 @@ local function pickTarget(hrp)
 	local above = tonumber(e.phFarmAbove) or 10
 	local loLv = myLv - below
 	local hiLv = myLv + above
-	-- targetLv: the level we actually AIM for = my level shifted down by "below" and
-	-- up by "above" (so below=2,above=0 -> 2 under me; 0,0 -> exactly my level). We
-	-- pick the in-window monster whose level is closest to this, not the strongest.
-	local targetLv = myLv - below + above
+	-- targetLv: the TOP of the window -- the strongest monster allowed (best EXP), as the
+	-- toggle says. It used to be myLv - below + above, which with the defaults (99/10)
+	-- aimed ~89 levels under me = the weakest thing in the field (user: "มั่วๆ").
+	local targetLv = hiLv
+	-- unlock mode: the gate boss of this field is fought regardless of "ตีบอสฟิลด์ด้วย"
+	-- and of distance (the arena can be past FARM_RADIUS)
+	local unlockB = goalFarm.ub(myId)
 	-- fieldMax = highest-level monster in the field REGARDLESS of the window, used
 	-- as a fallback so we keep farming (and levelling) when nothing falls inside
 	-- the chosen window -- e.g. my level outran the field's top monster.
 	local nearBest, nearBestOff, nearBestD, nearest, nearestD, bossPick, fieldMax, fieldMaxLv, fieldMaxD
+	local under, underLv, underD
 	for _, m in ipairs(workspace.Monsters:GetChildren()) do
 		if m.PrimaryPart and (tonumber(m:GetAttribute("Health")) or 0) > 0
 			and m:GetAttribute("Dummy") ~= true   -- skip town DPS-test dummies
 			and (not skipUntil[m] or skipUntil[m] < now) then
 			local isBoss = m:GetAttribute("IsBoss") == true or m:GetAttribute("MonsterId") == bossId
-			if (not isBoss) or e.phFarmBoss then
+			local isUB = isBoss and unlockB ~= nil and m:GetAttribute("MonsterId") == unlockB
+			if (not isBoss) or e.phFarmBoss or isUB then
 				local d = (m.PrimaryPart.Position - hrp.Position).Magnitude
 				local inAnchor = isBoss
 					or (anchor and flatDist(m.PrimaryPart.Position, anchor) < ANCHOR_RADIUS)
 					or (not anchor and not spotElsewhere)
-				if d < FARM_RADIUS and inAnchor then
+				if (d < FARM_RADIUS or isUB) and inAnchor then
 					local mf = fieldAt(m.PrimaryPart.Position)
 					if not myId or (mf and mf.id == myId) then
 						local bid2 = m:GetAttribute("MonsterId")
 						local bossOk = not (e.phBossUnbeaten and plr:GetAttribute("Beat_" .. tostring(bid2)) == true)
 							and ((not e.phBossWaitLv) or myLv >= (tonumber(m:GetAttribute("Level")) or BOSS_LV[bid2] or 0))
-						if isBoss and e.phFarmBoss and bossOk and (not bossPick or d < bossPick.d) then
+						if isBoss and (e.phFarmBoss or isUB) and bossOk and (not bossPick or d < bossPick.d) then
 							bossPick = {m = m, d = d}
 						end
 						local lv = tonumber(m:GetAttribute("Level")) or 0
@@ -1092,6 +1112,10 @@ local function pickTarget(hrp)
 							-- always remember the field's strongest (fallback)
 							if not fieldMax or lv > fieldMaxLv or (lv == fieldMaxLv and cost < fieldMaxD) then
 								fieldMax, fieldMaxLv, fieldMaxD = m, lv, cost
+							end
+							-- fallback that respects the window's top: strongest not above it
+							if lv <= hiLv and (not under or lv > underLv or (lv == underLv and cost < underD)) then
+								under, underLv, underD = m, lv, cost
 							end
 							-- inside the window, aim for targetLv: pick the monster whose
 							-- level is closest to it (tie -> cheapest to reach). nearest =
@@ -1120,10 +1144,10 @@ local function pickTarget(hrp)
 	end
 	-- goal farm: every kill counts the same toward "Defeat 5,000" -> the cheapest one to
 	-- reach, not the one closest to a target level (that walked past nearer monsters)
-	if nearest and goalFarm.here(hrp.Position) then return nearest end
+	if nearest and goalFarm.here(hrp.Position) and goalFarm.kind ~= "level" then return nearest end
 	if nearBest then return nearBest end    -- nearby monster closest to target level
 	if nearest then return nearest end      -- roam to the closest in-window
-	return fieldMax                         -- none in window: farm the field's best
+	return under or fieldMax                -- none in window: the strongest not above it
 end
 
 -- Walk to a point AROUND buildings with PathfindingService (straight MoveTo got
@@ -1583,11 +1607,74 @@ local function cardPick()
 end
 -- the active hunt: card hunt first (when on), then the biome goal. goalFarm.field / .mob /
 -- .left / .kind describe it for the warp picker, the spot and the status line.
+-- Auto Farm progression. Gate of field N+1 = level >= gate.level AND Beat_<field N's boss>
+-- (boss level == that gate level). Returns field, mob/boss, kind:
+--   "unlock": my level opens the next field but its gate boss isn't beaten -> that boss's field
+--   "level" : the unlocked field with the strongest normal monster inside [myLv-below, myLv+above]
+function goalFarm.prog(wantUnlock)
+	local Z = require(RS.Shared.Config.Zones)
+	local M = require(RS.Shared.Config.Monsters)
+	local defs = M.defs or M
+	local myLv = tonumber(plr:GetAttribute("Level")) or 1
+	if wantUnlock then
+		local function yes() return true end
+		for _, f in ipairs(openFields(Z)) do
+			local g = f.gate
+			local bid = type(g) == "table" and g.boss
+			if bid and not beatBoss(bid) and not fieldUnlocked(f.id) then
+				local okA, onlyBoss = pcall(Z.gateBlock, f, myLv, yes)        -- boss pretended beaten
+				if okA and onlyBoss == nil then
+					for _, h in ipairs(openFields(Z)) do
+						local w = Z.warpById and Z.warpById[h.id]
+						if w and w.base and w.base.boss == bid and fieldUnlocked(h.id) then
+							return h.id, bid, "unlock"
+						end
+					end
+				end
+				break   -- fields unlock in order: nothing past the first locked one can open
+			end
+		end
+	end
+	local lo = myLv - (tonumber(e.phFarmBelow) or 99)
+	local hi = myLv + (tonumber(e.phFarmAbove) or 10)
+	-- score: inside the window = the strongest; none inside (user Lv20, window 19-20: no
+	-- L19 exists) = the closest level to the window, below it before above it. Same level:
+	-- normal over elite, then the bigger spawn. Never "the field's biggest cluster" -- that
+	-- parked a Lv20 on Hot Dog Pup L12.
+	local best
+	for _, f in ipairs(openFields(Z)) do
+		local w = Z.warpById and Z.warpById[f.id]
+		local b = w and w.base
+		if b and f.levels and fieldUnlocked(f.id) then
+			for _, sp in ipairs(b.spawns or {}) do
+				local d = sp.monster ~= b.boss and defs[sp.monster]
+				local lv = d and tonumber(d.level)
+				if lv then
+					local gap = (lv >= lo and lv <= hi) and 0 or (lv < lo and (lo - lv) * 2 or (lv - hi) * 2 + 1)
+					local s = {f = f.id, mob = sp.monster, lv = lv, gap = gap,
+						elite = d.role == "elite" and 1 or 0, n = tonumber(sp.count) or 0}
+					if not best or s.gap < best.gap
+						or (s.gap == best.gap and (s.lv > best.lv
+						or (s.lv == best.lv and (s.elite < best.elite or (s.elite == best.elite and s.n > best.n))))) then
+						best = s
+					end
+				end
+			end
+		end
+	end
+	if best then return best.f, best.mob, "level", best.lv end
+	return nil
+end
 function goalFarm.pick()
 	if os.clock() - goalFarm.at < 5 then return goalFarm.field end
 	goalFarm.at = os.clock()
 	local field, left, mob, kind
-	if e.phCardHunt then
+	local prog = e.phFarm and e.phFarmProg
+	if prog then
+		local ok, f, m, k = pcall(goalFarm.prog, true)
+		if ok and k == "unlock" then field, mob, kind = f, m, k end
+	end
+	if not field and e.phCardHunt then
 		local ok, cs = pcall(cardPick)
 		if ok and cs then field, left, mob, kind = cs.fid, cs.n, cs.mob, "card" end
 	end
@@ -1612,11 +1699,20 @@ function goalFarm.pick()
 			if field then kind = "goal" end
 		end)
 	end
+	if not field and prog then
+		local ok, f, m, k, lv = pcall(goalFarm.prog, false)
+		if ok and f then field, mob, kind, left = f, m, k, lv end
+	end
 	goalFarm.field, goalFarm.left, goalFarm.mob, goalFarm.kind = field, left, mob, kind
 	return field
 end
 function goalFarm.tag(pos)
 	if not goalFarm.here(pos) then return "" end
+	if goalFarm.kind == "unlock" then
+		return (" · ไปตีบอส %s เพื่อปลดล็อกฟิลด์ถัดไป"):format(tostring(goalFarm.mob))
+	elseif goalFarm.kind == "level" then
+		return (" · ฟิลด์ตามเลเวล: %s L%d"):format(tostring(goalFarm.mob), goalFarm.left or 0)
+	end
 	if goalFarm.kind == "card" then
 		return (" · ล่าการ์ด %s (%s ขาดอีก %d ใบ)"):format(tostring(goalFarm.mob), tostring(goalFarm.field), goalFarm.left or 0)
 	end
@@ -1713,7 +1809,8 @@ local function wantedField(curId)
 		if pick then return pick end
 	end
 	-- 1b) Goal farm: no selected boss up -> the biome goal closest to done
-	if e.phGoalFarm or e.phCardHunt then
+	--     (+ Auto Farm progression: unlock boss / level-window field)
+	if goalFarm.on() then
 		local g = goalFarm.pick()
 		if g then return g end
 	end
@@ -3794,7 +3891,7 @@ task.spawn(function()
 			local myLv = tonumber(plr:GetAttribute("Level")) or 1
 			local below = tonumber(e.phFarmBelow) or 99
 			local above = tonumber(e.phFarmAbove) or 10
-			local targetLv = myLv - below + above
+			local targetLv = myLv + above   -- strongest allowed (same rule as pickTarget)
 			local best, bestScore
 			for _, m in ipairs(workspace.Monsters:GetChildren()) do
 				if m.PrimaryPart and (tonumber(m:GetAttribute("Health")) or 0) > 0 and m:GetAttribute("Dummy") ~= true
@@ -3881,7 +3978,7 @@ task.spawn(function()
 		local fbEligible = fbid
 			and not (e.phBossUnbeaten and plr:GetAttribute("Beat_" .. tostring(fbid)) == true)
 			and ((not e.phBossWaitLv) or (tonumber(plr:GetAttribute("Level")) or 1) >= (BOSS_LV[fbid] or 0))
-		local arena = e.phFarmBoss and fbEligible and myF and myF.arena and myF.arena.center
+		local arena = (e.phFarmBoss or (fbid and goalFarm.ub(myF.id) == fbid)) and fbEligible and myF and myF.arena and myF.arena.center
 		if arena and not tIsBoss then
 			local ac = (typeof(arena) == "Vector3") and arena or Vector3.new(arena.X or arena[1] or 436, 0, arena.Z or arena[3] or 112)
 			-- config arena centers are at y=0 (underground): snap onto the real ArenaFloor,
@@ -4175,6 +4272,9 @@ local FL = Tabs.Farm:Section({Side = "Left"})
 FL:Header({Text = "Auto Farm" })
 FL:Toggle({Name = "เปิด Auto Farm (เดินหามอนเลเวลสูงสุดในฟิลด์)", Default = e.phFarm,
 	Callback = function(v) e.phFarm = v; sv() end}, "PHFarm")
+FL:Toggle({Name = "ย้ายฟิลด์ตามช่วงเลเวล + ไปตีบอสปลดล็อกฟิลด์ถัดไปเอง", Default = e.phFarmProg,
+	Callback = function(v) e.phFarmProg = v; goalFarm.at = 0; sv() end}, "PHFarmProg")
+FL:Label({Text = "เลเวลถึงฟิลด์ถัดไปแล้ว แต่บอสที่เฝ้าประตูยังไม่ตาย → ไปรอตีบอสตัวนั้นก่อน\nไม่งั้นวาร์ปไปฟิลด์ที่มีมอนเลเวลสูงสุดในช่วงที่ตั้ง (ไม่นับ Elite) แล้วยืนตีกองนั้น"})
 FL:Toggle({Name = "ตีบอสฟิลด์ด้วย (ปลดล็อกฟิลด์ถัดไป)", Default = e.phFarmBoss,
 	Callback = function(v) e.phFarmBoss = v; sv() end}, "PHFarmBoss")
 FL:Toggle({Name = "└ ข้ามบอสที่ตีผ่านแล้ว (ปลดล็อกด่านแล้ว)", Default = e.phBossUnbeaten,
@@ -4210,8 +4310,7 @@ local function farmRangeText()
 	local myLv = tonumber(plr:GetAttribute("Level")) or 0
 	local below = tonumber(e.phFarmBelow) or 0
 	local above = tonumber(e.phFarmAbove) or 0
-	local tgt = myLv - below + above
-	return ("➜ เล็งมอน ~Lv %d (เลเวลคุณ %d, ต่ำ -%d/สูง +%d)"):format(math.max(tgt, 0), myLv, below, above)
+	return ("➜ ตีมอน Lv %d–%d (เลเวลคุณ %d) เลือกตัวเลเวลสูงสุดในช่วงก่อน"):format(math.max(myLv - below, 1), myLv + above, myLv)
 end
 FL:Slider({Name = "ต่ำกว่าเราได้ (เลเวล)", Minimum = 0, Maximum = 99, Default = e.phFarmBelow,
 	Precision = 0, DisplayMethod = "Round", Suffix = " lv",
