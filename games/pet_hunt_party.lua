@@ -65,7 +65,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDodge = true,         -- step out of boss/monster skill telegraphs (BossCast red zones)
 	phRide = true,          -- ride the equipped mount on long walks, dismount in attack range
 	phNav = true,           -- field walks follow our scanned NavMap (PetHunt/nav/*.json, A*); no map/no path -> old walker
-	phGoalFarm = false,     -- no selected boss up -> warp to the biome whose "Defeat 5,000 monsters" goal is closest to done and farm it
+	phGoalFarm = false,
+	phCardHunt = false,     -- no selected boss up -> stand on the spawn of a monster whose card we don't have (sets with the gold boss card first; boss cards skipped)     -- no selected boss up -> warp to the biome whose "Defeat 5,000 monsters" goal is closest to done and farm it
 	phTowerOn = false,      -- Auto Infinity Tower: fight each floor, walk into the TowerWarp ring to climb, dodge the x10 bosses
 	phTowerEnter = false,   -- in town: enter the Endless Tower by itself (solo / as party leader)
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
@@ -1016,7 +1017,7 @@ local ANCHOR_RADIUS = 70
 -- the farm spot elsewhere is ignored and the whole field is farmed.
 local goalFarm = {at = 0, field = nil, left = nil}
 function goalFarm.here(pos)
-	if not e.phGoalFarm or not goalFarm.pick then return false end
+	if not (e.phGoalFarm or e.phCardHunt) or not goalFarm.pick then return false end
 	local g = goalFarm.pick()
 	local f = g and fieldAt(pos)
 	return f ~= nil and f.id == g
@@ -1024,7 +1025,7 @@ end
 local function farmAnchor(hrp)
 	-- goal farm (user: "ยืนฟามเป็นกองๆก็ได้ ไม่ต้องขยับไปมา พอครบแล้วค่อยเปลี่ยน"): the goal
 	-- field's biggest spawn cluster becomes the farm spot until that goal is done
-	if goalFarm.here(hrp.Position) then return goalFarm.spot and goalFarm.spot(goalFarm.field) end
+	if goalFarm.here(hrp.Position) then return goalFarm.spot and goalFarm.spot(goalFarm.field, goalFarm.mob) end
 	local fp = e.phFarmPos
 	if type(fp) ~= "table" or not fp.x then return nil end
 	local a = Vector3.new(fp.x, fp.y, fp.z)
@@ -1536,37 +1537,98 @@ local function fieldUnlocked(fid)
 	local gold = tonumber(plr:GetAttribute("Gold")) or 0
 	return (not w) or gold >= (tonumber(w.gold) or 0)
 end
+-- CARD HUNT (user: "เก็บการ์ดที่ยังไม่มี ไล่จาก collection ที่เรามีการ์ดทองแล้วก่อน แล้วค่อยไล่อันอื่น
+-- ล่าทุกใบยกเว้นการ์ดบอสทอง"): Card Binder sets = Config.Binders.list (id = field id),
+-- found = Controllers.CardBook.isFound(cardId), a field card drops from the monster of the
+-- same id. Sets whose gold (boss) card we own come first, then the rest; fewest missing
+-- first so sets finish; inside a set the easiest rarity first. Boss cards are skipped.
+local CARD_RANK = {Common = 1, Uncommon = 2, Rare = 3, Epic = 4}
+local function cardPick()
+	local c = controllers()
+	local CB = require(c:FindFirstChild("CardBook", true))
+	local Cfg = RS.Shared.Config
+	local Bd = require(Cfg:FindFirstChild("Binders") or Cfg:FindFirstChild("Binders", true))
+	local Cd = require(Cfg.Cards)
+	local Z = require(Cfg.Zones)
+	local bestSet
+	for _, set in ipairs(Bd.list or {}) do
+		local w = Z.warpById and Z.warpById[set.id]
+		local b = w and w.base
+		if b and type(set.cards) == "table" and fieldUnlocked(set.id) then
+			local spawnable = {}
+			for _, sp in ipairs(b.spawns or {}) do spawnable[sp.monster] = true end
+			local goldHave, miss, setLeft = false, {}, 0
+			for _, cid in ipairs(set.cards) do
+				local found = CB.isFound(cid)
+				if not found then setLeft += 1 end   -- what the binder shows ("7/10" -> 3 left)
+				if cid == b.boss then
+					if found then goldHave = true end
+				elseif not found and spawnable[cid] then
+					local d = Cd.defs[cid]
+					miss[#miss + 1] = {cid = cid, r = CARD_RANK[d and d.rarity] or 9}
+				end
+			end
+			if #miss > 0 then
+				table.sort(miss, function(x, y) return x.r < y.r end)
+				-- user: "ไล่อันที่ collection เหลือน้อยสุดก่อน": gold-card sets first, then the
+				-- set with the fewest cards left as the binder counts them (boss card included)
+				local score = (goldHave and 0 or 1000) + setLeft * 10 + #miss
+				if not bestSet or score < bestSet.score then
+					bestSet = {score = score, fid = set.id, mob = miss[1].cid, n = setLeft, gold = goldHave}
+				end
+			end
+		end
+	end
+	return bestSet
+end
+-- the active hunt: card hunt first (when on), then the biome goal. goalFarm.field / .mob /
+-- .left / .kind describe it for the warp picker, the spot and the status line.
 function goalFarm.pick()
 	if os.clock() - goalFarm.at < 5 then return goalFarm.field end
 	goalFarm.at = os.clock()
-	local best, bestLeft
-	pcall(function()
-		local c = controllers()
-		local PS = require(c:FindFirstChild("ProgressState", true))
-		local A = require(RS.Shared.Config.Achievements)
-		local st = PS.state and PS.state.stats or {}
-		local claims = PS.state and PS.state.achievementClaims or {}
-		local left = {}   -- field -> monsters still needed for its biggest unfinished goal
-		for _, a in ipairs(A.list) do
-			local fid = type(a.stat) == "string" and a.stat:match("^zone:(.+)$")
-			if fid and not claims[a.id] then
-				local need = (tonumber(a.goal) or 0) - (tonumber(st[a.stat]) or 0)
-				if need > 0 then left[fid] = math.max(left[fid] or 0, need) end
+	local field, left, mob, kind
+	if e.phCardHunt then
+		local ok, cs = pcall(cardPick)
+		if ok and cs then field, left, mob, kind = cs.fid, cs.n, cs.mob, "card" end
+	end
+	if not field and e.phGoalFarm then
+		pcall(function()
+			local c = controllers()
+			local PS = require(c:FindFirstChild("ProgressState", true))
+			local A = require(RS.Shared.Config.Achievements)
+			local st = PS.state and PS.state.stats or {}
+			local claims = PS.state and PS.state.achievementClaims or {}
+			local need = {}   -- field -> monsters still needed for its biggest unfinished goal
+			for _, a in ipairs(A.list) do
+				local fid = type(a.stat) == "string" and a.stat:match("^zone:(.+)$")
+				if fid and not claims[a.id] then
+					local n = (tonumber(a.goal) or 0) - (tonumber(st[a.stat]) or 0)
+					if n > 0 then need[fid] = math.max(need[fid] or 0, n) end
+				end
 			end
-		end
-		for fid, need in pairs(left) do
-			if fieldUnlocked(fid) and (not bestLeft or need < bestLeft) then best, bestLeft = fid, need end
-		end
-	end)
-	goalFarm.field, goalFarm.left = best, bestLeft
-	return best
+			for fid, n in pairs(need) do
+				if fieldUnlocked(fid) and (not left or n < left) then field, left = fid, n end
+			end
+			if field then kind = "goal" end
+		end)
+	end
+	goalFarm.field, goalFarm.left, goalFarm.mob, goalFarm.kind = field, left, mob, kind
+	return field
 end
--- the biggest monster cluster of a field (Zones spawns, boss excluded), standing height
--- from the NavMap (floor + 3 = root height) or a ray when the field has no map yet
-function goalFarm.spot(fid)
+function goalFarm.tag(pos)
+	if not goalFarm.here(pos) then return "" end
+	if goalFarm.kind == "card" then
+		return (" · ล่าการ์ด %s (%s ขาดอีก %d ใบ)"):format(tostring(goalFarm.mob), tostring(goalFarm.field), goalFarm.left or 0)
+	end
+	return (" · ภารกิจ %s เหลือ %d"):format(tostring(goalFarm.field), goalFarm.left or 0)
+end
+-- where to stand: the hunted monster's biggest spawn (card hunt) or the field's biggest
+-- cluster (goal), boss excluded; height from the NavMap (floor + 3 = root height) or a ray
+function goalFarm.spot(fid, mob)
 	goalFarm.spots = goalFarm.spots or {}
 	if not fid then return nil end
-	if goalFarm.spots[fid] then return goalFarm.spots[fid] end
+	local key = fid .. ":" .. tostring(mob)
+	if goalFarm.spots[key] then return goalFarm.spots[key] end
 	local okZ, Z = pcall(require, RS.Shared.Config.Zones)
 	local w = okZ and Z.warpById and Z.warpById[fid]
 	local b = w and w.base
@@ -1574,8 +1636,9 @@ function goalFarm.spot(fid)
 	local best
 	for _, sp in ipairs(b.spawns or {}) do
 		local rg = sp.region
-		if rg and typeof(rg.center) == "Vector3" and (tonumber(sp.count) or 0) > 1 and sp.monster ~= b.boss
-			and (not best or sp.count > best.count) then
+		if rg and typeof(rg.center) == "Vector3" and sp.monster ~= b.boss and (mob == nil or sp.monster == mob)
+			and (mob ~= nil or (tonumber(sp.count) or 0) > 1)
+			and (not best or (tonumber(sp.count) or 0) > (tonumber(best.count) or 0)) then
 			best = sp
 		end
 	end
@@ -1599,7 +1662,7 @@ function goalFarm.spot(fid)
 		if not hit then return nil end   -- field not streamed in yet: try again next tick
 		pos = hit.Position + Vector3.new(0, 3, 0)
 	end
-	goalFarm.spots[fid] = pos
+	goalFarm.spots[key] = pos
 	goalFarm.spotMob = best.monster
 	return pos
 end
@@ -1650,7 +1713,7 @@ local function wantedField(curId)
 		if pick then return pick end
 	end
 	-- 1b) Goal farm: no selected boss up -> the biome goal closest to done
-	if e.phGoalFarm then
+	if e.phGoalFarm or e.phCardHunt then
 		local g = goalFarm.pick()
 		if g then return g end
 	end
@@ -3360,7 +3423,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.12)
 		local inDungeon = plr:GetAttribute("DungeonRun") ~= nil
-		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin or e.phTowerOn or e.phGoalFarm) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phDgOn or e.phAutoRejoin or e.phTowerOn or e.phGoalFarm or e.phCardHunt) then stats.farm = "ปิดอยู่"; pathReset(); wdAt = os.clock(); continue end
 		-- inside a dungeon run the field logic (warp stones, farm spot, field bosses,
 		-- watchdog hops) must never run: a Warp from in here would drag us out
 		if inDungeon and not (e.phDgOn or e.phAutoRejoin or (e.phTowerOn and plr:GetAttribute("DungeonRun") == "endless")) then stats.farm = "อยู่ในดันเจี้ยน (Auto Dungeon ปิด)"; pathReset(); wdAt = os.clock(); continue end
@@ -3399,7 +3462,7 @@ task.spawn(function()
 			continue
 		end
 		-- not in a run and Auto Dungeon is the only mode on: idle in town (replay loop drives)
-		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phGoalFarm) then stats.farm = "รอรอบดันเจี้ยนถัดไป"; pathReset(); wdAt = os.clock(); continue end
+		if not (e.phFarm or e.phBossOn or e.phWBOn or e.phGoalFarm or e.phCardHunt) then stats.farm = "รอรอบดันเจี้ยนถัดไป"; pathReset(); wdAt = os.clock(); continue end
 
 		-- WATCHDOG (unattended insurance): if the character is totally frozen -- no
 		-- 4-stud move for 30s -- it's wedged in a state pathTo can't see. Teleport-hop
@@ -3782,7 +3845,7 @@ task.spawn(function()
 			stayTarget = cur
 			stats.farm = (cur and ("%s: %s L%d"):format(R == 0 and "ยืนตีที่จุดฟาร์ม" or "ตีรอบจุดฟาร์ม", cur.Name, tonumber(cur:GetAttribute("Level")) or 0)
 				or "ยืนรอมอนเข้าระยะที่จุดฟาร์ม")
-				.. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d (กอง %s)"):format(tostring(goalFarm.field), goalFarm.left or 0, tostring(goalFarm.spotMob)) or "")
+				.. goalFarm.tag(hrp.Position)
 			continue
 		elseif getgenv().__PHP_OLDRANGE and GSettings then
 			-- stay mode off (or no spot here): give the player's autoRange back
@@ -3873,11 +3936,11 @@ task.spawn(function()
 				-- not read that as "frozen" (it was teleport-hopping us away from the
 				-- monsters every 30s -- the "warping away while farming" bug)
 				wdAt = os.clock()
-				stats.farm = ("%s %s L%d"):format(boss and "ตีบอส" or "ตี", t.Name, tonumber(t:GetAttribute("Level")) or 0) .. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d"):format(tostring(goalFarm.field), goalFarm.left or 0) or "")
+				stats.farm = ("%s %s L%d"):format(boss and "ตีบอส" or "ตี", t.Name, tonumber(t:GetAttribute("Level")) or 0) .. goalFarm.tag(hrp.Position)
 			else
 				engagingFarm = false
 				stats.farm = ("%s %s L%d (ห่าง %.0f)"):format(boss and "ไปตีบอส" or "เดินไปหา",
-					t.Name, tonumber(t:GetAttribute("Level")) or 0, d) .. (goalFarm.here(hrp.Position) and (" · ภารกิจ %s เหลือ %d"):format(tostring(goalFarm.field), goalFarm.left or 0) or "")
+					t.Name, tonumber(t:GetAttribute("Level")) or 0, d) .. goalFarm.tag(hrp.Position)
 			end
 		end
 	end
@@ -4120,6 +4183,8 @@ FL:Toggle({Name = "ฟาร์มที่จุดฟาร์ม (ล็อ�
 	Callback = function(v) e.phStayPut = v; sv() end}, "PHStayPut")
 FL:Toggle({Name = "ฟาร์มภารกิจ Biomes ตอนไม่มีบอส (ล่า 5,000 ตัว · ฟิลด์ที่ใกล้ครบก่อน)", Default = e.phGoalFarm,
 	Callback = function(v) e.phGoalFarm = v; goalFarm.at = 0; sv() end}, "PHGoalFarm")
+FL:Toggle({Name = "ล่าการ์ดที่ยังไม่มี ตอนไม่มีบอส (แฟ้มที่มีการ์ดทองแล้วก่อน · ไม่ล่าการ์ดบอส)", Default = e.phCardHunt,
+	Callback = function(v) e.phCardHunt = v; goalFarm.at = 0; sv() end}, "PHCardHunt")
 FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
 	Callback = function(v) e.phStayRadius = math.floor(v + 0.5); sv() end}, "PHStayRadius")
