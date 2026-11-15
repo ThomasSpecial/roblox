@@ -1743,12 +1743,45 @@ function goalFarm.spot(fid, mob)
 	local pos
 	pcall(function()
 		local m = Nav.maps[fid] or Nav.load(fid)
-		if m then
-			local i, j = Nav.cellOf(m, c)
-			local h = (i >= 0 and j >= 0 and i < m.w and j < m.h) and m.hts[j * m.w + i + 1]
-			if not h then i, j = Nav.snap(m, Vector3.new(c.X, (tonumber(b.elevation) or 0) + 12, c.Z), 4) end
-			if i then pos = Nav.worldOf(m, i, j) end
+		if not m then return end
+		-- stand on the spawn region's FLOOR = its most common cell height, at the enterable
+		-- floor cell nearest the centre. The heightmap keeps the TOP surface, and a centre
+		-- can sit under an overhead slab (toy: Spinning Top centre under a 1-stud Block shelf
+		-- at y99, floor y80 -> unreachable spot, user: "มอนเวล 35 มันติด")
+		local sz = best.region.size
+		local hx = ((typeof(sz) == "Vector2" or typeof(sz) == "Vector3") and sz.X or 30) / 2
+		local hz = (typeof(sz) == "Vector2" and sz.Y or typeof(sz) == "Vector3" and sz.Z or 30) / 2
+		local i0, j0 = Nav.cellOf(m, Vector3.new(c.X - hx, 0, c.Z - hz))
+		local i1, j1 = Nav.cellOf(m, Vector3.new(c.X + hx, 0, c.Z + hz))
+		i0, j0, i1, j1 = math.max(i0, 0), math.max(j0, 0), math.min(i1, m.w - 1), math.min(j1, m.h - 1)
+		local count, floorH, nTop = {}, nil, 0
+		for j = j0, j1 do
+			for i = i0, i1 do
+				local h = m.hts[j * m.w + i + 1]
+				if h then
+					local k = math.floor(h + 0.5)
+					count[k] = (count[k] or 0) + 1
+					if count[k] > nTop then floorH, nTop = k, count[k] end
+				end
+			end
 		end
+		local ci, cj = Nav.cellOf(m, c)
+		local bi, bj, bd
+		for j = j0, j1 do
+			for i = i0, i1 do
+				local h = m.hts[j * m.w + i + 1]
+				if h and floorH and math.abs(h - floorH) <= 1.5 then
+					local d = (i - ci) ^ 2 + (j - cj) ^ 2
+					if not bd or d < bd then
+						for _, o in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
+							if Nav.stepOk(m, i + o[1], j + o[2], -o[1], -o[2]) then bi, bj, bd = i, j, d break end
+						end
+					end
+				end
+			end
+		end
+		if not bi then bi, bj = Nav.snap(m, Vector3.new(c.X, (tonumber(b.elevation) or 0) + 12, c.Z), 4) end
+		if bi then pos = Nav.worldOf(m, bi, bj) end
 	end)
 	if not pos then
 		local rp = RaycastParams.new()
