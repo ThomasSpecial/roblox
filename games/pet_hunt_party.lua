@@ -4858,12 +4858,12 @@ for _, d in ipairs(DG and DG.list or {}) do
 			local lbl = ("%s · %s (Lv.%d+)"):format(d.name or d.id, df.name or df.id, tonumber(df.level) or 0)
 			table.insert(dgOpts, lbl)
 			dgByLabel[lbl] = d.id .. ":" .. df.id
-			if dgByLabel[lbl] == e.phDgPick then dgDefault = lbl end
+			if dgByLabel[lbl] == e.phDgPick then dgDefault = #dgOpts end   -- MacLib single-select Default = option INDEX (a label string never matches -> shows unselected)
 		end
 	end
 end
 DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที่จะเข้า (Replay)", Multi = false, Required = true,
-	Options = dgOpts, Default = dgDefault or dgOpts[1],
+	Options = dgOpts, Default = dgDefault or 1,
 	Callback = function(v)
 		if type(v) == "table" then v = v[1] or next(v) end
 		if dgByLabel[v] then e.phDgPick = dgByLabel[v]; sv() end
