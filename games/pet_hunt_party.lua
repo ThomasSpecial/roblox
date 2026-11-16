@@ -54,7 +54,13 @@ local HS = game:GetService("HttpService")
 local plr = Players.LocalPlayer
 
 -- ------------------------------------------------------------------ settings
-local SF = "PetHunt/state.json"
+-- one file PER ACCOUNT: several accounts on one PC share the executor workspace, and a
+-- single state.json let whichever account saved last switch the others' toggles (a
+-- leader's Auto Replay got turned off by a member's save). First run copies the old
+-- shared file so nothing is lost.
+-- (kept in a table field, not a local: the main chunk sits at Luau's 200-register limit
+-- and only a constant local like the old "PetHunt/state.json" costs no register)
+getgenv().__PHP_SF = ("PetHunt/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEvery = 20,
 	phCollect = false, phEquip = false, phEquipEvery = 15, phChest = false, phFarmBoss = false,
 	phBossOn = false, phBossPick = nil, phFarmPos = nil,
@@ -88,8 +94,9 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
-	if isfile and isfile(SF) then
-		local t = HS:JSONDecode(readfile(SF))
+	if isfile and not isfile(getgenv().__PHP_SF) and isfile("PetHunt/state.json") then writefile(getgenv().__PHP_SF, readfile("PetHunt/state.json")) end
+	if isfile and isfile(getgenv().__PHP_SF) then
+		local t = HS:JSONDecode(readfile(getgenv().__PHP_SF))
 		if type(t) == "table" then e = t end
 	end
 end)
@@ -97,7 +104,7 @@ for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
 local function sv()
 	pcall(function()
 		if makefolder and not isfolder("PetHunt") then makefolder("PetHunt") end
-		writefile(SF, HS:JSONEncode(e))
+		writefile(getgenv().__PHP_SF, HS:JSONEncode(e))
 	end)
 end
 
@@ -969,7 +976,7 @@ do   -- migrate picks saved under the old Thai labels ("ขั้น 0 (ธร�
 	for t in pairs(NEVER_SELL) do
 		if e.phSellTiers[TIER_LABELS[t]] then e.phSellTiers[TIER_LABELS[t]] = nil; migrated = true end
 	end
-	if migrated then pcall(function() writefile(SF, HS:JSONEncode(e)) end) end
+	if migrated then pcall(function() writefile(getgenv().__PHP_SF, HS:JSONEncode(e)) end) end
 end
 -- per-rarity level filter: phSellLv[tierKey] = {["93"] = true, ...}; empty = sell every level
 if type(e.phSellLv) ~= "table" then e.phSellLv = {} end
@@ -5014,7 +5021,7 @@ local equipLbl = GRs:Label({Text = "-"})
 local STs = Tabs.Settings:Section({Side = "Left"})
 STs:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() W:SetState(not W:GetState()) end) end}, "PHToggleUIKeybind")
-STs:Label({Text = "กด RightShift เพื่อซ่อน/แสดงหน้าต่าง\nตั้งค่าเซฟที่: " .. SF})
+STs:Label({Text = "กด RightShift เพื่อซ่อน/แสดงหน้าต่าง\nตั้งค่าเซฟที่: " .. getgenv().__PHP_SF})
 STs:Header({Text = "General"})
 STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟมีปัญหา → เข้าใหม่)", Default = e.phReconnect,
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
