@@ -4382,25 +4382,21 @@ do
 		if trait and trait ~= "" then s = s .. " · " .. tostring(trait) end
 		return s
 	end
-	-- card art: Config.PetArt.full[id] (the card's full illustration, 309x420) -> a public
-	-- rbxcdn PNG via thumbnails.roblox.com (Discord needs a plain image URL). Thumbnails
-	-- start "Pending" the first time, so every boss card is prefetched at load.
-	local artCache = {}
-	local function artUrl(id)
-		if artCache[id] then return artCache[id] end
-		local okA, A = pcall(function() return require(RS.Shared.Config.PetArt) end)
-		local ref = okA and type(A) == "table" and ((A.full or {})[id] or (A.pets or {})[id])
-		local asset = ref and tostring(ref):match("(%d+)")
+	-- images: Discord needs plain image URLs, so Roblox assets go through
+	-- thumbnails.roblox.com -> rbxcdn PNG. A thumbnail starts "Pending" the first time it is
+	-- asked for, so every boss card is prefetched at load. Cached per request URL.
+	local thumbCache = {}
+	local function thumb(api)
+		if thumbCache[api] then return thumbCache[api] end
 		local req = request or http_request or (syn and syn.request) or (http and http.request)
-		if not asset or not req then return nil end
+		if not req then return nil end
 		for _ = 1, 6 do
-			local okR, res = pcall(req, {Url = "https://thumbnails.roblox.com/v1/assets?assetIds=" .. asset
-				.. "&size=420x420&format=Png&isCircular=false", Method = "GET"})
+			local okR, res = pcall(req, {Url = api, Method = "GET"})
 			if okR and type(res) == "table" and res.StatusCode == 200 then
 				local okJ, j = pcall(HS.JSONDecode, HS, res.Body)
 				local row = okJ and type(j) == "table" and j.data and j.data[1]
 				if row and row.state == "Completed" and type(row.imageUrl) == "string" then
-					artCache[id] = row.imageUrl
+					thumbCache[api] = row.imageUrl
 					return row.imageUrl
 				end
 			end
@@ -4408,39 +4404,91 @@ do
 		end
 		return nil
 	end
+	local function petArt(id, kind)   -- kind "full" = the card illustration, "pets" = portrait
+		local okA, A = pcall(function() return require(RS.Shared.Config.PetArt) end)
+		local ref = okA and type(A) == "table" and (A[kind] or {})[id]
+		local asset = ref and tostring(ref):match("(%d+)")
+		return asset and thumb("https://thumbnails.roblox.com/v1/assets?assetIds=" .. asset .. "&size=420x420&format=Png&isCircular=false")
+	end
+	local function gameIcon()
+		return thumb("https://thumbnails.roblox.com/v1/games/icons?universeIds=" .. game.GameId .. "&size=150x150&format=Png&isCircular=false")
+	end
+	local function headshot()
+		return thumb("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. plr.UserId .. "&size=150x150&format=Png&isCircular=true")
+	end
 	task.spawn(function()
+		pcall(gameIcon); pcall(headshot)
 		for id in pairs(kindOf) do
 			if not alive() then return end
-			pcall(artUrl, id)
+			pcall(petArt, id, "full"); pcall(petArt, id, "pets")
 		end
 	end)
-	local function bossName(id)
+	local function petDef(id)
 		local okP, P = pcall(function() return require(RS.Shared.Config.Pets) end)
 		local pd = okP and type(P) == "table" and (P.defs or P)[id]
-		if type(pd) == "table" and pd.name then return pd.name end
+		return type(pd) == "table" and pd or {}
+	end
+	local function bossName(id)
+		local pd = petDef(id)
+		if pd.name then return pd.name end
 		local d = Cd.defs[id]
 		return d and d.name and (d.name:gsub("%s*Card$", "")) or id
 	end
+	local STAT = {atkPct = "ATK", dmgPct = "DMG", bossDmgPct = "Boss DMG", maxHpPct = "Max HP", expPct = "EXP",
+		dropPct = "Drop", goldPct = "Gold", crit = "Crit", aspd = "ASPD", cdr = "CDR", thorns = "Thorns",
+		moveSpeed = "Move Speed", potionPct = "Potion", atk = "ATK", def = "DEF", hp = "HP"}
+	local function bonusBlock(id)
+		local okB, b = pcall(Cd.bonusOf, id)
+		if not okB or type(b) ~= "table" then b = (Cd.defs[id] or {}).bonus end
+		if type(b) ~= "table" then return nil end
+		local lines = {}
+		for k, v in pairs(b) do
+			v = tonumber(v)
+			if v then
+				local val = (math.abs(v) < 1) and (("%g%%"):format(math.floor(v * 1000 + 0.5) / 10)) or ("%g"):format(v)
+				lines[#lines + 1] = ("+ %s +%s"):format(STAT[k] or k, val)
+			end
+		end
+		if #lines == 0 then return nil end
+		table.sort(lines)
+		return "```diff\n" .. table.concat(lines, "\n") .. "\n```"
+	end
+	local BADGE = {Legendary = "🌟 LEGENDARY", Secret = "💎 SECRET", Transcendent = "👑 TRANSCENDENT"}
+	local FIN_EMO = {gold = "🥇", rainbow = "🌈", holo = "✨"}
 	function hook.notify(id, key, delta, total, before, isTest)
 		local d = Cd.defs[id] or {}
 		local kind = kindOf[id]
 		task.spawn(function()
-			local art = artUrl(id)
+			local fin = finishOf(key)
+			local finKey = fin:match("^(%w+)") and fin:match("^(%w+)"):lower()
+			local desc = {}
+			local flavor = petDef(id).desc
+			if type(flavor) == "string" and flavor ~= "" then desc[#desc + 1] = "*" .. flavor .. "*" end
+			desc[#desc + 1] = bonusBlock(id)
+			local slot = Cd.slotNames and Cd.slotNames[d.slot] or d.slot
+			local content = {}
+			if isTest then content[#content + 1] = "🧪 **ทดสอบแจ้งเตือน**" end
+			if before == 0 and not isTest then content[#content + 1] = "🆕 **การ์ดใบแรก!**" end
+			if e.phHookPing and not isTest then content[#content + 1] = "@everyone" end
 			local payload = {
 				username = "Pet Hunt Party",
-				content = (e.phHookPing and not isTest) and "@everyone" or nil,
+				avatar_url = gameIcon(),
+				content = #content > 0 and table.concat(content, "  ") or nil,
 				embeds = {{
-					author = {name = (isTest and "[ทดสอบ] " or "") .. "🃏 ได้" .. (KIND[kind] or "การ์ด") .. "!"},
+					author = {name = (BADGE[d.rarity] or tostring(d.rarity or "")) .. " DROP!  ·  " .. (KIND[kind] or "การ์ด"),
+						icon_url = petArt(id, "pets")},
 					title = bossName(id),
-					description = ("**%s** ×%d · %s"):format(d.name or id, delta, tostring(d.rarity or "?")),
+					description = table.concat(desc, "\n"),
 					color = COLOR[d.rarity] or 0x5865F2,
-					image = art and {url = art} or nil,
+					thumbnail = petArt(id, "pets") and {url = petArt(id, "pets")} or nil,
+					image = petArt(id, "full") and {url = petArt(id, "full")} or nil,
 					fields = {
-						{name = "Finish", value = finishOf(key), inline = true},
-						{name = "มีทั้งหมด", value = ("%d ใบ%s"):format(total, before == 0 and " (ใบแรก! 🆕)" or ""), inline = true},
-						{name = "ตัวละคร", value = ("%s · Lv %s"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")), inline = true},
+						{name = "🎴 Finish", value = (FIN_EMO[finKey] or "▫️") .. " " .. fin, inline = true},
+						{name = "📦 มีทั้งหมด", value = ("**%d** ใบ%s"):format(total, delta > 1 and (" (+%d)"):format(delta) or ""), inline = true},
+						{name = "🧩 ช่องใส่", value = tostring(slot or "?"), inline = true},
 					},
-					footer = {text = "Pet Hunt Party · Auto"},
+					footer = {text = ("%s  ·  Lv %s  ·  Pet Hunt Party"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")),
+						icon_url = headshot()},
 					timestamp = DateTime.now():ToIsoDate(),
 				}},
 			}
