@@ -163,11 +163,12 @@ end)
 -- Drawing API, updated every RenderStepped (realtime): 2D box fitted to the projected
 -- character bounds, R15/R6 skeleton lines, name / distance / health bar. Party members
 -- (same "Party" attribute on the Player) count as teammates.
-for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = true, pHealth = true, pTracer = false, pGun = true,
+for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = false, pDist = true, pGlowRarity = true, pHealth = true, pTracer = false, pGun = true,
 	pTeam = false, pMaxDist = 2000}) do
 	if e[k] == nil then e[k] = v end
 end
 if e.pGlowMigrated == nil then e.pBox = false; e.pGlow = true; e.pGlowMigrated = true; sv() end
+if e.pNameMigrated == nil then e.pName = false; e.pGlowRarity = true; e.pNameMigrated = true; sv() end
 local ENEMY, MATE = Color3.fromRGB(255, 70, 70), Color3.fromRGB(80, 230, 120)
 
 -- Glow = a Highlight around the character (outline + light fill, seen through walls).
@@ -274,7 +275,11 @@ local renderConn = RunService.RenderStepped:Connect(function()
 				hideAll(d)
 			else
 				local col = mate and MATE or ENEMY
-				if e.pGlow then glowWanted[p] = {dist = dist, color = col, char = ch} end
+				-- glow colour = rarity of the gun in hand (fists / unknown gun -> enemy red / mate green)
+				local gName, gRar = gunOf(ch)
+				local glowCol = col
+				if e.pGlowRarity and gRar and gName ~= "Fists" then glowCol = COLORS[gRar] or col end
+				if e.pGlow then glowWanted[p] = {dist = dist, color = glowCol, char = ch} end
 				-- screen-space bounds from every body part's projected centre +- its size
 				local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
 				local onScreen = false
@@ -302,7 +307,6 @@ local renderConn = RunService.RenderStepped:Connect(function()
 					d.name.Text = p.DisplayName
 					d.name.Color = col
 					d.name.Position = Vector2.new(minX + w / 2, minY - 17)
-					local gName, gRar = gunOf(ch)
 					local showGun = e.pGun and gName ~= nil and gName ~= "Fists"
 					d.gun.Visible = showGun
 					if showGun then
@@ -310,7 +314,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 						d.gun.Color = COLORS[gRar or "Normal"] or COLORS.Normal
 						d.gun.Position = Vector2.new(minX + w / 2, maxY + 2)
 					end
-					d.dist.Visible = e.pName
+					d.dist.Visible = e.pDist
 					d.dist.Text = ("%dm"):format(math.floor(dist))
 					d.dist.Color = Color3.new(1, 1, 1)
 					d.dist.Position = Vector2.new(minX + w / 2, maxY + (showGun and 16 or 2))
@@ -420,7 +424,9 @@ P:Toggle({Name = "เปิด ESP คน", Default = e.pOn, Callback = function
 P:Toggle({Name = "Glow รอบตัว (มองทะลุกำแพง)", Default = e.pGlow, Callback = function(v) e.pGlow = v; sv() end}, "BRPGlow")
 P:Toggle({Name = "กรอบสี่เหลี่ยม", Default = e.pBox, Callback = function(v) e.pBox = v; sv() end}, "BRPBox")
 P:Toggle({Name = "Skeleton (โครงกระดูก)", Default = e.pSkel, Callback = function(v) e.pSkel = v; sv() end}, "BRPSkel")
-P:Toggle({Name = "ชื่อ + ระยะ", Default = e.pName, Callback = function(v) e.pName = v; sv() end}, "BRPName")
+P:Toggle({Name = "สี Glow = rarity ปืนที่ถือ", Default = e.pGlowRarity, Callback = function(v) e.pGlowRarity = v; sv() end}, "BRPGlowRarity")
+P:Toggle({Name = "ชื่อผู้เล่น", Default = e.pName, Callback = function(v) e.pName = v; sv() end}, "BRPName")
+P:Toggle({Name = "ระยะ", Default = e.pDist, Callback = function(v) e.pDist = v; sv() end}, "BRPDist")
 P:Toggle({Name = "แถบเลือด", Default = e.pHealth, Callback = function(v) e.pHealth = v; sv() end}, "BRPHealth")
 P:Toggle({Name = "ปืนที่ถือ + rarity (สีตาม rarity)", Default = e.pGun, Callback = function(v) e.pGun = v; sv() end}, "BRPGun")
 P:Toggle({Name = "เส้น Tracer จากกลางจอล่าง", Default = e.pTracer, Callback = function(v) e.pTracer = v; sv() end}, "BRPTracer")
@@ -428,7 +434,7 @@ P:Toggle({Name = "แสดงเพื่อนในปาร์ตี้ด�
 P:Slider({Name = "ระยะแสดงสูงสุด", Minimum = 50, Maximum = 5000, Default = tonumber(e.pMaxDist) or 2000,
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
 	Callback = function(v) e.pMaxDist = math.floor(v + 0.5); sv() end}, "BRPMaxDist")
-P:Label({Text = "ศัตรู = แดง · เพื่อนปาร์ตี้ = เขียว\nอัปเดตทุกเฟรม กรอบพอดีตัวตามท่าทาง"})
+P:Label({Text = "Glow ใช้สีตาม rarity ปืนที่ถือ (มือเปล่า: ศัตรูแดง · เพื่อนเขียว)\nอัปเดตทุกเฟรม กรอบพอดีตัวตามท่าทาง"})
 
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
