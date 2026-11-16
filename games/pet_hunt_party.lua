@@ -75,7 +75,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgOn = false,         -- Auto Dungeon: clear rooms / boss / open the boss chest while in a run
 	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
 	phDgAccept = false,     -- party member: auto-join the leader's ready check
-	phDgPick = "crypt:hard", phDgUseKeys = true, phDgKeepKeys = 0,
+	phDgPick = "crypt:hard",
 	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
 	phDgBuyBatch = false,   -- out of keys -> stop replaying, back in town buy phDgBuyCount keys in one go (250k each) -- off unless the user turns it on
 	phDgBuyCount = 100,
@@ -3417,10 +3417,10 @@ pcall(function()
 				-- user: "ออกเมื่อกุญแจหมด และซื้อทีละ 100 ดอก": no free run and no key left
 				-- -> don't vote REPLAY; the game sends us to town, where the town loop buys
 				-- a whole batch and enters again
-				if e.phDgBuyBatch and e.phDgUseKeys then
+				if e.phDgBuyBatch then
 					local st = dgCall("state")
 					local free = st.ok and type(st.free) == "table" and tonumber(st.free[id]) or 0
-					if st.ok and free <= 0 and (tonumber(st.keys) or 0) <= (tonumber(e.phDgKeepKeys) or 0) then
+					if st.ok and free <= 0 and (tonumber(st.keys) or 0) <= 0 then
 						dgStats.status = "กุญแจหมด → ไม่กด REPLAY กลับเมืองไปซื้อ"
 						return
 					end
@@ -3492,8 +3492,8 @@ end
 do   -- (block: the main chunk is at Luau's 200-local limit)
 local dgBuyAt = 0
 local function dgBuyBatch(keys)
-	if not (e.phDgBuyBatch and e.phDgUseKeys) then return false end
-	if (tonumber(keys) or 0) > (tonumber(e.phDgKeepKeys) or 0) then return false end
+	if not e.phDgBuyBatch then return false end
+	if (tonumber(keys) or 0) > 0 then return false end
 	if os.clock() - dgBuyAt < 5 then return false end
 	dgBuyAt = os.clock()
 	local price = tonumber(DG and DG.keyPrice) or 250000
@@ -3587,13 +3587,11 @@ task.spawn(function()
 			dgStats.free = type(st.free) == "table" and tonumber(st.free[id]) or 0
 			if st.inRun then dgStats.status = "อยู่ในรอบ"; continue end
 		end
-		-- free runs first; keys only if allowed and above the keep-floor; out of keys -> buy a batch (toggle)
+		-- free runs first, then keys (user removed the "use keys" toggle + keep-floor: keys
+		-- are always used); out of keys -> buy a batch (toggle) or stop
 		if def.keys and not def.unlimited and (dgStats.free or 0) <= 0 then
-			if not e.phDgUseKeys then dgStats.status = "รอบฟรีหมด (ปิดใช้กุญแจ)"; continue end
-			if (dgStats.keys or 0) <= (tonumber(e.phDgKeepKeys) or 0) and not dgBuyKeyFwd(dgStats.keys) then
-				if not e.phDgBuyBatch then
-					dgStats.status = ("กุญแจเหลือ %d (เก็บไว้ %d) หยุดเข้า"):format(dgStats.keys or 0, tonumber(e.phDgKeepKeys) or 0)
-				end
+			if (dgStats.keys or 0) <= 0 and not dgBuyKeyFwd(dgStats.keys) then
+				if not e.phDgBuyBatch then dgStats.status = "รอบฟรี + กุญแจหมด หยุดเข้า" end
 				continue
 			end
 		end
@@ -4804,12 +4802,7 @@ DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที�
 	end}, "PHDgPick")
 DLs:Toggle({Name = "Auto Start Dungeon (อยู่เมือง → เข้าดัน+ตีเอง · หลุด/โดนเตะ → เข้าเกมใหม่แล้วไปต่อ)", Default = e.phAutoRejoin,
 	Callback = function(v) e.phAutoRejoin = v; sv() end}, "PHAutoRejoin")
-DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีวันนี้หมด", Default = e.phDgUseKeys,
-	Callback = function(v) e.phDgUseKeys = v; sv() end}, "PHDgUseKeys")
-DLs:Slider({Name = "└ เก็บกุญแจไว้อย่างน้อย (ถึงแล้วหยุดเข้า)", Minimum = 0, Maximum = 100, Default = tonumber(e.phDgKeepKeys) or 0,
-	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
-	Callback = function(v) e.phDgKeepKeys = math.floor(v + 0.5); sv() end}, "PHDgKeepKeys")
-DLs:Toggle({Name = "กุญแจหมด → ออกมาซื้อทีละชุด แล้วเข้าต่อ (ดอกละ 250k ทอง · ต้องเปิด 'ใช้กุญแจ')", Default = e.phDgBuyBatch,
+DLs:Toggle({Name = "กุญแจหมด → ออกมาซื้อทีละชุด แล้วเข้าต่อ (ดอกละ 250k ทอง)", Default = e.phDgBuyBatch,
 	Callback = function(v) e.phDgBuyBatch = v; sv() end}, "PHDgBuyBatch")
 DLs:Slider({Name = "└ ซื้อทีละ (ดอก)", Minimum = 1, Maximum = 200, Default = tonumber(e.phDgBuyCount) or 100,
 	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
