@@ -89,6 +89,9 @@ local PLACE_SCRIPTS = {
     [88047783411976]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/open_sea.lua",         -- Open Sea For Animals
     [117483759937632] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/hunting_together.lua", -- ⚔️ [DUNGEON] Hunting Together RPG
     [88452215181406]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pet_hunt_party.lua",   -- [🎉RELEASE] Pet Hunt Party 🐾 RPG
+    -- Battle Royale universe: the match server and the Killstreak mode share one script
+    [108448382032231] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Battle Royale (chest + player ESP)
+    [104856666707760] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Killstreak Battle Royale
 }
 
 local url = PLACE_SCRIPTS[game.PlaceId]
