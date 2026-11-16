@@ -4341,6 +4341,7 @@ end)
 do
 	local hook = {status = "ยังไม่ได้ตั้ง URL"}
 	stats.hook = hook   -- table field, not a chunk local: main chunk is at the 200-register limit
+	getgenv().__PHP_HOOK = hook   -- reachable from the console: __PHP_HOOK.test()
 	local Cd = require(RS.Shared.Config.Cards)
 	local COLOR = {Legendary = 0xF1C40F, Secret = 0xE91E63, Transcendent = 0x9B59B6}
 	local KIND = {field = "การ์ดบอสฟิลด์", dungeon = "การ์ดบอสดันเจี้ยน", world = "การ์ดบอสโลก"}
@@ -4381,37 +4382,82 @@ do
 		if trait and trait ~= "" then s = s .. " · " .. tostring(trait) end
 		return s
 	end
-	function hook.notify(id, key, delta, total, before)
+	-- card art: Config.PetArt.full[id] (the card's full illustration, 309x420) -> a public
+	-- rbxcdn PNG via thumbnails.roblox.com (Discord needs a plain image URL). Thumbnails
+	-- start "Pending" the first time, so every boss card is prefetched at load.
+	local artCache = {}
+	local function artUrl(id)
+		if artCache[id] then return artCache[id] end
+		local okA, A = pcall(function() return require(RS.Shared.Config.PetArt) end)
+		local ref = okA and type(A) == "table" and ((A.full or {})[id] or (A.pets or {})[id])
+		local asset = ref and tostring(ref):match("(%d+)")
+		local req = request or http_request or (syn and syn.request) or (http and http.request)
+		if not asset or not req then return nil end
+		for _ = 1, 6 do
+			local okR, res = pcall(req, {Url = "https://thumbnails.roblox.com/v1/assets?assetIds=" .. asset
+				.. "&size=420x420&format=Png&isCircular=false", Method = "GET"})
+			if okR and type(res) == "table" and res.StatusCode == 200 then
+				local okJ, j = pcall(HS.JSONDecode, HS, res.Body)
+				local row = okJ and type(j) == "table" and j.data and j.data[1]
+				if row and row.state == "Completed" and type(row.imageUrl) == "string" then
+					artCache[id] = row.imageUrl
+					return row.imageUrl
+				end
+			end
+			task.wait(3)
+		end
+		return nil
+	end
+	task.spawn(function()
+		for id in pairs(kindOf) do
+			if not alive() then return end
+			pcall(artUrl, id)
+		end
+	end)
+	local function bossName(id)
+		local okP, P = pcall(function() return require(RS.Shared.Config.Pets) end)
+		local pd = okP and type(P) == "table" and (P.defs or P)[id]
+		if type(pd) == "table" and pd.name then return pd.name end
+		local d = Cd.defs[id]
+		return d and d.name and (d.name:gsub("%s*Card$", "")) or id
+	end
+	function hook.notify(id, key, delta, total, before, isTest)
 		local d = Cd.defs[id] or {}
 		local kind = kindOf[id]
-		local payload = {
-			username = "Pet Hunt Party",
-			content = e.phHookPing and "@everyone" or nil,
-			embeds = {{
-				title = "🃏 ได้" .. (KIND[kind] or "การ์ด") .. "!",
-				description = ("**%s** ×%d"):format(d.name or id, delta),
-				color = COLOR[d.rarity] or 0x5865F2,
-				fields = {
-					{name = "ระดับ", value = tostring(d.rarity or "?"), inline = true},
-					{name = "Finish", value = finishOf(key), inline = true},
-					{name = "มีทั้งหมด", value = ("%d ใบ%s"):format(total, before == 0 and " (ใบแรก! 🆕)" or ""), inline = true},
-					{name = "ตัวละคร", value = ("%s · Lv %s"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")), inline = true},
-				},
-				footer = {text = "Pet Hunt Party · Auto"},
-				timestamp = DateTime.now():ToIsoDate(),
-			}},
-		}
 		task.spawn(function()
+			local art = artUrl(id)
+			local payload = {
+				username = "Pet Hunt Party",
+				content = (e.phHookPing and not isTest) and "@everyone" or nil,
+				embeds = {{
+					author = {name = (isTest and "[ทดสอบ] " or "") .. "🃏 ได้" .. (KIND[kind] or "การ์ด") .. "!"},
+					title = bossName(id),
+					description = ("**%s** ×%d · %s"):format(d.name or id, delta, tostring(d.rarity or "?")),
+					color = COLOR[d.rarity] or 0x5865F2,
+					image = art and {url = art} or nil,
+					fields = {
+						{name = "Finish", value = finishOf(key), inline = true},
+						{name = "มีทั้งหมด", value = ("%d ใบ%s"):format(total, before == 0 and " (ใบแรก! 🆕)" or ""), inline = true},
+						{name = "ตัวละคร", value = ("%s · Lv %s"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")), inline = true},
+					},
+					footer = {text = "Pet Hunt Party · Auto"},
+					timestamp = DateTime.now():ToIsoDate(),
+				}},
+			}
 			local okS, msg = hook.post(payload)
-			hook.status = (okS and "✔ ส่งแล้ว: " or "✖ ส่งไม่ได้ (" .. tostring(msg) .. "): ") .. (d.name or id)
+			hook.status = (okS and (isTest and "✔ ทดสอบส่งสำเร็จ: " or "✔ ส่งแล้ว: ") or "✖ ส่งไม่ได้ (" .. tostring(msg) .. "): ") .. bossName(id)
 		end)
 	end
+	-- test = a real-looking notification for a boss card we own (or the first one known)
 	function hook.test()
-		local okS, msg = hook.post({username = "Pet Hunt Party", embeds = {{
-			title = "✅ ทดสอบ Webhook", description = "แจ้งเตือนการ์ดบอสพร้อมใช้งาน",
-			color = 0x2ECC71, fields = {{name = "ตัวละคร", value = plr.Name, inline = true}},
-			timestamp = DateTime.now():ToIsoDate()}}})
-		hook.status = okS and "✔ ทดสอบส่งสำเร็จ" or ("✖ ทดสอบไม่ผ่าน: " .. tostring(msg))
+		if not hook.urlOk() then hook.status = "✖ ยังไม่ได้ตั้ง URL"; return end
+		local pick
+		local okR, CB = pcall(function() return require(controllers():FindFirstChild("CardBook", true)) end)
+		for id in pairs(kindOf) do
+			pick = pick or id
+			if okR and type(CB) == "table" and CB.isFound and CB.isFound(id) then pick = id; break end
+		end
+		if pick then hook.notify(pick, pick, 1, 1, 1, true) end
 	end
 	-- key -> total (inventory + gear) for every boss card id
 	local function snapshot(CB)
