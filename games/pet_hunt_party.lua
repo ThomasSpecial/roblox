@@ -81,6 +81,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
 	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
+	phHookUrl = "",         -- Discord webhook (local state.json only, never in the script)
+	phHookField = true, phHookDungeon = true, phHookWorld = true, phHookPing = false,
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
 pcall(function()
@@ -4330,6 +4332,146 @@ task.spawn(function()
 	end
 end)
 
+-- ------------------------------------------------------------ DISCORD WEBHOOK
+-- user: "ทำเวลาได้การ์ดบอส หรือการ์ดบอสดัน ให้ webhook แจ้งเตือนดิส". Cards live in
+-- LocalPlayer.Cards (plain id -> count attrs) + CardBook's variants (holo/gold/rainbow keys)
+-- + cards socketed in gear. Total per key = inventory + gear, so equipping/unequipping a
+-- card never reads as a drop. A change only counts once two polls in a row agree (the
+-- inventory and the gear replicate separately). The URL lives only in PetHunt/state.json.
+do
+	local hook = {status = "ยังไม่ได้ตั้ง URL"}
+	stats.hook = hook   -- table field, not a chunk local: main chunk is at the 200-register limit
+	local Cd = require(RS.Shared.Config.Cards)
+	local COLOR = {Legendary = 0xF1C40F, Secret = 0xE91E63, Transcendent = 0x9B59B6}
+	local KIND = {field = "การ์ดบอสฟิลด์", dungeon = "การ์ดบอสดันเจี้ยน", world = "การ์ดบอสโลก"}
+	local kindOf = {}
+	pcall(function()
+		local Z = require(RS.Shared.Config.Zones)
+		for _, w in pairs(Z.warpById or {}) do
+			if w.base and w.base.boss and Cd.defs[w.base.boss] then kindOf[w.base.boss] = "field" end
+		end
+	end)
+	for id, d in pairs(Cd.defs) do
+		if d.dungeon then kindOf[id] = "dungeon" elseif d.worldBoss then kindOf[id] = "world" end
+	end
+	local function enabled(kind)
+		return (kind == "field" and e.phHookField) or (kind == "dungeon" and e.phHookDungeon)
+			or (kind == "world" and e.phHookWorld)
+	end
+	function hook.urlOk()
+		return type(e.phHookUrl) == "string" and e.phHookUrl:match("^https://[%w%.]*discord[%w%.]*%.com/api/webhooks/%d+/[%w_%-]+$") ~= nil
+	end
+	function hook.post(payload)
+		local req = request or http_request or (syn and syn.request) or (http and http.request)
+		if not req then return false, "executor ไม่มี request()" end
+		if not hook.urlOk() then return false, "URL webhook ไม่ถูกต้อง" end
+		local ok, res = pcall(req, {Url = e.phHookUrl, Method = "POST",
+			Headers = {["Content-Type"] = "application/json"}, Body = HS:JSONEncode(payload)})
+		if not ok then return false, tostring(res) end
+		if type(res) == "table" then
+			local code = tonumber(res.StatusCode) or 0
+			return code >= 200 and code < 300, "HTTP " .. code
+		end
+		return false, tostring(res)
+	end
+	local function finishOf(key)
+		local okP, _, fin, trait = pcall(Cd.parse, key)
+		if not okP then return "ธรรมดา" end
+		local s = fin and (tostring(fin):sub(1, 1):upper() .. tostring(fin):sub(2)) or "ธรรมดา"
+		if trait and trait ~= "" then s = s .. " · " .. tostring(trait) end
+		return s
+	end
+	function hook.notify(id, key, delta, total, before)
+		local d = Cd.defs[id] or {}
+		local kind = kindOf[id]
+		local payload = {
+			username = "Pet Hunt Party",
+			content = e.phHookPing and "@everyone" or nil,
+			embeds = {{
+				title = "🃏 ได้" .. (KIND[kind] or "การ์ด") .. "!",
+				description = ("**%s** ×%d"):format(d.name or id, delta),
+				color = COLOR[d.rarity] or 0x5865F2,
+				fields = {
+					{name = "ระดับ", value = tostring(d.rarity or "?"), inline = true},
+					{name = "Finish", value = finishOf(key), inline = true},
+					{name = "มีทั้งหมด", value = ("%d ใบ%s"):format(total, before == 0 and " (ใบแรก! 🆕)" or ""), inline = true},
+					{name = "ตัวละคร", value = ("%s · Lv %s"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")), inline = true},
+				},
+				footer = {text = "Pet Hunt Party · Auto"},
+				timestamp = DateTime.now():ToIsoDate(),
+			}},
+		}
+		task.spawn(function()
+			local okS, msg = hook.post(payload)
+			hook.status = (okS and "✔ ส่งแล้ว: " or "✖ ส่งไม่ได้ (" .. tostring(msg) .. "): ") .. (d.name or id)
+		end)
+	end
+	function hook.test()
+		local okS, msg = hook.post({username = "Pet Hunt Party", embeds = {{
+			title = "✅ ทดสอบ Webhook", description = "แจ้งเตือนการ์ดบอสพร้อมใช้งาน",
+			color = 0x2ECC71, fields = {{name = "ตัวละคร", value = plr.Name, inline = true}},
+			timestamp = DateTime.now():ToIsoDate()}}})
+		hook.status = okS and "✔ ทดสอบส่งสำเร็จ" or ("✖ ทดสอบไม่ผ่าน: " .. tostring(msg))
+	end
+	-- key -> total (inventory + gear) for every boss card id
+	local function snapshot(CB)
+		local t = {}
+		for id in pairs(kindOf) do
+			for _, c in ipairs(CB.copies(id) or {}) do t[c.key] = (t[c.key] or 0) + (tonumber(c.count) or 0) end
+			for _, g in ipairs(CB.inGear(id) or {}) do t[g.key] = (t[g.key] or 0) + 1 end
+		end
+		return t
+	end
+	task.spawn(function()
+		local CB
+		for _ = 1, 30 do
+			local okR, m = pcall(function() return require(controllers():FindFirstChild("CardBook", true)) end)
+			if okR and type(m) == "table" and m.copies then CB = m; break end
+			task.wait(2)
+		end
+		if not CB then hook.status = "✖ หา CardBook ไม่เจอ"; return end
+		task.wait(3)   -- let CardBook / GearState finish their first decode
+		local okB, base = pcall(snapshot, CB)
+		base = okB and base or {}
+		local pending = {}
+		local nIds = 0
+		for _ in pairs(kindOf) do nIds += 1 end
+		hook.status = (hook.urlOk() and "พร้อม" or "ยังไม่ได้ตั้ง URL") .. (" (เฝ้าการ์ดบอส %d ใบ)"):format(nIds)
+		while alive() do
+			task.wait(1.5)
+			local okN, now = pcall(snapshot, CB)
+			if okN then
+				local keys = {}
+				for k in pairs(now) do keys[k] = true end
+				for k in pairs(base) do keys[k] = true end
+				for k in pairs(keys) do
+					local v, b = now[k] or 0, base[k] or 0
+					if v == b then pending[k] = nil
+					elseif pending[k] ~= v then pending[k] = v   -- first sighting: wait one poll
+					else
+						pending[k] = nil
+						base[k] = v
+						if v > b then
+							local okP, id = pcall(Cd.parse, k)
+							id = okP and id or k
+							local before = 0
+							for k2, c in pairs(base) do
+								local okQ, id2 = pcall(Cd.parse, k2)
+								if okQ and id2 == id and k2 ~= k then before += c end
+							end
+							before += b
+							print(("[PetHunt] boss card +%d: %s (%s)"):format(v - b, tostring(id), k))
+							if enabled(kindOf[id]) and hook.urlOk() then
+								hook.notify(id, k, v - b, before + (v - b), before)
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
 -- ---------------------------------------------------------------------- UI
 print("[PetHunt] Loading MacLib...")
 local ok, Lib = pcall(function()
@@ -4694,6 +4836,31 @@ STs:Toggle({Name = "เดินด้วย NavMap (แผนที่สแก
 STs:Toggle({Name = "Auto Ride (ขี่สัตว์ตอนเดินไกล / ลงเองตอนเข้าระยะตี)", Default = e.phRide,
 	Callback = function(v) e.phRide = v; sv() end}, "PHRide")
 STs:Label({Text = "กำลังจะมา: Auto World Boss (บอสโลกทุก 30 นาที)"})
+do
+	local hook = stats.hook
+	local SRw = Tabs.Settings:Section({Side = "Right"})
+	SRw:Header({Text = "Discord Webhook (แจ้งเตือนการ์ดบอส)"})
+	SRw:Input({Name = "Webhook URL", Placeholder = hook.urlOk() and ("ตั้งแล้ว …" .. e.phHookUrl:sub(-6)) or "https://discord.com/api/webhooks/...",
+		AcceptedCharacters = "All",
+		Callback = function(t)
+			t = tostring(t or ""):gsub("^%s+", ""):gsub("%s+$", "")
+			if t == "" then return end
+			local old = e.phHookUrl
+			e.phHookUrl = t
+			if hook.urlOk() then sv(); hook.status = "✔ บันทึก URL แล้ว" else e.phHookUrl = old; hook.status = "✖ URL ไม่ใช่ Discord webhook" end
+		end}, "PHHookUrl")
+	SRw:Toggle({Name = "แจ้งเมื่อได้การ์ดบอสฟิลด์ (Legendary)", Default = e.phHookField,
+		Callback = function(v) e.phHookField = v; sv() end}, "PHHookField")
+	SRw:Toggle({Name = "แจ้งเมื่อได้การ์ดบอสดันเจี้ยน (Secret)", Default = e.phHookDungeon,
+		Callback = function(v) e.phHookDungeon = v; sv() end}, "PHHookDungeon")
+	SRw:Toggle({Name = "แจ้งเมื่อได้การ์ดบอสโลก (Transcendent)", Default = e.phHookWorld,
+		Callback = function(v) e.phHookWorld = v; sv() end}, "PHHookWorld")
+	SRw:Toggle({Name = "แท็ก @everyone", Default = e.phHookPing,
+		Callback = function(v) e.phHookPing = v; sv() end}, "PHHookPing")
+	SRw:Button({Name = "ทดสอบส่ง Webhook", Callback = function() task.spawn(hook.test) end})
+	SRw:Button({Name = "ลบ Webhook URL", Callback = function() e.phHookUrl = ""; sv(); hook.status = "ลบ URL แล้ว" end})
+	hook.lbl = SRw:Label({Text = "Webhook: " .. hook.status})
+end
 
 task.spawn(function()
 	while alive() do
@@ -4791,6 +4958,7 @@ task.spawn(function()
 				:format(stats.sell, stats.sold, #pending, gold))
 		end)
 		pcall(function() collectLbl:UpdateName("เก็บของ: " .. stats.collect) end)
+		pcall(function() stats.hook.lbl:UpdateName("Webhook: " .. stats.hook.status) end)
 		pcall(function() equipLbl:UpdateName(("สวมของ: %s\nสวมไปแล้วรวม %d ชิ้น"):format(stats.equip, stats.equipped)) end)
 		task.wait(0.5)
 	end
