@@ -2343,6 +2343,13 @@ task.spawn(function()
 		if not dodging then dodgeGoal = nil end
 		for id, h in pairs(hazards) do if now > h.tEnd then hazards[id] = nil end end
 		if not e.phDodge or not next(hazards) then dodging = false; continue end
+		-- boss dead, chest up: its leftover telegraphs can't hurt anyone any more, and
+		-- dodging them fought the walk to the chest (user: "เปิดกล่องบอส มันชอบวิ่งติดๆ";
+		-- chestwatch saw "หลบสกิลบอส" as the chest appeared)
+		if plr:GetAttribute("DungeonChest") == true then
+			for id in pairs(hazards) do hazards[id] = nil end
+			dodging = false; continue
+		end
 		local _, hum, hrp = myChar()
 		if not hrp then dodging = false; continue end
 		local pos = hrp.Position
@@ -3029,13 +3036,23 @@ local function dgTick(hum, hrp)
 		if part and part:IsA("Attachment") then part = part.Parent end
 		setAuto(false)
 		if part then
-			local d = flatDist(part.Position, pos)
-			if d > math.max((prompt.MaxActivationDistance or 10) - 3, 4) then
-				if stuckFor > 3 then pathTo(hum, hrp, part.Position) else dgWalk(hum, hrp, run, part.Position) end
-				stats.farm = ("ดันเจี้ยน: ไปเปิดหีบบอส (ห่าง %.0f)"):format(d)
+			-- the prompt works out to MaxActivationDistance (12, no line-of-sight, no hold):
+			-- press it on every approach tick once inside that (3D, what the server checks),
+			-- and keep walking in until ~5 so a near-the-edge press can't fail on lag.
+			-- Straight line only while it's making progress: no 3-stud move in 1.5s (a
+			-- pillar) or far away -> the pathfinder (was: corridor walk + 3s stuck wait).
+			local d3 = (part.Position - pos).Magnitude
+			local reach = (prompt.MaxActivationDistance or 10) - 1
+			if d3 <= reach and os.clock() - (dgStats.chestFire or 0) > 0.3 then
+				dgStats.chestFire = os.clock()
+				pcall(fireproximityprompt, prompt)
+			end
+			if d3 > 5 then
+				if stuckFor > 1.5 or d3 > 40 then pathTo(hum, hrp, part.Position)
+				else hum:MoveTo(Vector3.new(part.Position.X, pos.Y, part.Position.Z)) end
+				stats.farm = ("ดันเจี้ยน: ไปเปิดหีบบอส (ห่าง %.0f)"):format(d3)
 			else
 				pathReset()
-				pcall(fireproximityprompt, prompt)
 				stats.farm = "ดันเจี้ยน: เปิดหีบบอส"
 			end
 		else
