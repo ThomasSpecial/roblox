@@ -3465,15 +3465,20 @@ pcall(function()
 						return
 					end
 				end
-				-- user: "ออกเมื่อกุญแจหมด และซื้อทีละ 100 ดอก": no free run and no key left
-				-- -> don't vote REPLAY; the game sends us to town, where the town loop buys
-				-- a whole batch and enters again
+				-- user: "ซื้อทีละ 100 ดอก" + "ไม่ต้องออก ซื้อได้เรื่อยๆ": buyKey works inside a
+				-- run (tested: 10 keys in ~2s while in the crypt), so with no free run and no
+				-- key left buy the whole batch right here and vote REPLAY as usual. Only if
+				-- that fails (gold floor / server says no) skip REPLAY -> town loop retries.
 				if e.phDgBuyBatch then
 					local st = dgCall("state")
 					local free = st.ok and type(st.free) == "table" and tonumber(st.free[id]) or 0
 					if st.ok and free <= 0 and (tonumber(st.keys) or 0) <= 0 then
-						dgStats.status = "กุญแจหมด → ไม่กด REPLAY กลับเมืองไปซื้อ"
-						return
+						dgStats.keys = 0
+						dgStats.status = "กุญแจหมด → ซื้อในดันเลย"
+						if not dgBuyKeyFwd(0) then
+							dgStats.status = dgStats.status .. " → ไม่กด REPLAY กลับเมือง"
+							return
+						end
 					end
 				end
 					for _ = 1, 4 do
@@ -4870,7 +4875,7 @@ DLs:Dropdown({Name = "ดันเจี้ยน / ความยากที�
 	end}, "PHDgPick")
 DLs:Toggle({Name = "Auto Start Dungeon (อยู่เมือง → เข้าดัน+ตีเอง · หลุด/โดนเตะ → เข้าเกมใหม่แล้วไปต่อ)", Default = e.phAutoRejoin,
 	Callback = function(v) e.phAutoRejoin = v; sv() end}, "PHAutoRejoin")
-DLs:Toggle({Name = "กุญแจหมด → ออกมาซื้อทีละชุด แล้วเข้าต่อ (ดอกละ 250k ทอง)", Default = e.phDgBuyBatch,
+DLs:Toggle({Name = "กุญแจหมด → ซื้อทีละชุดในดันเลย แล้ว REPLAY ต่อ (ดอกละ 250k ทอง)", Default = e.phDgBuyBatch,
 	Callback = function(v) e.phDgBuyBatch = v; sv() end}, "PHDgBuyBatch")
 DLs:Slider({Name = "└ ซื้อทีละ (ดอก)", Minimum = 1, Maximum = 200, Default = tonumber(e.phDgBuyCount) or 100,
 	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
