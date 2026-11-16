@@ -164,12 +164,15 @@ end)
 -- character bounds, R15/R6 skeleton lines, name / distance / health bar. Party members
 -- (same "Party" attribute on the Player) count as teammates.
 for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = false, pDist = true, pGlowRarity = true, pVisOnly = false, pHealth = true, pTracer = false, pGun = true,
-	pTeam = false, pMaxDist = 2000}) do
+	pTeam = true, pMaxDist = 2000}) do
 	if e[k] == nil then e[k] = v end
 end
 if e.pGlowMigrated == nil then e.pBox = false; e.pGlow = true; e.pGlowMigrated = true; sv() end
 if e.pNameMigrated == nil then e.pName = false; e.pGlowRarity = true; e.pNameMigrated = true; sv() end
-local ENEMY, MATE = Color3.fromRGB(255, 70, 70), Color3.fromRGB(80, 230, 120)
+local ENEMY, MATE = Color3.fromRGB(255, 70, 70), Color3.fromRGB(0, 255, 90)
+-- teammates own pure green, so an enemy holding an Uncommon (green) gun glows yellow instead
+local GLOW_RARITY = setmetatable({Uncommon = Color3.fromRGB(255, 225, 40)}, {__index = COLORS})
+if e.pTeamMigrated == nil then e.pTeam = true; e.pTeamMigrated = true; sv() end
 
 -- Glow = a Highlight around the character (outline + light fill, seen through walls).
 -- Roblox renders at most 31 Highlights at once, so only the 30 nearest shown players
@@ -293,7 +296,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 				-- glow colour = rarity of the gun in hand (fists / unknown gun -> enemy red / mate green)
 				local gName, gRar = gunOf(ch)
 				local glowCol = col
-				if e.pGlowRarity and gRar and gName ~= "Fists" then glowCol = COLORS[gRar] or col end
+				if not mate and e.pGlowRarity and gRar and gName ~= "Fists" then glowCol = GLOW_RARITY[gRar] or col end
 				if e.pGlow then glowWanted[p] = {dist = dist, color = glowCol, char = ch} end
 				local seen = not e.pVisOnly or canSee(camPos, ch)
 				-- screen-space bounds from every body part's projected centre +- its size
@@ -319,15 +322,15 @@ local renderConn = RunService.RenderStepped:Connect(function()
 					d.box.Visible, d.boxOut.Visible = e.pBox, e.pBox
 					d.box.Position, d.box.Size, d.box.Color = Vector2.new(minX, minY), Vector2.new(w, h), col
 					d.boxOut.Position, d.boxOut.Size = d.box.Position, d.box.Size
-					d.name.Visible = e.pName
-					d.name.Text = p.DisplayName
+					d.name.Visible = e.pName or mate
+					d.name.Text = mate and ("★ เพื่อน " .. p.DisplayName) or p.DisplayName
 					d.name.Color = col
 					d.name.Position = Vector2.new(minX + w / 2, minY - 17)
 					local showGun = e.pGun and gName ~= nil and gName ~= "Fists"
 					d.gun.Visible = showGun
 					if showGun then
 						d.gun.Text = gRar and ("%s [%s]"):format(gName, gRar) or gName
-						d.gun.Color = COLORS[gRar or "Normal"] or COLORS.Normal
+						d.gun.Color = GLOW_RARITY[gRar or "Normal"] or COLORS.Normal
 						d.gun.Position = Vector2.new(minX + w / 2, maxY + 2)
 					end
 					d.dist.Visible = e.pDist
@@ -448,11 +451,11 @@ P:Toggle({Name = "ระยะ", Default = e.pDist, Callback = function(v) e.pDi
 P:Toggle({Name = "แถบเลือด", Default = e.pHealth, Callback = function(v) e.pHealth = v; sv() end}, "BRPHealth")
 P:Toggle({Name = "ปืนที่ถือ + rarity (สีตาม rarity)", Default = e.pGun, Callback = function(v) e.pGun = v; sv() end}, "BRPGun")
 P:Toggle({Name = "เส้น Tracer จากกลางจอล่าง", Default = e.pTracer, Callback = function(v) e.pTracer = v; sv() end}, "BRPTracer")
-P:Toggle({Name = "แสดงเพื่อนในปาร์ตี้ด้วย (สีเขียว)", Default = e.pTeam, Callback = function(v) e.pTeam = v; sv() end}, "BRPTeam")
+P:Toggle({Name = "แสดงเพื่อนในปาร์ตี้ (Glow เขียวตลอด + ป้าย ★ เพื่อน)", Default = e.pTeam, Callback = function(v) e.pTeam = v; sv() end}, "BRPTeam")
 P:Slider({Name = "ระยะแสดงสูงสุด", Minimum = 50, Maximum = 5000, Default = tonumber(e.pMaxDist) or 2000,
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
 	Callback = function(v) e.pMaxDist = math.floor(v + 0.5); sv() end}, "BRPMaxDist")
-P:Label({Text = "Glow ใช้สีตาม rarity ปืนที่ถือ (มือเปล่า: ศัตรูแดง · เพื่อนเขียว)\nอัปเดตทุกเฟรม กรอบพอดีตัวตามท่าทาง"})
+P:Label({Text = "ศัตรู: Glow สีตาม rarity ปืนที่ถือ (มือเปล่า = แดง · Uncommon = เหลือง)\nเพื่อน: Glow เขียวตลอด ไม่ขึ้นกับปืน + ป้าย ★ เพื่อน ชื่อ\nอัปเดตทุกเฟรม กรอบพอดีตัวตามท่าทาง"})
 
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
