@@ -163,7 +163,7 @@ end)
 -- Drawing API, updated every RenderStepped (realtime): 2D box fitted to the projected
 -- character bounds, R15/R6 skeleton lines, name / distance / health bar. Party members
 -- (same "Party" attribute on the Player) count as teammates.
-for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = false, pDist = true, pGlowRarity = true, pHealth = true, pTracer = false, pGun = true,
+for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = false, pDist = true, pGlowRarity = true, pVisOnly = false, pHealth = true, pTracer = false, pGun = true,
 	pTeam = false, pMaxDist = 2000}) do
 	if e[k] == nil then e[k] = v end
 end
@@ -190,6 +190,21 @@ local function glowFor(p)
 	return h
 end
 local glowWanted = {}   -- filled by the render loop: player -> {dist, color}
+local visParams = RaycastParams.new()
+visParams.FilterType = Enum.RaycastFilterType.Exclude
+visParams.IgnoreWater = true
+local function canSee(camPos, ch)
+	local myCh = plr.Character
+	visParams.FilterDescendantsInstances = myCh and {myCh, ch} or {ch}
+	for _, n in ipairs({"Head", "UpperTorso", "Torso", "HumanoidRootPart"}) do
+		local part = ch:FindFirstChild(n)
+		if part then
+			local hit = workspace:Raycast(camPos, part.Position - camPos, visParams)
+			if not hit or (hit.Instance.Transparency >= 0.9 or not hit.Instance.CanCollide) then return true end
+		end
+	end
+	return false
+end
 local BONES_R15 = {
 	{"Head", "UpperTorso"}, {"UpperTorso", "LowerTorso"},
 	{"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"}, {"LeftLowerArm", "LeftHand"},
@@ -280,6 +295,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 				local glowCol = col
 				if e.pGlowRarity and gRar and gName ~= "Fists" then glowCol = COLORS[gRar] or col end
 				if e.pGlow then glowWanted[p] = {dist = dist, color = glowCol, char = ch} end
+				local seen = not e.pVisOnly or canSee(camPos, ch)
 				-- screen-space bounds from every body part's projected centre +- its size
 				local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
 				local onScreen = false
@@ -296,7 +312,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 						end
 					end
 				end
-				if not onScreen or minX == math.huge then
+				if not seen or not onScreen or minX == math.huge then
 					hideAll(d)
 				else
 					local w, h = maxX - minX, maxY - minY
@@ -362,6 +378,7 @@ task.spawn(function()
 			if h.Adornee ~= it.w.char then h.Adornee = it.w.char end
 			h.OutlineColor = it.w.color
 			h.FillColor = it.w.color
+			h.DepthMode = e.pVisOnly and Enum.HighlightDepthMode.Occluded or Enum.HighlightDepthMode.AlwaysOnTop
 			h.Enabled = true
 			keep[it.p] = true
 		end
@@ -421,7 +438,8 @@ local cntLbl = R:Label({Text = "-"})
 local P = Tabs.PESP:Section({Side = "Left"})
 P:Header({Text = "Player ESP (realtime)"})
 P:Toggle({Name = "เปิด ESP คน", Default = e.pOn, Callback = function(v) e.pOn = v; sv() end}, "BRPOn")
-P:Toggle({Name = "Glow รอบตัว (มองทะลุกำแพง)", Default = e.pGlow, Callback = function(v) e.pGlow = v; sv() end}, "BRPGlow")
+P:Toggle({Name = "Glow รอบตัว", Default = e.pGlow, Callback = function(v) e.pGlow = v; sv() end}, "BRPGlow")
+P:Toggle({Name = "ไม่มองทะลุกำแพง (แสดงเฉพาะตอนเห็นตัว)", Default = e.pVisOnly, Callback = function(v) e.pVisOnly = v; sv() end}, "BRPVisOnly")
 P:Toggle({Name = "กรอบสี่เหลี่ยม", Default = e.pBox, Callback = function(v) e.pBox = v; sv() end}, "BRPBox")
 P:Toggle({Name = "Skeleton (โครงกระดูก)", Default = e.pSkel, Callback = function(v) e.pSkel = v; sv() end}, "BRPSkel")
 P:Toggle({Name = "สี Glow = rarity ปืนที่ถือ", Default = e.pGlowRarity, Callback = function(v) e.pGlowRarity = v; sv() end}, "BRPGlowRarity")
