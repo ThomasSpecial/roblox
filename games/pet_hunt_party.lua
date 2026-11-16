@@ -81,6 +81,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgBuyCount = 100,
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
 	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
+	phDgRegroup = true,     -- a party member dropped out of the run -> no REPLAY, go to town and start again together
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
 	phHookUrl = "",         -- own Discord webhook; "" = the built-in one (BUILTIN_HOOK in the webhook block)
 	phHookField = true, phHookDungeon = true, phHookWorld = true, phHookPing = false,
@@ -2868,6 +2869,16 @@ pcall(function() DG = require(RS.Shared.Config.Dungeons) end)
 local dgStats = {runs = 0, wins = 0, lastSec = nil, status = "-", waitUntil = 0, lastTry = 0,
 	backAt = 0, chestAt = nil, keys = nil, free = nil, lastErr = nil}
 getgenv().__PHP_DG = dgStats
+do   -- loaded mid-run: take the roster from whoever of our party is in this run now
+	local run, pid = plr:GetAttribute("DungeonRun"), plr:GetAttribute("PartyId")
+	if run and pid and pid ~= "" then
+		local r = {}
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= plr and pl:GetAttribute("PartyId") == pid and pl:GetAttribute("DungeonRun") == run then r[pl.Name] = true end
+		end
+		dgStats.roster = r
+	end
+end
 local function dgCall(...)
 	local ok, r = pcall(function(...) return Net.func("Dungeon"):InvokeServer(...) end, ...)
 	if ok and type(r) == "table" then return r end
@@ -3392,6 +3403,18 @@ pcall(function()
 		elseif data.kind == "loading" or data.kind == "start" or data.kind == "restart" then
 			dgStats.waitUntil = 0
 			dgStats.startedAt = os.clock()
+			dgStats.regroupUntil = nil
+			-- who went in with us (same PartyId, in this server) -> checked again at the result
+			local pid = plr:GetAttribute("PartyId")
+			if pid and pid ~= "" then
+				local r = {}
+				for _, pl in ipairs(Players:GetPlayers()) do
+					if pl ~= plr and pl:GetAttribute("PartyId") == pid then r[pl.Name] = true end
+				end
+				if next(r) or not dgStats.roster then dgStats.roster = r end
+			else
+				dgStats.roster = nil
+			end
 			shrinkZone = nil   -- new run: the old boss ring is gone
 			dgLootPhase = nil; dgChestPos = nil
 		elseif data.kind == "result" then
@@ -3413,6 +3436,27 @@ pcall(function()
 				while dgLootPhase and (e.phDgOn or e.phAutoRejoin) and os.clock() - tW < 10 and alive() do
 					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
 					task.wait(0.2)
+				end
+				-- user: "ตี้ 3 คน แล้วมีคนใดคนนึงหลุดไม่ได้อยู่ในดันเจี้ยน พอตีบอสเสร็จ ให้มันไม่ต้อง
+				-- ต่อ แต่ออกมา แล้วเริ่มใหม่ เข้าดันด้วยกันใหม่": a member who started with us is
+				-- gone from the server or no longer in this run -> no REPLAY vote; the game sends
+				-- everyone to town and the leader's town loop starts a fresh run (ready check)
+				-- once the whole roster is back in the server.
+				if e.phDgRegroup and dgStats.roster then
+					local run = plr:GetAttribute("DungeonRun")
+					local pid = plr:GetAttribute("PartyId")
+					local missing = {}
+					for name in pairs(dgStats.roster) do
+						local pl = Players:FindFirstChild(name)
+						if not pl or pl:GetAttribute("PartyId") ~= pid or (run and pl:GetAttribute("DungeonRun") ~= run) then
+							missing[#missing + 1] = name
+						end
+					end
+					if #missing > 0 then
+						dgStats.regroupUntil = os.clock() + 180
+						dgStats.status = "เพื่อนหลุด (" .. table.concat(missing, ", ") .. ") → ไม่กด REPLAY กลับเมืองเริ่มใหม่"
+						return
+					end
 				end
 				-- user: "ออกเมื่อกุญแจหมด และซื้อทีละ 100 ดอก": no free run and no key left
 				-- -> don't vote REPLAY; the game sends us to town, where the town loop buys
@@ -3572,6 +3616,21 @@ task.spawn(function()
 			continue
 		end
 		if now < dgStats.waitUntil then dgStats.status = "รอทุกคนกดพร้อม"; continue end
+		-- regroup after a drop-out: wait (max 3 min) until every roster member is back in
+		-- this server and in our party, so the ready check brings everyone in together
+		if inParty and dgStats.regroupUntil and now < dgStats.regroupUntil and dgStats.roster then
+			local pid = plr:GetAttribute("PartyId")
+			local away = {}
+			for name in pairs(dgStats.roster) do
+				local pl = Players:FindFirstChild(name)
+				if not pl or pl:GetAttribute("PartyId") ~= pid then away[#away + 1] = name end
+			end
+			if #away > 0 then
+				dgStats.status = ("รอเพื่อนกลับเข้าปาร์ตี้: %s (อีก %ds)"):format(table.concat(away, ", "), math.ceil(dgStats.regroupUntil - now))
+				continue
+			end
+			dgStats.regroupUntil = nil
+		end
 		if now - dgStats.lastTry < 8 then continue end
 		dgStats.lastTry = now
 		local id, diff = dgPick()
@@ -4779,6 +4838,8 @@ DLs:Toggle({Name = "Auto เข้า Infinity Tower จากเมือง (�
 	Callback = function(v) e.phTowerEnter = v; sv() end}, "PHTowerEnter")
 DLs:Toggle({Name = "Auto Replay (กดปุ่ม REPLAY หน้าจบดันให้เอง)", Default = e.phDgReplay,
 	Callback = function(v) e.phDgReplay = v; sv() end}, "PHDgReplay")
+DLs:Toggle({Name = "└ เพื่อนในตี้หลุด → ไม่ REPLAY กลับเมืองแล้วเข้าดันพร้อมกันใหม่", Default = e.phDgRegroup,
+	Callback = function(v) e.phDgRegroup = v; sv() end}, "PHDgRegroup")
 DLs:Toggle({Name = "Auto Skip ฉากเปิดตัวบอส (กด SKIP ให้เอง)", Default = e.phDgSkipIntro,
 	Callback = function(v) e.phDgSkipIntro = v; sv() end}, "PHDgSkipIntro")
 DLs:Toggle({Name = "Auto Join ปาร์ตี้ (ลูกปาร์ตี้: กด Join ให้เองตอนหัวหน้าเรียก)", Default = e.phDgAccept,
