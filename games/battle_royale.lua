@@ -163,7 +163,7 @@ end)
 -- Drawing API, updated every RenderStepped (realtime): 2D box fitted to the projected
 -- character bounds, R15/R6 skeleton lines, name / distance / health bar. Party members
 -- (same "Party" attribute on the Player) count as teammates.
-for k, v in pairs({pOn = true, pBox = true, pSkel = true, pName = true, pHealth = true, pTracer = false,
+for k, v in pairs({pOn = true, pBox = true, pSkel = true, pName = true, pHealth = true, pTracer = false, pGun = true,
 	pTeam = false, pMaxDist = 2000}) do
 	if e[k] == nil then e[k] = v end
 end
@@ -178,6 +178,27 @@ local BONES_R15 = {
 local BONES_R6 = {
 	{"Head", "Torso"}, {"Torso", "Left Arm"}, {"Torso", "Right Arm"}, {"Torso", "Left Leg"}, {"Torso", "Right Leg"},
 }
+-- held gun: the Tool in the character is named after the weapon id; its fixed rarity is
+-- ReplicatedStorage.Weapons.<Class>.<Id>.General.Rarity (IntValue, index into Rarities)
+local GUNS = {}
+pcall(function()
+	for _, cls in ipairs(RS:WaitForChild("Weapons", 10):GetChildren()) do
+		for _, w in ipairs(cls:GetChildren()) do
+			local g = w:FindFirstChild("General")
+			if g then
+				local r = g:FindFirstChild("Rarity")
+				local dn = g:FindFirstChild("DisplayName")
+				GUNS[w.Name] = {name = dn and dn.Value or w.Name, rarity = r and RARITIES[r.Value] or nil}
+			end
+		end
+	end
+end)
+local function gunOf(ch)
+	local tool = ch:FindFirstChildOfClass("Tool")
+	if not tool then return nil end
+	local g = GUNS[tool.Name]
+	return g and g.name or tool.Name, g and g.rarity
+end
 local function newLine(th) local l = Drawing.new("Line"); l.Thickness = th or 1.5; l.Visible = false; return l end
 local pDraw = {}   -- player -> drawings
 local function dropPlayer(p)
@@ -195,6 +216,7 @@ local function drawFor(p)
 	d.box = add(Drawing.new("Square")); d.box.Thickness = 1.5; d.box.Filled = false
 	d.name = add(Drawing.new("Text")); d.name.Size = 14; d.name.Center = true; d.name.Outline = true
 	d.dist = add(Drawing.new("Text")); d.dist.Size = 13; d.dist.Center = true; d.dist.Outline = true
+	d.gun = add(Drawing.new("Text")); d.gun.Size = 13; d.gun.Center = true; d.gun.Outline = true
 	d.hpBack = add(Drawing.new("Square")); d.hpBack.Filled = true; d.hpBack.Color = Color3.new(0, 0, 0)
 	d.hp = add(Drawing.new("Square")); d.hp.Filled = true
 	d.tracer = add(newLine(1.2))
@@ -256,10 +278,18 @@ local renderConn = RunService.RenderStepped:Connect(function()
 					d.name.Text = p.DisplayName
 					d.name.Color = col
 					d.name.Position = Vector2.new(minX + w / 2, minY - 17)
+					local gName, gRar = gunOf(ch)
+					local showGun = e.pGun and gName ~= nil and gName ~= "Fists"
+					d.gun.Visible = showGun
+					if showGun then
+						d.gun.Text = gRar and ("%s [%s]"):format(gName, gRar) or gName
+						d.gun.Color = COLORS[gRar or "Normal"] or COLORS.Normal
+						d.gun.Position = Vector2.new(minX + w / 2, maxY + 2)
+					end
 					d.dist.Visible = e.pName
 					d.dist.Text = ("%dm"):format(math.floor(dist))
 					d.dist.Color = Color3.new(1, 1, 1)
-					d.dist.Position = Vector2.new(minX + w / 2, maxY + 2)
+					d.dist.Position = Vector2.new(minX + w / 2, maxY + (showGun and 16 or 2))
 					local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
 					d.hpBack.Visible, d.hp.Visible = e.pHealth, e.pHealth
 					d.hpBack.Position, d.hpBack.Size = Vector2.new(minX - 6, minY - 1), Vector2.new(4, h + 2)
@@ -345,6 +375,7 @@ P:Toggle({Name = "กรอบตามตัว", Default = e.pBox, Callback = 
 P:Toggle({Name = "Skeleton (โครงกระดูก)", Default = e.pSkel, Callback = function(v) e.pSkel = v; sv() end}, "BRPSkel")
 P:Toggle({Name = "ชื่อ + ระยะ", Default = e.pName, Callback = function(v) e.pName = v; sv() end}, "BRPName")
 P:Toggle({Name = "แถบเลือด", Default = e.pHealth, Callback = function(v) e.pHealth = v; sv() end}, "BRPHealth")
+P:Toggle({Name = "ปืนที่ถือ + rarity (สีตาม rarity)", Default = e.pGun, Callback = function(v) e.pGun = v; sv() end}, "BRPGun")
 P:Toggle({Name = "เส้น Tracer จากกลางจอล่าง", Default = e.pTracer, Callback = function(v) e.pTracer = v; sv() end}, "BRPTracer")
 P:Toggle({Name = "แสดงเพื่อนในปาร์ตี้ด้วย (สีเขียว)", Default = e.pTeam, Callback = function(v) e.pTeam = v; sv() end}, "BRPTeam")
 P:Slider({Name = "ระยะแสดงสูงสุด", Minimum = 50, Maximum = 5000, Default = tonumber(e.pMaxDist) or 2000,
