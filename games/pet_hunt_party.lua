@@ -77,7 +77,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgAccept = false,     -- party member: auto-join the leader's ready check
 	phDgPick = "crypt:hard", phDgUseKeys = true, phDgKeepKeys = 0,
 	phAutoRejoin = false,   -- disconnected / kicked -> rejoin this game (then Auto Replay re-enters)
-	phDgBuyKeys = false,    -- out of keys -> buy one (250k gold) -- only on, user's explicit request
+	phDgBuyBatch = false,   -- out of keys -> stop replaying, back in town buy phDgBuyCount keys in one go (250k each) -- off unless the user turns it on
+	phDgBuyCount = 100,
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
 	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
@@ -2940,7 +2941,7 @@ local dgMark = {pos = nil, at = 0}
 -- {center, minT, untilT, ignore = {part = true}, nearAt = {part = t}}
 local dgLootPhase = nil
 local dgChestPos = nil
-local dgBuyKeyFwd = nil   -- = dgTryBuyKey (defined further down, next to the town loop)
+local dgBuyKeyFwd = nil   -- = dgBuyBatch (defined further down, next to the town loop)
 local function dgStartLoot()
 	local now = os.clock()
 	local _, _, hrp0 = myChar()
@@ -3413,11 +3414,16 @@ pcall(function()
 					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
 					task.wait(0.2)
 				end
-				-- out of free runs and keys: buy one now so the REPLAY vote can go through
-				if dgBuyKeyFwd and e.phDgBuyKeys and e.phDgUseKeys then
+				-- user: "ออกเมื่อกุญแจหมด และซื้อทีละ 100 ดอก": no free run and no key left
+				-- -> don't vote REPLAY; the game sends us to town, where the town loop buys
+				-- a whole batch and enters again
+				if e.phDgBuyBatch and e.phDgUseKeys then
 					local st = dgCall("state")
 					local free = st.ok and type(st.free) == "table" and tonumber(st.free[id]) or 0
-					if st.ok and free <= 0 then pcall(dgBuyKeyFwd, tonumber(st.keys) or 0) end
+					if st.ok and free <= 0 and (tonumber(st.keys) or 0) <= (tonumber(e.phDgKeepKeys) or 0) then
+						dgStats.status = "กุญแจหมด → ไม่กด REPLAY กลับเมืองไปซื้อ"
+						return
+					end
 				end
 					for _ = 1, 4 do
 						if not alive() or not e.phDgReplay then return end
@@ -3478,34 +3484,46 @@ if dgConn then
 	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
 end
 
--- AUTO BUY KEY (only with the toggle on): out of free runs and at/below the keep-floor
--- -> buy ONE key (DG.keyPrice gold) via the dungeon panel's own "buyKey" call, never
--- taking gold below the floor. Returns true when a key was bought.
+-- AUTO BUY KEYS IN BATCHES (only with the toggle on; user: "ออกเมื่อกุญแจหมด และซื้อทีละ
+-- 100 ดอก ก็คือหมด 100 ค่อยออกมาซื้ออีก 100"). In town, out of free runs and at/below the
+-- keep-floor -> call the dungeon panel's "buyKey" (one key per call, DG.keyPrice gold)
+-- phDgBuyCount times, stopping early if gold would drop under the floor or the server says
+-- no. Returns true when at least one key was bought.
 do   -- (block: the main chunk is at Luau's 200-local limit)
 local dgBuyAt = 0
-local function dgTryBuyKey(keys)
-	if not (e.phDgBuyKeys and e.phDgUseKeys) then return false end
+local function dgBuyBatch(keys)
+	if not (e.phDgBuyBatch and e.phDgUseKeys) then return false end
 	if (tonumber(keys) or 0) > (tonumber(e.phDgKeepKeys) or 0) then return false end
-	if os.clock() - dgBuyAt < 3 then return false end
+	if os.clock() - dgBuyAt < 5 then return false end
+	dgBuyAt = os.clock()
 	local price = tonumber(DG and DG.keyPrice) or 250000
-	local gold = tonumber(plr:GetAttribute("Gold")) or 0
 	local floor = (tonumber(e.phDgGoldFloor) or 0) * 1e6
-	if gold - price < floor then
-		dgStats.status = ("กุญแจหมด: ทองไม่พอซื้อ (เหลือ %.1fM เก็บไว้ %dM)"):format(gold / 1e6, tonumber(e.phDgGoldFloor) or 0)
-		return false
+	local want = math.clamp(math.floor(tonumber(e.phDgBuyCount) or 100), 1, 500)
+	local got, why = 0, nil
+	for i = 1, want do
+		if not (alive() and e.phDgBuyBatch) then why = "ปิดสวิตช์"; break end
+		local gold = tonumber(plr:GetAttribute("Gold")) or 0
+		if gold - price < floor then
+			why = ("ทองเหลือ %.1fM (เก็บไว้ %dM)"):format(gold / 1e6, tonumber(e.phDgGoldFloor) or 0)
+			break
+		end
+		local r = dgCall("buyKey")
+		if not r.ok then why = tostring(r.error or "เซิร์ฟไม่ให้ซื้อ"); break end
+		got += 1
+		dgStats.keys = tonumber(r.keys) or ((tonumber(dgStats.keys) or 0) + 1)
+		dgStats.status = ("กำลังซื้อกุญแจ %d/%d"):format(i, want)
+		task.wait(0.12)
+	end
+	dgStats.bought = (dgStats.bought or 0) + got
+	if got > 0 then
+		dgStats.status = ("ซื้อกุญแจ %d ดอกแล้ว (มี %s)%s"):format(got, tostring(dgStats.keys or "?"), why and (" · หยุด: " .. why) or "")
+	else
+		dgStats.status = "ซื้อกุญแจไม่ได้: " .. tostring(why or "?")
 	end
 	dgBuyAt = os.clock()
-	local r = dgCall("buyKey")
-	if r.ok then
-		dgStats.keys = tonumber(r.keys) or ((tonumber(keys) or 0) + 1)
-		dgStats.bought = (dgStats.bought or 0) + 1
-		dgStats.status = ("ซื้อกุญแจแล้ว (รวมซื้อ %d ดอก)"):format(dgStats.bought)
-		return true
-	end
-	dgStats.status = "ซื้อกุญแจไม่ได้: " .. tostring(r.error or "?")
-	return false
+	return got > 0
 end
-dgBuyKeyFwd = dgTryBuyKey
+dgBuyKeyFwd = dgBuyBatch
 end
 
 -- AUTO REJOIN: the "Disconnected / kicked" prompt sets GuiService's error message.
@@ -3569,11 +3587,11 @@ task.spawn(function()
 			dgStats.free = type(st.free) == "table" and tonumber(st.free[id]) or 0
 			if st.inRun then dgStats.status = "อยู่ในรอบ"; continue end
 		end
-		-- free runs first; keys only if allowed and above the keep-floor. Never buys keys.
+		-- free runs first; keys only if allowed and above the keep-floor; out of keys -> buy a batch (toggle)
 		if def.keys and not def.unlimited and (dgStats.free or 0) <= 0 then
 			if not e.phDgUseKeys then dgStats.status = "รอบฟรีหมด (ปิดใช้กุญแจ)"; continue end
 			if (dgStats.keys or 0) <= (tonumber(e.phDgKeepKeys) or 0) and not dgBuyKeyFwd(dgStats.keys) then
-				if not e.phDgBuyKeys then
+				if not e.phDgBuyBatch then
 					dgStats.status = ("กุญแจเหลือ %d (เก็บไว้ %d) หยุดเข้า"):format(dgStats.keys or 0, tonumber(e.phDgKeepKeys) or 0)
 				end
 				continue
@@ -4791,12 +4809,15 @@ DLs:Toggle({Name = "ใช้กุญแจเมื่อรอบฟรีว
 DLs:Slider({Name = "└ เก็บกุญแจไว้อย่างน้อย (ถึงแล้วหยุดเข้า)", Minimum = 0, Maximum = 100, Default = tonumber(e.phDgKeepKeys) or 0,
 	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
 	Callback = function(v) e.phDgKeepKeys = math.floor(v + 0.5); sv() end}, "PHDgKeepKeys")
-DLs:Toggle({Name = "ซื้อกุญแจเองเมื่อหมด (ดอกละ 250k ทอง · ต้องเปิด 'ใช้กุญแจ' ด้วย)", Default = e.phDgBuyKeys,
-	Callback = function(v) e.phDgBuyKeys = v; sv() end}, "PHDgBuyKeys")
-DLs:Slider({Name = "└ เก็บทองไว้อย่างน้อย (ล้าน) ต่ำกว่านี้ไม่ซื้อ", Minimum = 0, Maximum = 200, Default = tonumber(e.phDgGoldFloor) or 5,
+DLs:Toggle({Name = "กุญแจหมด → ออกมาซื้อทีละชุด แล้วเข้าต่อ (ดอกละ 250k ทอง · ต้องเปิด 'ใช้กุญแจ')", Default = e.phDgBuyBatch,
+	Callback = function(v) e.phDgBuyBatch = v; sv() end}, "PHDgBuyBatch")
+DLs:Slider({Name = "└ ซื้อทีละ (ดอก)", Minimum = 1, Maximum = 200, Default = tonumber(e.phDgBuyCount) or 100,
+	Precision = 0, DisplayMethod = "Round", Suffix = " ดอก",
+	Callback = function(v) e.phDgBuyCount = math.floor(v + 0.5); sv() end}, "PHDgBuyCount")
+DLs:Slider({Name = "└ เก็บทองไว้อย่างน้อย (ล้าน) ต่ำกว่านี้หยุดซื้อ", Minimum = 0, Maximum = 200, Default = tonumber(e.phDgGoldFloor) or 5,
 	Precision = 0, DisplayMethod = "Round", Suffix = "M",
 	Callback = function(v) e.phDgGoldFloor = math.floor(v + 0.5); sv() end}, "PHDgGoldFloor")
-DLs:Label({Text = "จบดัน → กด REPLAY ให้เองทันที (โหวต: ทุกคนในปาร์ตี้ต้องกด ครบแล้วเริ่มรอบใหม่เลย)\nถ้าโหวตไม่ครบจนกลับเมือง: เดี่ยว/หัวหน้า → กดเข้าใหม่ให้ · ลูกปาร์ตี้ → รอหัวหน้าเรียก\nใช้รอบฟรีก่อน แล้วค่อยใช้กุญแจ · ไม่ซื้อกุญแจให้เด็ดขาด\nในดันเจี้ยน: ตีมอนห้องปัจจุบัน → เดินห้องถัดไป → บอส (หลบสกิล) → เปิดหีบ"})
+DLs:Label({Text = "จบดัน → กด REPLAY ให้เองทันที (โหวต: ทุกคนในปาร์ตี้ต้องกด ครบแล้วเริ่มรอบใหม่เลย)\nถ้าโหวตไม่ครบจนกลับเมือง: เดี่ยว/หัวหน้า → กดเข้าใหม่ให้ · ลูกปาร์ตี้ → รอหัวหน้าเรียก\nใช้รอบฟรีก่อน แล้วค่อยใช้กุญแจ · ซื้อกุญแจเฉพาะตอนเปิดสวิตช์ซื้อทีละชุด\nในดันเจี้ยน: ตีมอนห้องปัจจุบัน → เดินห้องถัดไป → บอส (หลบสกิล) → เปิดหีบ"})
 local DRs = Tabs.Dungeon:Section({Side = "Right"})
 DRs:Header({Text = "สถานะดันเจี้ยน"})
 local dgLbl = DRs:Label({Text = "-"})
