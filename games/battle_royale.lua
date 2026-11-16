@@ -163,11 +163,32 @@ end)
 -- Drawing API, updated every RenderStepped (realtime): 2D box fitted to the projected
 -- character bounds, R15/R6 skeleton lines, name / distance / health bar. Party members
 -- (same "Party" attribute on the Player) count as teammates.
-for k, v in pairs({pOn = true, pBox = true, pSkel = true, pName = true, pHealth = true, pTracer = false, pGun = true,
+for k, v in pairs({pOn = true, pBox = false, pGlow = true, pSkel = true, pName = true, pHealth = true, pTracer = false, pGun = true,
 	pTeam = false, pMaxDist = 2000}) do
 	if e[k] == nil then e[k] = v end
 end
+if e.pGlowMigrated == nil then e.pBox = false; e.pGlow = true; e.pGlowMigrated = true; sv() end
 local ENEMY, MATE = Color3.fromRGB(255, 70, 70), Color3.fromRGB(80, 230, 120)
+
+-- Glow = a Highlight around the character (outline + light fill, seen through walls).
+-- Roblox renders at most 31 Highlights at once, so only the 30 nearest shown players
+-- get one; the pool is re-assigned 5x a second.
+local glowFolder = Instance.new("Folder")
+glowFolder.Name = "BR_PlayerGlow"
+glowFolder.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+local glowOf = {}   -- player -> Highlight
+local function glowFor(p)
+	local h = glowOf[p]
+	if h and h.Parent then return h end
+	h = Instance.new("Highlight")
+	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	h.FillTransparency = 0.7
+	h.OutlineTransparency = 0
+	h.Parent = glowFolder
+	glowOf[p] = h
+	return h
+end
+local glowWanted = {}   -- filled by the render loop: player -> {dist, color}
 local BONES_R15 = {
 	{"Head", "UpperTorso"}, {"UpperTorso", "LowerTorso"},
 	{"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"}, {"LeftLowerArm", "LeftHand"},
@@ -206,6 +227,7 @@ local function dropPlayer(p)
 	if not d then return end
 	for _, o in ipairs(d.all) do pcall(function() o:Remove() end) end
 	pDraw[p] = nil
+	if glowOf[p] then pcall(function() glowOf[p]:Destroy() end); glowOf[p] = nil end
 end
 local function drawFor(p)
 	local d = pDraw[p]
@@ -237,6 +259,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 	local myParty = plr:GetAttribute("Party")
 	local camPos = cam.CFrame.Position
 	local vp = cam.ViewportSize
+	table.clear(glowWanted)
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= plr then
 			local d = drawFor(p)
@@ -251,6 +274,7 @@ local renderConn = RunService.RenderStepped:Connect(function()
 				hideAll(d)
 			else
 				local col = mate and MATE or ENEMY
+				if e.pGlow then glowWanted[p] = {dist = dist, color = col, char = ch} end
 				-- screen-space bounds from every body part's projected centre +- its size
 				local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
 				local onScreen = false
@@ -322,6 +346,28 @@ local renderConn = RunService.RenderStepped:Connect(function()
 	end
 end)
 
+task.spawn(function()
+	while alive() do
+		local list = {}
+		for p, w in pairs(glowWanted) do list[#list + 1] = {p = p, w = w} end
+		table.sort(list, function(a, b) return a.w.dist < b.w.dist end)
+		local keep = {}
+		for i = 1, math.min(#list, 30) do
+			local it = list[i]
+			local h = glowFor(it.p)
+			if h.Adornee ~= it.w.char then h.Adornee = it.w.char end
+			h.OutlineColor = it.w.color
+			h.FillColor = it.w.color
+			h.Enabled = true
+			keep[it.p] = true
+		end
+		for p, h in pairs(glowOf) do
+			if not keep[p] then h.Enabled = false end
+		end
+		task.wait(0.2)
+	end
+end)
+
 -- ---------------------------------------------------------------------- UI
 local okL, Lib = pcall(function()
 	return loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
@@ -371,7 +417,8 @@ local cntLbl = R:Label({Text = "-"})
 local P = Tabs.PESP:Section({Side = "Left"})
 P:Header({Text = "Player ESP (realtime)"})
 P:Toggle({Name = "เปิด ESP คน", Default = e.pOn, Callback = function(v) e.pOn = v; sv() end}, "BRPOn")
-P:Toggle({Name = "กรอบตามตัว", Default = e.pBox, Callback = function(v) e.pBox = v; sv() end}, "BRPBox")
+P:Toggle({Name = "Glow รอบตัว (มองทะลุกำแพง)", Default = e.pGlow, Callback = function(v) e.pGlow = v; sv() end}, "BRPGlow")
+P:Toggle({Name = "กรอบสี่เหลี่ยม", Default = e.pBox, Callback = function(v) e.pBox = v; sv() end}, "BRPBox")
 P:Toggle({Name = "Skeleton (โครงกระดูก)", Default = e.pSkel, Callback = function(v) e.pSkel = v; sv() end}, "BRPSkel")
 P:Toggle({Name = "ชื่อ + ระยะ", Default = e.pName, Callback = function(v) e.pName = v; sv() end}, "BRPName")
 P:Toggle({Name = "แถบเลือด", Default = e.pHealth, Callback = function(v) e.pHealth = v; sv() end}, "BRPHealth")
@@ -411,6 +458,7 @@ W.onUnloaded(function()
 	pcall(function() renderConn:Disconnect() end)
 	pcall(function() remPlayer:Disconnect() end)
 	for p in pairs(pDraw) do dropPlayer(p) end
+	pcall(function() glowFolder:Destroy() end)
 	print("[BR ESP] Unloaded")
 end)
 Tabs.ESP:Select()
