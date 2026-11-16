@@ -4420,7 +4420,7 @@ do
 		pcall(gameIcon); pcall(headshot)
 		for id in pairs(kindOf) do
 			if not alive() then return end
-			pcall(petArt, id, "full"); pcall(petArt, id, "pets")
+			pcall(petArt, id, "full"); pcall(petArt, id, "pets"); pcall(slotIcon, (Cd.defs[id] or {}).slot)
 		end
 	end)
 	local function petDef(id)
@@ -4454,6 +4454,15 @@ do
 		return "```diff\n" .. table.concat(lines, "\n") .. "\n```"
 	end
 	local BADGE = {Legendary = "🌟 LEGENDARY", Secret = "💎 SECRET", Transcendent = "👑 TRANSCENDENT"}
+	-- the game's own slot icons (BagUi: weapon "swords", headgear "crown", armor "shield",
+	-- accessory "luck" -> Kit.Ui.iconTile images). Discord can't put an image inside a field,
+	-- so the real icon rides on the author line and the field gets the matching emoji.
+	local SLOT_ICON = {weapon = "106814063337979", headgear = "136477733127887", armor = "94791657957297", accessory = "94297658222181"}
+	local SLOT_EMO = {weapon = "⚔️", headgear = "👑", armor = "🛡️", accessory = "🍀"}
+	local function slotIcon(slot)
+		local a = SLOT_ICON[slot]
+		return a and thumb("https://thumbnails.roblox.com/v1/assets?assetIds=" .. a .. "&size=150x150&format=Png&isCircular=false")
+	end
 	local FIN_EMO = {gold = "🥇", rainbow = "🌈", holo = "✨"}
 	function hook.notify(id, key, delta, total, before, isTest)
 		local d = Cd.defs[id] or {}
@@ -4475,8 +4484,8 @@ do
 				avatar_url = gameIcon(),
 				content = #content > 0 and table.concat(content, "  ") or nil,
 				embeds = {{
-					author = {name = (BADGE[d.rarity] or tostring(d.rarity or "")) .. " DROP!  ·  " .. (KIND[kind] or "การ์ด"),
-						icon_url = petArt(id, "pets")},
+					author = {name = (BADGE[d.rarity] or tostring(d.rarity or "")) .. " DROP!  ·  " .. (KIND[kind] or "การ์ด")
+						.. "  ·  " .. tostring(slot or "?"), icon_url = slotIcon(d.slot) or petArt(id, "pets")},
 					title = bossName(id),
 					description = table.concat(desc, "\n"),
 					color = COLOR[d.rarity] or 0x5865F2,
@@ -4485,7 +4494,7 @@ do
 					fields = {
 						{name = "🎴 Finish", value = (FIN_EMO[finKey] or "▫️") .. " " .. fin, inline = true},
 						{name = "📦 มีทั้งหมด", value = ("**%d** ใบ%s"):format(total, delta > 1 and (" (+%d)"):format(delta) or ""), inline = true},
-						{name = "🧩 ช่องใส่", value = tostring(slot or "?"), inline = true},
+						{name = "🧩 ช่องใส่", value = (SLOT_EMO[d.slot] or "▫️") .. " " .. tostring(slot or "?"), inline = true},
 					},
 					footer = {text = ("%s  ·  Lv %s  ·  Pet Hunt Party"):format(plr.Name, tostring(plr:GetAttribute("Level") or "?")),
 						icon_url = headshot()},
