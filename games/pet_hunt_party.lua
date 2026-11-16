@@ -81,7 +81,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgGoldFloor = 5,      -- ...but never take gold below this many MILLION
 	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
-	phHookUrl = "",         -- Discord webhook (local state.json only, never in the script)
+	phHookUrl = "",         -- own Discord webhook; "" = the built-in one (BUILTIN_HOOK in the webhook block)
 	phHookField = true, phHookDungeon = true, phHookWorld = true, phHookPing = false,
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
@@ -4339,7 +4339,7 @@ end)
 -- card never reads as a drop. A change only counts once two polls in a row agree (the
 -- inventory and the gear replicate separately). The URL lives only in PetHunt/state.json.
 do
-	local hook = {status = "ยังไม่ได้ตั้ง URL"}
+	local hook = {status = "กำลังเริ่ม…"}
 	stats.hook = hook   -- table field, not a chunk local: main chunk is at the 200-register limit
 	getgenv().__PHP_HOOK = hook   -- reachable from the console: __PHP_HOOK.test()
 	local Cd = require(RS.Shared.Config.Cards)
@@ -4359,14 +4359,25 @@ do
 		return (kind == "field" and e.phHookField) or (kind == "dungeon" and e.phHookDungeon)
 			or (kind == "world" and e.phHookWorld)
 	end
+	-- user: "ฟิก webhook เลย ที่ส่งไป ไม่ต้องให้ใส่" (chose to ship it in the public script,
+	-- knowing anyone reading the repo can see it): used whenever no own URL is set.
+	local BUILTIN_HOOK = "https://discord.com/api/webhooks/1571905652706648186/1Y5Xppw8M0MJ1CxaTGCBfJQtM11rIsQkVFR3kWkfcoR38xP0Kzj2eVdcd5ex9HLksMgF"
+	function hook.valid(u)
+		return type(u) == "string" and u:match("^https://[%w%.]*discord[%w%.]*%.com/api/webhooks/%d+/[%w_%-]+$") ~= nil
+	end
+	function hook.url()
+		if hook.valid(e.phHookUrl) then return e.phHookUrl end
+		return BUILTIN_HOOK
+	end
+	function hook.custom() return hook.valid(e.phHookUrl) and e.phHookUrl ~= BUILTIN_HOOK end
 	function hook.urlOk()
-		return type(e.phHookUrl) == "string" and e.phHookUrl:match("^https://[%w%.]*discord[%w%.]*%.com/api/webhooks/%d+/[%w_%-]+$") ~= nil
+		return hook.valid(hook.url())
 	end
 	function hook.post(payload)
 		local req = request or http_request or (syn and syn.request) or (http and http.request)
 		if not req then return false, "executor ไม่มี request()" end
 		if not hook.urlOk() then return false, "URL webhook ไม่ถูกต้อง" end
-		local ok, res = pcall(req, {Url = e.phHookUrl, Method = "POST",
+		local ok, res = pcall(req, {Url = hook.url(), Method = "POST",
 			Headers = {["Content-Type"] = "application/json"}, Body = HS:JSONEncode(payload)})
 		if not ok then return false, tostring(res) end
 		if type(res) == "table" then
@@ -4943,14 +4954,14 @@ do
 	local hook = stats.hook
 	local SRw = Tabs.Settings:Section({Side = "Right"})
 	SRw:Header({Text = "Discord Webhook (แจ้งเตือนการ์ดบอส)"})
-	SRw:Input({Name = "Webhook URL", Placeholder = hook.urlOk() and ("ตั้งแล้ว …" .. e.phHookUrl:sub(-6)) or "https://discord.com/api/webhooks/...",
+	SRw:Input({Name = "Webhook URL", Placeholder = hook.custom() and ("ใช้ของตัวเอง …" .. e.phHookUrl:sub(-6)) or "ใช้ webhook ในตัว (ใส่ของตัวเองเพื่อเปลี่ยน)",
 		AcceptedCharacters = "All",
 		Callback = function(t)
 			t = tostring(t or ""):gsub("^%s+", ""):gsub("%s+$", "")
 			if t == "" then return end
 			local old = e.phHookUrl
 			e.phHookUrl = t
-			if hook.urlOk() then sv(); hook.status = "✔ บันทึก URL แล้ว" else e.phHookUrl = old; hook.status = "✖ URL ไม่ใช่ Discord webhook" end
+			if hook.valid(t) then sv(); hook.status = "✔ บันทึก URL แล้ว" else e.phHookUrl = old; hook.status = "✖ URL ไม่ใช่ Discord webhook" end
 		end}, "PHHookUrl")
 	SRw:Toggle({Name = "แจ้งเมื่อได้การ์ดบอสฟิลด์ (Legendary)", Default = e.phHookField,
 		Callback = function(v) e.phHookField = v; sv() end}, "PHHookField")
@@ -4961,7 +4972,7 @@ do
 	SRw:Toggle({Name = "แท็ก @everyone", Default = e.phHookPing,
 		Callback = function(v) e.phHookPing = v; sv() end}, "PHHookPing")
 	SRw:Button({Name = "ทดสอบส่ง Webhook", Callback = function() task.spawn(hook.test) end})
-	SRw:Button({Name = "ลบ Webhook URL", Callback = function() e.phHookUrl = ""; sv(); hook.status = "ลบ URL แล้ว" end})
+	SRw:Button({Name = "กลับไปใช้ webhook ในตัว", Callback = function() e.phHookUrl = ""; sv(); hook.status = "ใช้ webhook ในตัวแล้ว" end})
 	hook.lbl = SRw:Label({Text = "Webhook: " .. hook.status})
 end
 
