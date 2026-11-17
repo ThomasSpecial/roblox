@@ -65,7 +65,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phCollect = false, phEquip = false, phEquipEvery = 15, phChest = false, phFarmBoss = false,
 	phBossOn = false, phBossPick = nil, phFarmPos = nil,
 	phWBOn = false, phWBPick = nil, phWBFields = nil, phReconnect = true,
-	phHopNoFriends = true,  -- Auto Boss / World Boss on: reconnect into a server without Roblox friends
+	phHopNoFriends = true,  -- Auto Boss on: reconnect into a server without Roblox friends
 	phBossWaitLv = true,    -- only go fight a field boss once my level >= its level
 	phBossUnbeaten = true,  -- skip field bosses already cleared (Beat_<id> attr = field unlocked)
 	phAutoWarp = true,      -- walk to a WarpStone and warp to the right field (incl. after a death->town)
@@ -914,7 +914,8 @@ end
 -- HOP AWAY FROM FRIENDS (user: "Auto Boss หรือ Auto World boss เปิดอยู่ เวลาหลุด มันจะกลับมา
 -- เซิฟเดียวกับเพื่อน ให้มัน hop หาเซิฟที่ไม่มีเพื่อนอยู่" -- Roblox friends). A plain
 -- Teleport(placeId) lets matchmaking drop us next to a friend. With the toggle on and Auto
--- Boss / Auto World Boss running (and no dungeon party -- that one needs the friends):
+-- Boss running (user later: "เหลือแค่ Auto boss อันเดียวพอ ... ปิด Auto boss ก็ไม่ต้องทำงาน";
+-- World Boss alone does NOT hop) and no dungeon party -- that one needs the friends:
 --   * reconnect -> pick a public server (games.roblox.com list, 3 pages) that is not full,
 --     not this one and not one GetFriendsOnline reports a friend in -> TeleportToPlaceInstance
 --   * after joining, a friend in the server anyway (joins can hide their server) -> hop again
@@ -922,7 +923,7 @@ end
 -- (getgenv fields, no chunk locals: the main chunk is at Luau's 200-register limit)
 do
 	local function wantHop()
-		return e.phHopNoFriends and (e.phBossOn or e.phWBOn) and not (e.phDgOn or e.phDgAccept)
+		return e.phHopNoFriends and e.phBossOn and not (e.phDgOn or e.phDgAccept)   -- user: Auto Boss only, not World Boss
 	end
 	local function friendJobs()
 		local avoid = {[game.JobId] = true}
@@ -5114,7 +5115,7 @@ STs:Label({Text = "กด RightShift เพื่อซ่อน/แสดงห
 STs:Header({Text = "General"})
 STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟมีปัญหา → เข้าใหม่)", Default = e.phReconnect,
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
-STs:Toggle({Name = "└ เปิด Auto Boss / World Boss อยู่ → หลุดแล้วไปเซิร์ฟที่ไม่มีเพื่อน Roblox", Default = e.phHopNoFriends,
+STs:Toggle({Name = "└ เปิด Auto Boss อยู่ → หลุดแล้วไปเซิร์ฟที่ไม่มีเพื่อน Roblox", Default = e.phHopNoFriends,
 	Callback = function(v) e.phHopNoFriends = v; sv() end}, "PHHopNoFriends")
 STs:Toggle({Name = "Auto Warp (วาร์ปไปฟิลด์ที่ถูก / ตายแล้ววาร์ปกลับจากเมือง)", Default = e.phAutoWarp,
 	Callback = function(v) e.phAutoWarp = v; sv() end}, "PHAutoWarp")
