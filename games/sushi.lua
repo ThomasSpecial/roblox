@@ -25,7 +25,8 @@ local Remotes = RS:WaitForChild("RemoteEvents", 30)
 -- ------------------------------------------------------------------ settings
 local SF = ("Sushi/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {money = true, moneyEvery = 1, fish = true, deposit = true, depositEvery = 1,
-	hire = true, hireAmount = "x1", hireEvery = 1, merge = true, mergeEvery = 3}
+	hire = true, hireAmount = "x1", hireEvery = 1, merge = true, mergeEvery = 3,
+	depositMinOn = true, depositMin = 1.3, depositHot = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -114,10 +115,20 @@ task.spawn(function()
 			lastD = now
 			pcall(function()
 				local n = fishHeld()
-				if n > 0 and touch(pad("Sell", "DepositButton")) then
-					st.deposit = ("ส่งให้เชฟ %s ตัว · %s"):format(guiText("LootGui", "MoneyText") or "?", os.date("%H:%M:%S"))
-				else
-					st.deposit = "ไม่มีปลาในมือ"
+				if n <= 0 then st.deposit = "ไม่มีปลาในมือ"; return end
+				-- user: "เมื่อ fish value ถึงที่ต้องการ ค่อย deposit": the server-wide FishPrice
+				-- (0.5x-1.5x, re-rolled every few s) multiplies what a deposit pays -- hold the
+				-- fish until it reaches the target (what the paid Fish Trader employee does)
+				local price = tonumber(workspace:GetAttribute("FishPrice")) or 1
+				local hot = workspace:GetAttribute("FishPriceEvent") == "HighDemand"
+				if e.depositMinOn and price < (tonumber(e.depositMin) or 1.3) and not (hot and e.depositHot) then
+					st.deposit = ("ถือไว้ %s ตัว · ราคา %.1fx < เป้า %.1fx (อีก %ss)"):format(guiText("LootGui", "MoneyText") or "?",
+						price, tonumber(e.depositMin) or 1.3, tostring(workspace:GetAttribute("FishPriceNext") or "?"))
+					return
+				end
+				local held = guiText("LootGui", "MoneyText") or "?"
+				if touch(pad("Sell", "DepositButton")) then
+					st.deposit = ("ส่งให้เชฟ %s ตัว @ %.1fx%s · %s"):format(held, price, hot and " (HighDemand)" or "", os.date("%H:%M:%S"))
 				end
 			end)
 		end
@@ -177,6 +188,12 @@ L:Toggle({Name = "Auto Collect Fish Instant (เก็บปลาทุกต�
 	Callback = function(v) e.fish = v; sv() end}, "SUFish")
 L:Toggle({Name = "Auto Deposit Fish Instant (ส่งปลาให้เชฟ)", Default = e.deposit,
 	Callback = function(v) e.deposit = v; sv() end}, "SUDeposit")
+L:Toggle({Name = "└ ส่งเฉพาะตอน Fish Value ถึงเป้า", Default = e.depositMinOn,
+	Callback = function(v) e.depositMinOn = v; sv() end}, "SUDepositMinOn")
+L:Slider({Name = "└ Fish Value ขั้นต่ำ", Minimum = 0.5, Maximum = 1.5, Default = tonumber(e.depositMin) or 1.3,
+	Precision = 1, Suffix = "x", Callback = function(v) e.depositMin = v; sv() end}, "SUDepositMin")
+L:Toggle({Name = "└ HighDemand → ส่งทันที (ไม่สนเป้า)", Default = e.depositHot,
+	Callback = function(v) e.depositHot = v; sv() end}, "SUDepositHot")
 L:Toggle({Name = "Auto Collect Money Instant (เก็บเงิน)", Default = e.money,
 	Callback = function(v) e.money = v; sv() end}, "SUMoney")
 L:Header({Text = "คนตกปลา"})
@@ -209,6 +226,9 @@ task.spawn(function()
 			stLbl:UpdateName(table.concat({
 				("เงิน: $%s · ปลาในมือ: %s · คนตกปลา: %s"):format(guiText("CurrencyGui", "CashText") or "?",
 					guiText("LootGui", "MoneyText") or "?", tostring(plr:GetAttribute("CurrentCount") or "?")),
+				("Fish Value ตอนนี้: %.1fx%s · เปลี่ยนใน %ss"):format(tonumber(workspace:GetAttribute("FishPrice")) or 0,
+					workspace:GetAttribute("FishPriceEvent") == "HighDemand" and " (HighDemand)" or "",
+					tostring(workspace:GetAttribute("FishPriceNext") or "?")),
 				"Fish: " .. st.fish .. " · รวม " .. st.fishTotal .. " ตัว",
 				"Deposit: " .. st.deposit,
 				"Money: " .. st.money,
