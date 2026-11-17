@@ -28,7 +28,7 @@ local Inv = require(RS.Modules.MineInventory)
 -- ------------------------------------------------------------------ settings
 local SF = ("AnimeMine/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {collect = true, collectEvery = 1, sell = true, sellEvery = 1, research = true,
-	researchAll = false, unlock = true}
+	researchAll = false, unlock = true, park = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -97,6 +97,23 @@ local function sellTick()
 	local ch = plr.Character
 	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 	if not (pos and hrp) then st.sell = "หาร้านขายไม่เจอ"; return end
+	-- user: "ทำแบบ instant ดิ" -> park at the stand: the crew mines the plot without us
+	-- (tested: same income while standing at the stand), so every sell goes out the moment
+	-- ore lands in the bag -- no hop, no replication wait (8/8 sells in 8s, none missed)
+	if e.park then
+		local spot = pos + Vector3.new(0, 0, 7)
+		if (hrp.Position - spot).Magnitude > 9 then
+			hrp.CFrame = CFrame.new(spot, pos)
+			task.wait(0.15)
+		end
+		local m0 = money()
+		GS.SendEvent("MineSellItems", keys)
+		task.wait(0.15)
+		local got = money() - m0
+		if got > 0 then st.sold += got end
+		st.sell = ("ขาย %d ชนิด +%s · %s"):format(#keys, fmt(math.max(0, got)), os.date("%H:%M:%S"))
+		return
+	end
 	-- tested: the server needs our new position replicated first -- 1 frame is too soon,
 	-- 0.1s is enough. Hop there, sell, hop straight back (~0.15s away from the plot);
 	-- a miss bumps the wait for the next try.
@@ -182,27 +199,32 @@ end
 
 -- ------------------------------------------------------------------ loops
 task.spawn(function()
-	local lastC, lastS = 0, 0
+	local lastC, lastS, lastR = 0, 0, 0
 	while alive() do
 		local now = os.clock()
-		if e.collect and now - lastC >= (tonumber(e.collectEvery) or 2) then
+		local fast = e.sell and e.park   -- parked at the stand: collect + sell every 0.2s
+		if e.collect and (fast or now - lastC >= (tonumber(e.collectEvery) or 1)) then
 			lastC = now
 			pcall(collectTick)
+			if fast then task.wait(0.15) end
 		end
-		if e.unlock then pcall(unlockTick) end
-		if e.research then
-			-- several pips in a row while affordable, then breathe
-			for _ = 1, 5 do
-				local ok, more = pcall(researchTick)
-				if not (ok and more) then break end
-				task.wait(0.35)
-			end
-		end
-		if e.sell and now - lastS >= (tonumber(e.sellEvery) or 10) then
+		if e.sell and (fast or now - lastS >= (tonumber(e.sellEvery) or 1)) then
 			lastS = now
 			pcall(sellTick)
 		end
-		task.wait(0.5)
+		if now - lastR >= 0.5 then
+			lastR = now
+			if e.unlock then pcall(unlockTick) end
+			if e.research then
+				-- several pips in a row while affordable, then breathe
+				for _ = 1, 5 do
+					local ok, more = pcall(researchTick)
+					if not (ok and more) then break end
+					task.wait(0.35)
+				end
+			end
+		end
+		task.wait(fast and 0.05 or 0.5)
 	end
 end)
 
@@ -231,7 +253,9 @@ L:Toggle({Name = "Auto Sell Instant (ขายแร่ทั้งหมด ว
 L:Slider({Name = "└ ขายทุก", Minimum = 1, Maximum = 120, Default = tonumber(e.sellEvery) or 1,
 	Precision = 0, DisplayMethod = "Round", Suffix = " วิ",
 	Callback = function(v) e.sellEvery = math.floor(v + 0.5); sv() end}, "AMSellEvery")
-L:Label({Text = "ขายเฉพาะแร่ ไม่แตะตัวละคร / pickaxe"})
+L:Toggle({Name = "└ ยืนประจำร้าน (ขายทันทีที่แร่เข้า ไม่ต้องวาร์ปไปกลับ)", Default = e.park,
+	Callback = function(v) e.park = v; sv() end}, "AMPark")
+L:Label({Text = "ขายเฉพาะแร่ ไม่แตะตัวละคร / pickaxe\nยืนประจำร้าน: ตัวละครยืนที่ร้านขายตลอด ทีมยังขุดที่แปลงเหมือนเดิม\nเก็บ + ขายทุก 0.2 วิ (ปิด = วาร์ปไปขายตามรอบที่ตั้ง)"})
 L:Header({Text = "Research / Zone"})
 L:Toggle({Name = "Auto Research Tree (ซื้ออันถูกสุดก่อน)", Default = e.research,
 	Callback = function(v) e.research = v; sv() end}, "AMResearch")
