@@ -18,6 +18,7 @@ local function alive() return getgenv().__AMINE == G end
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local HS = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local plr = Players.LocalPlayer
 
 local GS = require(RS.Modules.GameState)
@@ -26,11 +27,13 @@ local Inv = require(RS.Modules.MineInventory)
 
 -- ------------------------------------------------------------------ settings
 local SF = ("AnimeMine/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {collect = true, collectEvery = 2, sell = true, sellEvery = 10, research = true,
+local DEFAULTS = {collect = true, collectEvery = 1, sell = true, sellEvery = 1, research = true,
 	researchAll = false, unlock = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
+-- user: "auto sell ไม่เห็นจะ instant" -> sell right after every collect (old defaults 2s / 10s)
+if not e.instantMigrated then e.collectEvery = 1; e.sellEvery = 1; e.instantMigrated = true end
 local function sv()
 	pcall(function()
 		if makefolder and not isfolder("AnimeMine") then makefolder("AnimeMine") end
@@ -94,16 +97,27 @@ local function sellTick()
 	local ch = plr.Character
 	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 	if not (pos and hrp) then st.sell = "หาร้านขายไม่เจอ"; return end
+	-- tested: the server needs our new position replicated first -- 1 frame is too soon,
+	-- 0.1s is enough. Hop there, sell, hop straight back (~0.15s away from the plot);
+	-- a miss bumps the wait for the next try.
 	local back = hrp.CFrame
 	local m0 = money()
 	hrp.CFrame = CFrame.new(pos + Vector3.new(0, 0, 7), pos)
-	task.wait(0.35)
+	task.wait(st.sellWait or 0.12)
 	GS.SendEvent("MineSellItems", keys)
-	task.wait(0.6)
+	RunService.Heartbeat:Wait()
+	RunService.Heartbeat:Wait()
 	if hrp.Parent then hrp.CFrame = back end
+	task.wait(0.5)
 	local got = money() - m0
-	if got > 0 then st.sold += got end
-	st.sell = ("ขาย %d ชนิด +%s · %s"):format(#keys, fmt(math.max(0, got)), os.date("%H:%M:%S"))
+	if got > 0 then
+		st.sold += got
+		st.sellWait = math.max(0.12, (st.sellWait or 0.12) - 0.04)
+		st.sell = ("ขาย %d ชนิด +%s · %s"):format(#keys, fmt(got), os.date("%H:%M:%S"))
+	else
+		st.sellWait = math.min((st.sellWait or 0.12) + 0.08, 0.5)
+		st.sell = "ขายไม่ติด ลองใหม่ (รอ " .. st.sellWait .. " วิ)"
+	end
 end
 
 -- ------------------------------------------------------------------ research
@@ -209,12 +223,12 @@ local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "เก็บ / ขาย"})
 L:Toggle({Name = "Auto Collect Instant (เก็บของจาก chest)", Default = e.collect,
 	Callback = function(v) e.collect = v; sv() end}, "AMCollect")
-L:Slider({Name = "└ เก็บทุก", Minimum = 1, Maximum = 30, Default = tonumber(e.collectEvery) or 2,
+L:Slider({Name = "└ เก็บทุก", Minimum = 1, Maximum = 30, Default = tonumber(e.collectEvery) or 1,
 	Precision = 0, DisplayMethod = "Round", Suffix = " วิ",
 	Callback = function(v) e.collectEvery = math.floor(v + 0.5); sv() end}, "AMCollectEvery")
 L:Toggle({Name = "Auto Sell Instant (ขายแร่ทั้งหมด วาร์ปไปร้านแล้วกลับ)", Default = e.sell,
 	Callback = function(v) e.sell = v; sv() end}, "AMSell")
-L:Slider({Name = "└ ขายทุก", Minimum = 3, Maximum = 120, Default = tonumber(e.sellEvery) or 10,
+L:Slider({Name = "└ ขายทุก", Minimum = 1, Maximum = 120, Default = tonumber(e.sellEvery) or 1,
 	Precision = 0, DisplayMethod = "Round", Suffix = " วิ",
 	Callback = function(v) e.sellEvery = math.floor(v + 0.5); sv() end}, "AMSellEvery")
 L:Label({Text = "ขายเฉพาะแร่ ไม่แตะตัวละคร / pickaxe"})
