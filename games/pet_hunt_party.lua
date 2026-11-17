@@ -65,6 +65,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phCollect = false, phEquip = false, phEquipEvery = 15, phChest = false, phFarmBoss = false,
 	phBossOn = false, phBossPick = nil, phFarmPos = nil,
 	phWBOn = false, phWBPick = nil, phWBFields = nil, phReconnect = true,
+	phHopNoFriends = true,  -- Auto Boss / World Boss on: reconnect into a server without Roblox friends
 	phBossWaitLv = true,    -- only go fight a field boss once my level >= its level
 	phBossUnbeaten = true,  -- skip field bosses already cleared (Beat_<id> attr = field unlocked)
 	phAutoWarp = true,      -- walk to a WarpStone and warp to the right field (incl. after a death->town)
@@ -910,6 +911,85 @@ local function nearestBossAdd(pos)
 	return best
 end
 
+-- HOP AWAY FROM FRIENDS (user: "Auto Boss หรือ Auto World boss เปิดอยู่ เวลาหลุด มันจะกลับมา
+-- เซิฟเดียวกับเพื่อน ให้มัน hop หาเซิฟที่ไม่มีเพื่อนอยู่" -- Roblox friends). A plain
+-- Teleport(placeId) lets matchmaking drop us next to a friend. With the toggle on and Auto
+-- Boss / Auto World Boss running (and no dungeon party -- that one needs the friends):
+--   * reconnect -> pick a public server (games.roblox.com list, 3 pages) that is not full,
+--     not this one and not one GetFriendsOnline reports a friend in -> TeleportToPlaceInstance
+--   * after joining, a friend in the server anyway (joins can hide their server) -> hop again
+--     (max 3 hops per 10 min, kept in a file because getgenv dies with the teleport)
+-- (getgenv fields, no chunk locals: the main chunk is at Luau's 200-register limit)
+do
+	local function wantHop()
+		return e.phHopNoFriends and (e.phBossOn or e.phWBOn) and not (e.phDgOn or e.phDgAccept)
+	end
+	local function friendJobs()
+		local avoid = {[game.JobId] = true}
+		pcall(function()
+			for _, f in ipairs(plr:GetFriendsOnline(200)) do
+				if f.GameId and f.PlaceId == game.PlaceId then avoid[f.GameId] = true end
+			end
+		end)
+		for id in pairs(getgenv().__PHP_FRIENDJOBS or {}) do avoid[id] = true end
+		return avoid
+	end
+	getgenv().__PHP_HOP = function()
+		local TS = game:GetService("TeleportService")
+		if not wantHop() then TS:Teleport(game.PlaceId, plr); return "rejoin" end
+		local avoid, cands, cursor = friendJobs(), {}, nil
+		for _ = 1, 3 do
+			local ok, r = pcall(request, {Method = "GET", Url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true%s")
+				:format(game.PlaceId, cursor and ("&cursor=" .. cursor) or "")})
+			if not (ok and r and r.StatusCode == 200) then break end
+			local okJ, d = pcall(HS.JSONDecode, HS, r.Body)
+			if not (okJ and type(d) == "table") then break end
+			for _, s in ipairs(d.data or {}) do
+				if s.id and not avoid[s.id] and (tonumber(s.playing) or 0) < (tonumber(s.maxPlayers) or 0) - 1 then cands[#cands + 1] = s.id end
+			end
+			cursor = d.nextPageCursor
+			if not cursor or #cands >= 25 then break end
+		end
+		if #cands == 0 then TS:Teleport(game.PlaceId, plr); return "no server" end
+		TS:TeleportToPlaceInstance(game.PlaceId, cands[math.random(#cands)], plr)
+		return "hop"
+	end
+	-- remember where friends are while we are still connected (the web call may fail mid-drop)
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local t = {}
+				for _, f in ipairs(plr:GetFriendsOnline(200)) do
+					if f.GameId and f.PlaceId == game.PlaceId then t[f.GameId] = true end
+				end
+				getgenv().__PHP_FRIENDJOBS = t
+			end)
+			task.wait(60)
+		end
+	end)
+	-- joined next to a friend anyway -> hop once more
+	task.spawn(function()
+		task.wait(20)
+		if not (alive() and wantHop()) then return end
+		local friend
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= plr then
+				local ok, yes = pcall(plr.IsFriendsWith, plr, p.UserId)
+				if ok and yes then friend = p.Name; break end
+			end
+		end
+		if not friend then return end
+		local f = ("PetHunt/hops_%d.txt"):format(plr.UserId)
+		local hops = {}
+		pcall(function() if isfile(f) then for n in readfile(f):gmatch("%d+") do if os.time() - tonumber(n) < 600 then hops[#hops + 1] = n end end end end)
+		if #hops >= 3 then return end
+		hops[#hops + 1] = tostring(os.time())
+		pcall(function() writefile(f, table.concat(hops, ",")) end)
+		print("[PetHunt] friend " .. friend .. " in this server -> hopping")
+		pcall(getgenv().__PHP_HOP)
+	end)
+end
+
 -- Auto Reconnect: 3-trigger version (PlayerRemoving alone misses silent drops
 -- where the transport dies but LocalPlayer never leaves and the native
 -- "Disconnected" dialog just sits there). Debounced 5s, hooked once across
@@ -922,7 +1002,9 @@ if not getgenv().__PHP_RECON then
 		if not e.phReconnect then return end
 		if os.clock() - firedAt < 5 then return end
 		firedAt = os.clock()
-		pcall(function() TeleportService:Teleport(game.PlaceId, plr) end)
+		pcall(function()
+			if getgenv().__PHP_HOP then getgenv().__PHP_HOP() else TeleportService:Teleport(game.PlaceId, plr) end
+		end)
 	end
 	pcall(function() Players.PlayerRemoving:Connect(function(p) if p == plr then tryReconnect() end end) end)
 	pcall(function() plr.AncestryChanged:Connect(function(_, parent) if parent ~= Players then tryReconnect() end end) end)
@@ -3599,7 +3681,9 @@ pcall(function()
 			task.wait(3)
 			for _ = 1, 30 do   -- servers can refuse for a while; keep trying ~5 min
 				if not e.phAutoRejoin then break end
-				pcall(function() TeleportService:Teleport(game.PlaceId, plr) end)
+				pcall(function()
+					if getgenv().__PHP_HOP then getgenv().__PHP_HOP() else TeleportService:Teleport(game.PlaceId, plr) end
+				end)
 				task.wait(10)
 			end
 			rejoining = false
@@ -5030,6 +5114,8 @@ STs:Label({Text = "กด RightShift เพื่อซ่อน/แสดงห
 STs:Header({Text = "General"})
 STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟมีปัญหา → เข้าใหม่)", Default = e.phReconnect,
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
+STs:Toggle({Name = "└ เปิด Auto Boss / World Boss อยู่ → หลุดแล้วไปเซิร์ฟที่ไม่มีเพื่อน Roblox", Default = e.phHopNoFriends,
+	Callback = function(v) e.phHopNoFriends = v; sv() end}, "PHHopNoFriends")
 STs:Toggle({Name = "Auto Warp (วาร์ปไปฟิลด์ที่ถูก / ตายแล้ววาร์ปกลับจากเมือง)", Default = e.phAutoWarp,
 	Callback = function(v) e.phAutoWarp = v; sv() end}, "PHAutoWarp")
 STs:Toggle({Name = "เดินด้วย NavMap (แผนที่สแกนเอง ไม่ติดทางลาด/ขั้นพื้น)", Default = e.phNav,
