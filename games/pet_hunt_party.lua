@@ -1074,6 +1074,7 @@ end
 -- ------------------------------------------------------------------- stats
 local stats = {farm = "-", sell = "-", sold = 0, gold = 0, collect = "-", equip = "-", equipped = 0, chest = "-"}
 getgenv().__PHP_STATS = stats   -- read-only diagnostics handle (current generation's status)
+getgenv().__PHP_E = e           -- live settings handle (benchmarks flip farm spot / sell toggles without a reload)
 stats.sessionAt = os.clock()
 stats.kills = 0
 
