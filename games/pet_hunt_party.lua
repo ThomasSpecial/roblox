@@ -80,7 +80,6 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
 	phFuseRar = nil,        -- {Common = true, ...}
-	phFuseHide = true,      -- no fusion cutscene on screen while Auto Fusion runs
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
 	phDgOn = false,         -- Auto Dungeon: clear rooms / boss / open the boss chest while in a run
 	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
@@ -4391,7 +4390,7 @@ task.spawn(function()
 		getgenv().__PHP_FSPLAY = getgenv().__PHP_FSPLAY or FS.play
 		local orig = getgenv().__PHP_FSPLAY
 		FS.play = function(...)
-			if alive() and e.phFuseOn and e.phFuseHide then return end
+			if alive() and e.phFuseOn then return end   -- user: no separate toggle, part of Auto Fusion
 			return orig(...)
 		end
 	end)
@@ -5209,9 +5208,7 @@ stats.fuseL:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Requir
 		end
 		e.phFuseRar = sel; sv()
 	end}, "PHFuseRar")
-stats.fuseL:Toggle({Name = "ไม่ต้องโชว์อนิเมชัน fusion บนจอ", Default = e.phFuseHide,
-	Callback = function(v) e.phFuseHide = v; sv() end}, "PHFuseHide")
-stats.fuseL:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
+stats.fuseL:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse · ไม่โชว์อนิเมชัน fusion บนจอ\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
 stats.fuseR = Tabs.Fusion:Section({Side = "Right"})
 stats.fuseR:Header({Text = "สถานะ"})
 stats.fuseLbl = stats.fuseR:Label({Text = "-"})
