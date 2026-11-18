@@ -78,6 +78,8 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phTowerEnter = false,   -- in town: enter the Endless Tower by itself (solo / as party leader)
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
+	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
+	phFuseRar = nil,        -- {Common = true, ...}
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
 	phDgOn = false,         -- Auto Dungeon: clear rooms / boss / open the boss chest while in a run
 	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
@@ -4356,6 +4358,71 @@ task.spawn(function()
 	end
 end)
 
+-- --------------------------------------------------------------- auto fusion
+-- user: "เพิ่ม auto fusion card ด้วย เลือก rarity ได้". The Fusion panel (FusionUi): pick a
+-- rarity, fill Fusion.cost[rarity] cards (Common 20 / Uncommon 10 / Rare 10 / Epic 6 /
+-- Legendary 3) of ONE biome, then CardBook.send("fuse", rarity, keys) -> one card of the next
+-- rarity from that biome. Only spares go in: Fusion.spares() already keeps 1 copy of every
+-- card (unless it sits in a gear card slot), and like the game's own auto-fill we only use
+-- plain cards -- gold / rainbow / holo finishes are never fused. Biome with the most spares first.
+if type(e.phFuseRar) ~= "table" then e.phFuseRar = {Common = true} end
+stats.fuse, stats.fused = "ปิดอยู่", 0
+task.spawn(function()
+	local C = controllers()
+	local okB, CB = pcall(function() return require(C:WaitForChild("CardBook", 10)) end)
+	local okF, Fusion = pcall(require, RS.Shared.Config.Fusion)
+	local okC, CardsCfg = pcall(require, RS.Shared.Config.Cards)
+	if not (okB and okF and okC and CB and CB.send) then stats.fuse = "หาระบบ fusion ไม่เจอ"; return end
+	local function album()
+		local v = {}
+		local cs = plr:FindFirstChild("Cards")
+		if cs then for k, n in pairs(cs:GetAttributes()) do if type(n) == "number" and n > 0 and CardsCfg.defs[k] then v[k] = n end end end
+		pcall(function() for k, n in pairs(CB.variants()) do if n > 0 then v[k] = n end end end)
+		return v
+	end
+	local function slotted(id) return GearState ~= nil and GearState.cardSlotOf(id) ~= nil end
+	while alive() do
+		task.wait(2)
+		if not e.phFuseOn then stats.fuse = "ปิดอยู่"; continue end
+		if not hooks() then continue end
+		if Fusion.open and not Fusion.open() then stats.fuse = "เกมปิด fusion อยู่"; continue end
+		local did = false
+		for _, rar in ipairs(Fusion.order or {}) do
+			if not (alive() and e.phFuseOn) then break end
+			local cost = tonumber(Fusion.cost[rar]) or 0
+			if e.phFuseRar[rar] and cost > 0 then
+				local ok, list = pcall(Fusion.spares, rar, album(), slotted, nil)
+				if ok and type(list) == "table" then
+					local by, n = {}, {}
+					for _, j in ipairs(list) do
+						if not j.finish and (tonumber(j.spare) or 0) > 0 then
+							by[j.biome] = by[j.biome] or {}
+							table.insert(by[j.biome], j)
+							n[j.biome] = (n[j.biome] or 0) + j.spare
+						end
+					end
+					local biome, most
+					for b, c in pairs(n) do if c >= cost and (not most or c > most) then biome, most = b, c end end
+					if biome then
+						table.sort(by[biome], function(a, b) return a.spare > b.spare end)
+						local keys = {}
+						for _, j in ipairs(by[biome]) do
+							for _ = 1, j.spare do if #keys < cost then keys[#keys + 1] = j.key end end
+						end
+						pcall(CB.send, "fuse", rar, keys)
+						stats.fused += 1
+						stats.fuse = ("fuse %s x%d (%s) · รวม %d ครั้ง"):format(rar, cost, tostring(Fusion.biomes and Fusion.biomes[biome] or biome), stats.fused)
+						did = true
+						task.wait(1.8)   -- the panel locks 1.5s after a fuse
+						break           -- recount from scratch: the new card may feed the next rarity
+					end
+				end
+			end
+		end
+		if not did then stats.fuse = ("ไม่มีการ์ดซ้ำพอ fuse (fuse ไปแล้ว %d ครั้ง)"):format(stats.fused) end
+	end
+end)
+
 -- --------------------------------------------------------------- auto sell
 -- Build the sell list exactly like the Bag's sellAllPick: by selected tier, not
 -- locked, not equipped, sellPrice > 0; then fire the Bag's own sell remote one
@@ -5101,6 +5168,27 @@ SLs:Header({Text = "ขยะจากมอน (วัตถุดิบ)"})
 SLs:Toggle({Name = "ขายวัตถุดิบอัตโนมัติ (ปุ่ม SELL LOOT ของเกม)", Default = e.phSellMats,
 	Callback = function(v) e.phSellMats = v; sv() end}, "PHSellMats")
 local matsLbl = SLs:Label({Text = "-"})
+SLs:Header({Text = "Auto Fusion การ์ด"})
+SLs:Toggle({Name = "เปิด Auto Fusion (รวมการ์ดซ้ำ → การ์ดขั้นถัดไป)", Default = e.phFuseOn,
+	Callback = function(v) e.phFuseOn = v; sv() end}, "PHFuseOn")
+SLs:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Required = false,
+	Options = {"Common", "Uncommon", "Rare", "Epic", "Legendary"},
+	Default = (function() local d = {} for _, r in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary"}) do if e.phFuseRar[r] then d[#d + 1] = r end end return d end)(),
+	Callback = function(v)
+		local sel = {}
+		if type(v) == "table" then
+			for k, on in pairs(v) do if on == true then sel[k] = true elseif type(k) == "number" then sel[on] = true end end
+		end
+		e.phFuseRar = sel; sv()
+	end}, "PHFuseRar")
+stats.fuseLbl = SLs:Label({Text = "-"})
+SLs:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
+task.spawn(function()
+	while alive() do
+		pcall(function() stats.fuseLbl:UpdateName("Fusion: " .. tostring(stats.fuse)) end)
+		task.wait(1)
+	end
+end)
 SLs:Label({Text = "ขายเฉพาะไอเทมประเภทวัตถุดิบ (ดรอปจากมอน) ไม่แตะยา/หินตีบวก/อุปกรณ์\nวัตถุดิบในเกมนี้ไม่มีสูตรคราฟต์ใช้ มีไว้ขายอย่างเดียว"})
 task.spawn(function()
 	while alive() do
