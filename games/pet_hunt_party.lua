@@ -1134,7 +1134,8 @@ local function farmAnchor(hrp)
 	-- field's biggest spawn cluster becomes the farm spot until that goal is done
 	if goalFarm.here(hrp.Position) then
 		if goalFarm.kind == "unlock" then return nil end   -- free to walk to the boss arena
-		return goalFarm.spot and goalFarm.spot(goalFarm.field, goalFarm.mob)
+		local gs = goalFarm.spot and goalFarm.spot(goalFarm.field, goalFarm.mob)
+		return gs, gs and goalFarm.spotR and goalFarm.spotR[goalFarm.field .. ":" .. tostring(goalFarm.mob)]
 	end
 	local fp = e.phFarmPos
 	if type(fp) ~= "table" or not fp.x then return nil end
@@ -1835,6 +1836,15 @@ function goalFarm.spot(fid, mob)
 	end
 	if not best then return nil end
 	local c = best.region.center
+	-- spawn area radius (half diagonal): monsters roam all over it, so a ranged class
+	-- planted at the centre with a short gun (Gunner 26) can't reach most of them
+	do
+		local sz = best.region.size
+		local sx = (typeof(sz) == "Vector2" or typeof(sz) == "Vector3") and sz.X or 30
+		local sy = typeof(sz) == "Vector2" and sz.Y or typeof(sz) == "Vector3" and sz.Z or 30
+		goalFarm.spotR = goalFarm.spotR or {}
+		goalFarm.spotR[key] = math.sqrt((sx / 2) ^ 2 + (sy / 2) ^ 2)
+	end
 	local pos
 	pcall(function()
 		local m = Nav.maps[fid] or Nav.load(fid)
@@ -3770,10 +3780,16 @@ local wdPos, wdAt = nil, os.clock()
 local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on the spot / last target
 -- how far (flat studs) stay-put may step off the spot to fight. Unset = by class:
 -- ranged (attack range >= 20, e.g. Archer 38) = 0 feet locked; melee = 25
-local function stayRadius()
+-- user: "auto farm มันเอ๋อ บางทีไปไม่เจอมอน" (Gunner, range 26): R used to be 0 for every
+-- ranged class = feet locked on the spot, so monsters roaming a 50x76 spawn area were
+-- mostly out of reach and it stood there "waiting". Ranged now may step out as far as the
+-- spawn area is bigger than its gun reaches (area radius - attack range); a manual farm
+-- spot counts as a ~40-stud area. Melee keeps its 25.
+local function stayRadius(areaR)
 	local r = tonumber(e.phStayRadius)
 	if r then return math.max(0, r) end
-	return ATTACK_RANGE >= 20 and 0 or 25
+	if ATTACK_RANGE < 20 then return 25 end
+	return math.max(0, math.floor((areaR or 40) - ATTACK_RANGE + 0.5))
 end
 task.spawn(function()
 	while alive() do
@@ -4133,12 +4149,13 @@ task.spawn(function()
 		-- shoot what's within attack range of it; never walk after monsters. Uses the
 		-- game's own autoStay (AUTO anchors to where it was switched on) with autoRange
 		-- clamped to our attack range so its auto-picks never need a step either.
-		local spot = e.phStayPut and farmAnchor(hrp)
+		local spot, spotR
+		if e.phStayPut then spot, spotR = farmAnchor(hrp) end
 		if spot then
 			-- R = how far from the spot we may step out (0 = feet locked: ranged classes
 			-- shoot everything from the spot; melee needs room, so it walks out to fight
 			-- inside R and comes back when nothing's left / when dragged past R)
-			local R = stayRadius()
+			local R = stayRadius(spotR)
 			local sp = hrp.Position
 			local atSpot = flatDist(sp, spot) <= 2.5 and math.abs(sp.Y - spot.Y) <= 4
 			local function inZone(m)
@@ -4801,7 +4818,7 @@ FL:Toggle({Name = "ล่าการ์ดที่ยังไม่มี ต
 FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
 	Callback = function(v) e.phStayRadius = math.floor(v + 0.5); sv() end}, "PHStayRadius")
-FL:Label({Text = "สายยิงไกล (ธนู): 0 = ยืนนิ่ง ยิงทุกตัวที่ถึงจากจุด\nสายตีใกล้: ~20-30 = เดินออกไปตีมอนในวงนี้ แล้วกลับมาที่จุดเอง\n(ยังไม่เคยปรับ = ตั้งให้ตามอาชีพ: ยิงไกล 0 / ตีใกล้ 25)"})
+FL:Label({Text = "สายยิงไกล (ธนู): 0 = ยืนนิ่ง ยิงทุกตัวที่ถึงจากจุด\nสายตีใกล้: ~20-30 = เดินออกไปตีมอนในวงนี้ แล้วกลับมาที่จุดเอง\n(ยังไม่เคยปรับ = อัตโนมัติ: ยิงไกล = ขยับได้เท่าที่กองมอนกว้างกว่าระยะยิง (Gunner ยิงสั้นเลยขยับมากกว่าธนู) / ตีใกล้ 25)"})
 local stayLbl
 local function stayText()
 	local fp = e.phFarmPos
