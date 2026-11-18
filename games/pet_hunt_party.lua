@@ -4867,6 +4867,7 @@ local Tabs = {
 	Boss = TG:Tab({Name = "Auto Boss", Image = "rbxassetid://10723346959"}),
 	Dungeon = TG:Tab({Name = "ดันเจี้ยน", Image = "rbxassetid://10723396107"}),
 	Sell = TG:Tab({Name = "Auto Sell", Image = "rbxassetid://10709769841"}),
+	Fusion = TG:Tab({Name = "Auto Fusion", Image = "rbxassetid://10723396107"}),
 	Gear = TG:Tab({Name = "เก็บ/สวม", Image = "rbxassetid://10723345576"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
@@ -5168,10 +5169,11 @@ SLs:Header({Text = "ขยะจากมอน (วัตถุดิบ)"})
 SLs:Toggle({Name = "ขายวัตถุดิบอัตโนมัติ (ปุ่ม SELL LOOT ของเกม)", Default = e.phSellMats,
 	Callback = function(v) e.phSellMats = v; sv() end}, "PHSellMats")
 local matsLbl = SLs:Label({Text = "-"})
-SLs:Header({Text = "Auto Fusion การ์ด"})
-SLs:Toggle({Name = "เปิด Auto Fusion (รวมการ์ดซ้ำ → การ์ดขั้นถัดไป)", Default = e.phFuseOn,
+stats.fuseL = Tabs.Fusion:Section({Side = "Left"})
+stats.fuseL:Header({Text = "Auto Fusion การ์ด"})
+stats.fuseL:Toggle({Name = "เปิด Auto Fusion (รวมการ์ดซ้ำ → การ์ดขั้นถัดไป)", Default = e.phFuseOn,
 	Callback = function(v) e.phFuseOn = v; sv() end}, "PHFuseOn")
-SLs:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Required = false,
+stats.fuseL:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Required = false,
 	Options = {"Common", "Uncommon", "Rare", "Epic", "Legendary"},
 	Default = (function() local d = {} for _, r in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary"}) do if e.phFuseRar[r] then d[#d + 1] = r end end return d end)(),
 	Callback = function(v)
@@ -5181,8 +5183,10 @@ SLs:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Required = fal
 		end
 		e.phFuseRar = sel; sv()
 	end}, "PHFuseRar")
-stats.fuseLbl = SLs:Label({Text = "-"})
-SLs:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
+stats.fuseL:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
+stats.fuseR = Tabs.Fusion:Section({Side = "Right"})
+stats.fuseR:Header({Text = "สถานะ"})
+stats.fuseLbl = stats.fuseR:Label({Text = "-"})
 task.spawn(function()
 	while alive() do
 		pcall(function() stats.fuseLbl:UpdateName("Fusion: " .. tostring(stats.fuse)) end)
