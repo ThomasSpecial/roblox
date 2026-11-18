@@ -80,6 +80,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
 	phFuseRar = nil,        -- {Common = true, ...}
+	phFuseHide = true,      -- no fusion cutscene on screen while Auto Fusion runs
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
 	phDgOn = false,         -- Auto Dungeon: clear rooms / boss / open the boss chest while in a run
 	phDgReplay = false,     -- back in town after a run -> enter the picked dungeon again (solo / leader)
@@ -4381,17 +4382,38 @@ task.spawn(function()
 		return v
 	end
 	local function slotted(id) return GearState ~= nil and GearState.cardSlotOf(id) ~= nil end
+	-- user: "ทำให้มันไม่ขึ้นบนจอ": every fuse makes the server send a "CardFusion" effect and
+	-- Client.Main calls FusionShow.play(data) -> full-screen altar cutscene. Main looks the
+	-- function up on the module table each time, so swapping the field mutes it. The game's
+	-- original is kept in getgenv so reloads don't stack wrappers.
+	pcall(function()
+		local FS = require(C:WaitForChild("FusionShow", 10))
+		getgenv().__PHP_FSPLAY = getgenv().__PHP_FSPLAY or FS.play
+		local orig = getgenv().__PHP_FSPLAY
+		FS.play = function(...)
+			if alive() and e.phFuseOn and e.phFuseHide then return end
+			return orig(...)
+		end
+	end)
 	while alive() do
 		task.wait(2)
 		if not e.phFuseOn then stats.fuse = "ปิดอยู่"; continue end
 		if not hooks() then continue end
 		if Fusion.open and not Fusion.open() then stats.fuse = "เกมปิด fusion อยู่"; continue end
+		-- user: "ทำให้มันไวกว่านี้ได้ไหม": the server takes fuses back to back (tested 4 in 1s,
+		-- all went through) -- the 1.5s lock is only the panel's. So burn through every
+		-- possible fuse from ONE album snapshot, counting our own spends down locally (the
+		-- server's copy replicates a beat later, and a stale count would resend used cards),
+		-- 0.25s apart; refresh the snapshot only when nothing is left to fuse.
 		local did = false
+		local snap = album()
+		local burst = 0
 		for _, rar in ipairs(Fusion.order or {}) do
 			if not (alive() and e.phFuseOn) then break end
 			local cost = tonumber(Fusion.cost[rar]) or 0
-			if e.phFuseRar[rar] and cost > 0 then
-				local ok, list = pcall(Fusion.spares, rar, album(), slotted, nil)
+			while e.phFuseRar[rar] and cost > 0 and alive() and e.phFuseOn and burst < 200 do
+				local ok, list = pcall(Fusion.spares, rar, snap, slotted, nil)
+				local sentOne = false
 				if ok and type(list) == "table" then
 					local by, n = {}, {}
 					for _, j in ipairs(list) do
@@ -4410,15 +4432,19 @@ task.spawn(function()
 							for _ = 1, j.spare do if #keys < cost then keys[#keys + 1] = j.key end end
 						end
 						pcall(CB.send, "fuse", rar, keys)
+						for _, k in ipairs(keys) do snap[k] = (snap[k] or 1) - 1 end
 						stats.fused += 1
+						burst += 1
 						stats.fuse = ("fuse %s x%d (%s) · รวม %d ครั้ง"):format(rar, cost, tostring(Fusion.biomes and Fusion.biomes[biome] or biome), stats.fused)
-						did = true
-						task.wait(1.8)   -- the panel locks 1.5s after a fuse
-						break           -- recount from scratch: the new card may feed the next rarity
+						did, sentOne = true, true
+						task.wait(0.25)
 					end
 				end
+				if not sentOne then break end
 			end
 		end
+		-- fused something: the new cards (next rarity) show up on the next snapshot
+		if did then task.wait(1.5); continue end
 		if not did then stats.fuse = ("ไม่มีการ์ดซ้ำพอ fuse (fuse ไปแล้ว %d ครั้ง)"):format(stats.fused) end
 	end
 end)
@@ -5183,6 +5209,8 @@ stats.fuseL:Dropdown({Name = "Rarity ที่จะ fuse", Multi = true, Requir
 		end
 		e.phFuseRar = sel; sv()
 	end}, "PHFuseRar")
+stats.fuseL:Toggle({Name = "ไม่ต้องโชว์อนิเมชัน fusion บนจอ", Default = e.phFuseHide,
+	Callback = function(v) e.phFuseHide = v; sv() end}, "PHFuseHide")
 stats.fuseL:Label({Text = "ใช้เฉพาะการ์ดซ้ำแบบธรรมดา (เก็บไว้ 1 ใบเสมอ · การ์ดที่ใส่ช่องไม่นับ)\nไม่เอาการ์ด gold / rainbow / holo ไป fuse\nCommon 20 · Uncommon 10 · Rare 10 · Epic 6 · Legendary 3 ใบ (biome เดียวกัน)"})
 stats.fuseR = Tabs.Fusion:Section({Side = "Right"})
 stats.fuseR:Header({Text = "สถานะ"})
