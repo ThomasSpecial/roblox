@@ -2333,6 +2333,13 @@ pcall(function()
 	local Classes = require(RS.Shared.Config.Classes)
 	local d = (Classes.defs or Classes)[plr:GetAttribute("Class") or ""]
 	if d and tonumber(d.attackRange) then ATTACK_RANGE = tonumber(d.attackRange) end
+	-- user: "auto farm ทำให้มันรองรับทุกอาชีพ": follow a job change without a reload
+	-- (Archer 38 / Mage 32 / Cleric 28 / Gunner+Summoner 26 / melee 5-6)
+	local cn = plr:GetAttributeChangedSignal("Class"):Connect(function()
+		local nd = (Classes.defs or Classes)[plr:GetAttribute("Class") or ""]
+		if nd and tonumber(nd.attackRange) then ATTACK_RANGE = tonumber(nd.attackRange) end
+	end)
+	task.spawn(function() while alive() do task.wait(2) end; cn:Disconnect() end)
 end)
 local function findEscape(pos, bossPos, prefDir)
 	local dg = inDG()
