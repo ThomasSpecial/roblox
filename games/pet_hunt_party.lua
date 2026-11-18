@@ -3794,9 +3794,13 @@ local stayAnchored, stayTarget = false, nil   -- stay-put mode: AUTO anchored on
 -- mostly out of reach and it stood there "waiting". Ranged now may step out as far as the
 -- spawn area is bigger than its gun reaches (area radius - attack range); a manual farm
 -- spot counts as a ~40-stud area. Melee keeps its 25.
+-- user: "เปิด auto ให้มันปรับระยะออโต้ตามสาย แต่ก็ custom ได้": phStayAuto (default on) = the
+-- class/spawn-area value below; dragging the slider switches to a custom phStayRadius.
+-- (an old saved phStayRadius from before the toggle = custom, so nothing changes for it)
+if e.phStayAuto == nil then e.phStayAuto = tonumber(e.phStayRadius) == nil end
 local function stayRadius(areaR)
 	local r = tonumber(e.phStayRadius)
-	if r then return math.max(0, r) end
+	if r and e.phStayAuto == false then return math.max(0, r) end
 	if ATTACK_RANGE < 20 then return 25 end
 	return math.max(0, math.floor((areaR or 40) - ATTACK_RANGE + 0.5))
 end
@@ -4165,6 +4169,7 @@ task.spawn(function()
 			-- shoot everything from the spot; melee needs room, so it walks out to fight
 			-- inside R and comes back when nothing's left / when dragged past R)
 			local R = stayRadius(spotR)
+			stats.stayR = R
 			local sp = hrp.Position
 			local atSpot = flatDist(sp, spot) <= 2.5 and math.abs(sp.Y - spot.Y) <= 4
 			local function inZone(m)
@@ -4947,10 +4952,32 @@ FL:Toggle({Name = "ฟาร์มภารกิจ Biomes ตอนไม่�
 	Callback = function(v) e.phGoalFarm = v; goalFarm.at = 0; sv() end}, "PHGoalFarm")
 FL:Toggle({Name = "ล่าการ์ดที่ยังไม่มี ตอนไม่มีบอส (แฟ้มที่มีการ์ดทองแล้วก่อน · ไม่ล่าการ์ดบอส)", Default = e.phCardHunt,
 	Callback = function(v) e.phCardHunt = v; goalFarm.at = 0; sv() end}, "PHCardHunt")
-FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
+stats.stayAutoT = FL:Toggle({Name = "└ ระยะเดินออกจากจุด: อัตโนมัติตามอาชีพ", Default = e.phStayAuto ~= false,
+	Callback = function(v)
+		e.phStayAuto = v; sv()
+		if v then pcall(function() stats.staySl:UpdateValue(stayRadius(stats.stayAreaR)) end) end
+	end}, "PHStayAuto")
+stats.staySl = FL:Slider({Name = "└ ระยะเดินออกจากจุดได้ (0 = ล็อกขา)", Minimum = 0, Maximum = 70, Default = stayRadius(),
 	Precision = 0, DisplayMethod = "Round", Suffix = " studs",
-	Callback = function(v) e.phStayRadius = math.floor(v + 0.5); sv() end}, "PHStayRadius")
-FL:Label({Text = "สายยิงไกล (ธนู): 0 = ยืนนิ่ง ยิงทุกตัวที่ถึงจากจุด\nสายตีใกล้: ~20-30 = เดินออกไปตีมอนในวงนี้ แล้วกลับมาที่จุดเอง\n(ยังไม่เคยปรับ = อัตโนมัติ: ยิงไกล = ขยับได้เท่าที่กองมอนกว้างกว่าระยะยิง (Gunner ยิงสั้นเลยขยับมากกว่าธนู) / ตีใกล้ 25)"})
+	Callback = function(v)
+		-- the player dragged it -> custom value, auto off
+		e.phStayRadius = math.floor(v + 0.5); e.phStayAuto = false; sv()
+		pcall(function() if stats.stayAutoT:GetState() then stats.stayAutoT:UpdateState(false) end end)
+	end}, "PHStayRadius")
+stats.stayLbl2 = FL:Label({Text = "-"})
+FL:Label({Text = "อัตโนมัติ: ยิงไกล = ขยับได้เท่าที่กองมอนกว้างกว่าระยะยิง (Archer 38 ขยับน้อย · Gunner 26 ขยับมาก) / ตีใกล้ 25\nเลื่อนแถบเอง = ใช้ค่าที่ตั้ง (ปิดอัตโนมัติให้) · เปิดอัตโนมัติอีกครั้ง = กลับไปใช้ค่าตามอาชีพ"})
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			local auto = e.phStayAuto ~= false
+			local r = auto and (stats.stayR or stayRadius()) or stayRadius()
+			if auto then stats.staySl:UpdateValue(r) end
+			stats.stayLbl2:UpdateName(("ตอนนี้ใช้: %d studs (%s · %s ระยะยิง %d)"):format(r, auto and "อัตโนมัติ" or "ตั้งเอง",
+				tostring(plr:GetAttribute("Class") or "?"), ATTACK_RANGE))
+		end)
+		task.wait(1)
+	end
+end)
 local stayLbl
 local function stayText()
 	local fp = e.phFarmPos
