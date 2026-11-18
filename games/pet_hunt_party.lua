@@ -4577,37 +4577,69 @@ local function equipBest()
 	local ok, g = pcall(GearState.get)
 	if not ok or type(g) ~= "table" or type(g.gear) ~= "table" then return end
 	local myClass = plr:GetAttribute("Class")
+	local myLv = tonumber(plr:GetAttribute("Level")) or 1
 	local equipped = g.equipped or {}
+	-- user: "auto equip มันไม่ใส่ชุดออโต้": it never checked the item level -- after a job
+	-- change (Summoner Lv10) it kept "equipping" Lv95 gear the server refuses, every cycle,
+	-- and the slots stayed empty. Now only what Equipment.usable() allows (class + level).
+	local function canWear(def)
+		if Equipment.usable then
+			local ok, r = pcall(Equipment.usable, def, myClass, myLv)
+			if ok then return r == true end
+		end
+		return (def.class == nil or def.class == myClass) and (tonumber(def.level) or 0) <= myLv
+	end
 	local function scoreOf(uid)
-		local piece = g.gear[uid]
+		local piece = uid and g.gear[uid]
 		local def = piece and Equipment.defs[piece.id]
 		if not def then return -1 end
 		return (tonumber(def.level) or 0) * 1e6 + (tonumber(def.lines) or 0) * 1e3 + (tonumber(piece.refine) or 0)
 	end
-	local best = {}
+	-- best piece per type; accessories keep the top TWO (two ring slots)
+	local ranked = {}
 	for uid, piece in pairs(g.gear) do
 		local def = Equipment.defs[piece.id]
-		if def and (def.class == nil or def.class == myClass) then
-			local slot = def.type
-			local score = scoreOf(uid)
-			if not best[slot] or score > best[slot].score then
-				best[slot] = {uid = uid, score = score}
+		if def and canWear(def) then
+			ranked[def.type] = ranked[def.type] or {}
+			table.insert(ranked[def.type], {uid = uid, score = scoreOf(uid)})
+		end
+	end
+	for _, list in pairs(ranked) do table.sort(list, function(a, b) return a.score > b.score end) end
+	local did = 0
+	local function equipUid(uid)
+		pcall(function() gearRemote:FireServer("equip", uid) end)
+		did += 1
+		stats.equipped += 1
+		task.wait(0.15)
+	end
+	for _, slot in ipairs(SLOTS) do
+		local list = ranked[slot]
+		if slot ~= "accessory" then
+			local b = list and list[1]
+			-- swap only when the best is STRICTLY better than what's on (equal-score
+			-- duplicates, e.g. two identical caps, must not churn the equip remote)
+			if b and equipped[slot] ~= b.uid and b.score > scoreOf(equipped[slot]) then equipUid(b.uid) end
+		elseif list then
+			-- rings: the server puts an equip into an EMPTY ring slot first (Equipment.slotFor),
+			-- else over slot 1 -- so take a worse ring off by its slot name, then equip
+			local want = {}
+			for i = 1, math.min(2, #list) do want[list[i].uid] = list[i] end
+			local have = {accessory = equipped.accessory, accessory2 = equipped.accessory2}
+			for _, w in pairs(want) do
+				if have.accessory ~= w.uid and have.accessory2 ~= w.uid then
+					-- free the weaker (or empty) ring slot if it beats what sits there
+					local s1, s2 = scoreOf(have.accessory), scoreOf(have.accessory2)
+					local tgt = (s1 <= s2) and "accessory" or "accessory2"
+					if w.score > math.min(s1, s2) then
+						if have[tgt] then pcall(function() gearRemote:FireServer("unequip", tgt) end); task.wait(0.2) end
+						equipUid(w.uid)
+						have[tgt] = w.uid
+					end
+				end
 			end
 		end
 	end
-	local did = 0
-	for _, slot in ipairs(SLOTS) do
-		local b = best[slot]
-		-- swap only when the best is STRICTLY better than what's on (equal-score
-		-- duplicates, e.g. two identical caps, must not churn the equip remote)
-		if b and equipped[slot] ~= b.uid and b.score > scoreOf(equipped[slot]) then
-			pcall(function() gearRemote:FireServer("equip", b.uid) end)
-			did += 1
-			stats.equipped += 1
-			task.wait(0.15)
-		end
-	end
-	stats.equip = did > 0 and ("สวมเพิ่ม " .. did .. " ชิ้น") or "ดีสุดแล้ว"
+	stats.equip = did > 0 and ("สวมเพิ่ม " .. did .. " ชิ้น") or "ดีสุดแล้ว (ใส่ได้ตามเลเวล/อาชีพ)"
 end
 
 task.spawn(function()
