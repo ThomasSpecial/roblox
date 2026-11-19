@@ -82,6 +82,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgSell = nil,         -- {[baseId] = {on, mains = {key = true}, pct}} (main line only)
 	phDgSellTiers = nil,    -- {normal = true, awakened = true, nightmare = true}
 	phDgSellRefined = false, -- also sell refined (+N) dungeon pieces
+	phWiki = true,          -- write the local wiki (workspace/PetHunt/wiki/index.html); data re-pulled when the game updates
 	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
 	phFuseRar = nil,        -- {Common = true, ...}
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
@@ -5790,6 +5791,48 @@ local STs = Tabs.Settings:Section({Side = "Left"})
 STs:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() W:SetState(not W:GetState()) end) end}, "PHToggleUIKeybind")
 STs:Label({Text = "กด RightShift เพื่อซ่อน/แสดงหน้าต่าง\nตั้งค่าเซฟที่: " .. getgenv().__PHP_SF})
+-- user: "อยากทำเว็บ wiki เวลารันสคริปให้มันรันเว็บวิกิ ดึงข้อมูลเกมมาแสดง ดึงแบบออโต้ เวลาเกม
+-- อัพเดตก็ให้ดึงมาด้วย" (local only). The builder lives in games/pet_hunt_wiki.lua; it writes
+-- index.html + data.mjs (re-pulled when PlaceVersion changes) + me.mjs (every minute).
+-- (a function, not a do-block: the main chunk is at the register limit)
+;(function()
+	STs:Header({Text = "เว็บวิกิ (ในเครื่อง)"})
+	STs:Toggle({Name = "สร้างเว็บวิกิ Pet Hunt อัตโนมัติ", Default = e.phWiki,
+		Callback = function(v) e.phWiki = v; sv() end}, "PHWiki")
+	local lbl = STs:Label({Text = "-"})
+	local function W() return getgenv().__PHP_WIKI end
+	STs:Button({Name = "ดึงข้อมูลเกมใหม่ตอนนี้", Callback = function()
+		task.spawn(function()
+			local w = W()
+			if not w then return end
+			w.page(); w.build(true); w.me()
+		end)
+	end})
+	STs:Label({Text = "เปิดไฟล์นี้ในเบราว์เซอร์ (บุ๊กมาร์กไว้ได้ กด F5 ดูข้อมูลล่าสุด):\n<โฟลเดอร์ workspace ของ executor>/PetHunt/wiki/index.html\nReal: %LOCALAPPDATA%\\Real\\workspace\\PetHunt\\wiki\\index.html"})
+	task.spawn(function()
+		task.wait(8)
+		if not alive() then return end
+		-- dev copy in the workspace wins, else the published builder
+		local src
+		pcall(function() if isfile("PetHunt/wiki/dev_wiki.lua") then src = readfile("PetHunt/wiki/dev_wiki.lua") end end)
+		if not src then
+			pcall(function() src = game:HttpGet("https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pet_hunt_wiki.lua?t=" .. os.time()) end)
+		end
+		local f = src and loadstring(src)
+		if f then pcall(f) end
+		local w = W()
+		if w and w.auto then w.auto(alive, function() return e.phWiki end) end
+	end)
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local w = W()
+				lbl:UpdateName("วิกิ: " .. (not e.phWiki and "ปิดอยู่" or (w and tostring(w.status) or "กำลังโหลดตัวสร้างวิกิ...")))
+			end)
+			task.wait(2)
+		end
+	end)
+end)()
 STs:Header({Text = "General"})
 STs:Toggle({Name = "Auto Reconnect (เน็ตหลุด/เซิร์ฟมีปัญหา → เข้าใหม่)", Default = e.phReconnect,
 	Callback = function(v) e.phReconnect = v; sv() end}, "PHReconnect")
