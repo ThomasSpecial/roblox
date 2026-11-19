@@ -3372,6 +3372,24 @@ local function dgTick(hum, hrp)
 				stand = Vector3.new(prev.X, pos.Y, prev.Z)
 			end
 			dgMark.stand = stand
+			-- user: "จังหวะหลบสกิลบอส ... จะทำให้มันไวที่สุด" / "เวลาวิ่งมันก็ตีบอสได้": after a dodge we
+			-- walked straight back to the orbit spot (>5 away = walk), often into the next
+			-- telegraph -- 28 dodges + 18 rolls + ~20s of "กลับกลางห้อง" in a 61s boss fight.
+			-- Where we already stand is good enough when: target in reach, clean, inside the
+			-- closing ring with margin, not under the boss, not drifting off the centre.
+			-- Then HOLD it (we shoot from anywhere in range) and only walk once it turns bad.
+			if not dodging then
+				local bpN = boss and boss.PrimaryPart and boss.PrimaryPart.Position
+				local srN, scN = shrinkRadius()
+				local keepOff = math.min(10, math.max(reachOf(best) - 2, 0))   -- melee still has to stand close
+				if inReach(best, pos) and safeEverywhere(pos) and inFightArena(pos, 2)
+					and (not srN or flatDist(pos, scN) <= srN - SHRINK_MARGIN - 3)
+					and (not bpN or flatDist(pos, bpN) >= keepOff)
+					and flatDist(pos, anchor) <= 30 then
+					stand = Vector3.new(pos.X, pos.Y, pos.Z)
+					dgMark.stand = stand
+				end
+			end
 		else
 			dgMark.stand = nil
 		end
