@@ -25,7 +25,7 @@
   --r-Common:#b0b6c4;--r-Uncommon:#60ce76;--r-Rare:#489aff;--r-Epic:#b262ff;--r-Legendary:#ffac2c;
   --r-Mythic:#ff4880;--r-Transcendent:#78fae1;--r-Cosmic:#a58cff;--r-Secret:#fadc78;}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Noto Sans Thai","Leelawadee UI","Segoe UI",system-ui,sans-serif}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 "Noto Sans Thai","Leelawadee UI","Segoe UI",system-ui,sans-serif}
 a{color:var(--accent);text-decoration:none;cursor:pointer}
 header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 header h1{font-size:17px;margin:0;white-space:nowrap}
@@ -66,6 +66,19 @@ code,.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
 .calc label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:2px}
 .calc input{padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text)}
 .empty{padding:40px;text-align:center;color:var(--muted)}
+.big{font-size:26px;font-weight:700;line-height:1.2}
+.answer{display:flex;gap:10px;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line)}
+.answer:last-child{border-bottom:0}
+.answer .rank{min-width:22px;color:var(--muted)}
+.answer .main{flex:1}
+.answer .val{font-weight:600;white-space:nowrap}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
+.tile{display:block;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;color:var(--text)}
+.tile:hover{border-color:var(--accent)}
+.tile b{display:block;font-size:15px}
+.tile span{font-size:12.5px;color:var(--muted)}
+details.card summary{cursor:pointer;font-weight:600}
+.toggle{display:inline-flex;gap:6px;align-items:center;font-size:13px;cursor:pointer}
 @media (max-width:640px){main{padding:10px}header{padding:8px 10px}nav{padding:6px 10px}}
 </style>
 </head>
@@ -108,8 +121,13 @@ const optByKey = {}; (EQ.options || []).forEach(o => optByKey[o.key] = o);
 // stat keys shown as percentages
 const PCT = new Set(["crit","aspd","cdr","lifesteal","critDmg","armorPen","dmgReduce","thorns","summonAspd","potionPct","spRegen"]);
 const isPct = k => PCT.has(k) || /Pct$/.test(k);
-const statName = k => (EQ.lineNames || {})[k] || ({maxSp:"Max SP",maxSpPct:"Max SP",potionPct:"Potion Heal",thorns:"Thorns",spRegen:"SP Regen",
-  summonAspd:"Pack Attack Speed",summonTime:"Pack Duration",hp:"HP",sp:"SP"})[k] || k;
+const TH = {str:"STR",agi:"AGI",vit:"VIT",int:"INT",dex:"DEX",luk:"LUK",atk:"พลังโจมตี",atkPct:"พลังโจมตี %",def:"ป้องกัน",
+  maxHp:"HP สูงสุด",maxHpPct:"HP สูงสุด %",maxSp:"SP สูงสุด",maxSpPct:"SP สูงสุด %",crit:"โอกาสคริ",critDmg:"แรงคริ",aspd:"ความเร็วตี",
+  cdr:"ลดคูลดาวน์",dmgPct:"ดาเมจ %",bossDmgPct:"ดาเมจใส่บอส",expPct:"EXP เพิ่ม",goldPct:"ทองเพิ่ม",dropPct:"อัตราดรอป",
+  moveSpeed:"ความเร็วเดิน",skillPct:"พลังสกิล",armorPen:"เจาะเกราะ",lifesteal:"ดูดเลือด",dmgReduce:"ลดดาเมจที่โดน",healPct:"พลังฮีล",
+  summonPct:"ดาเมจสัตว์เลี้ยง",summonAspd:"ความเร็วตีสัตว์เลี้ยง",summonTime:"เวลาสัตว์เลี้ยง",potionPct:"ยาฮีลแรงขึ้น",thorns:"สะท้อนดาเมจ",
+  spRegen:"ฟื้น SP",hp:"HP",sp:"SP"};
+const statName = k => TH[k] || (EQ.lineNames || {})[k] || k;
 const num = (x, d = 0) => (x == null || isNaN(x)) ? "-" : Number(x).toLocaleString("en-US", {maximumFractionDigits: d, minimumFractionDigits: 0});
 const fmtStat = (k, v) => {
   if (typeof v !== "number") return esc(String(v));
@@ -232,7 +250,7 @@ function openRef(ref) {
 // --------------------------------------------------------------- pages
 const PAGES = [
   ["home", "ภาพรวม"], ["me", "ตัวฉัน"], ["classes", "อาชีพ"], ["options", "ออฟชั่นอุปกรณ์"], ["gear", "อุปกรณ์"],
-  ["monsters", "มอนสเตอร์ & คำนวณดาเมจ"], ["bosses", "บอส"], ["cards", "การ์ด"], ["items", "ไอเทม"],
+  ["monsters", "ฟาร์มมอน"], ["bosses", "บอส"], ["cards", "การ์ด"], ["items", "ไอเทม"],
   ["dungeons", "ดันเจี้ยน"], ["formulas", "สูตร & ตีบวก"],
 ];
 const state = {page: (location.hash || "#home").slice(1), q: "", focus: null};
@@ -240,39 +258,53 @@ window.addEventListener("hashchange", () => { state.page = location.hash.slice(1
 
 const P = {};
 P.home = () => {
-  const mons = Object.values(MON.defs || {});
-  const c = (f) => mons.filter(f).length;
-  return `<h2>ภาพรวม</h2>
-  <div class="grid">
-    <div class="card"><h3 style="margin-top:0">ข้อมูลเกม</h3><div class="kv">
-      <b>เวอร์ชันเกม</b><span>${D.meta.placeVersion}</span>
-      <b>ดึงข้อมูลเมื่อ</b><span>${when(D.meta.dumpedAt)} <span class="muted small">(${ago(D.meta.dumpedAt)})</span></span>
-      <b>มอนสเตอร์</b><span>${c(m => m.role === "normal")} ธรรมดา · ${c(m => m.role === "elite")} Elite · ${c(m => m.role === "boss")} บอส</span>
-      <b>อุปกรณ์</b><span>${Object.keys(EQ.defs || {}).length} ชิ้น</span>
-      <b>การ์ด</b><span>${Object.keys(CARDS.defs || {}).length + Object.keys(DG.cards || {}).length} ใบ</span>
-      <b>ไอเทม</b><span>${Object.keys(ITEMS).length} ชนิด</span>
-      <b>ฟิลด์</b><span>${fields.length}</span>
-    </div></div>
-    <div class="card"><h3 style="margin-top:0">ตัวละคร</h3>${ME ? `<div class="kv">
-      <b>ชื่อ</b><span>${esc(ME.display)} <span class="muted">@${esc(ME.name)}</span></span>
-      <b>อาชีพ</b><span>${esc(myClass)} Lv ${myLv}</span>
-      <b>Power</b><span>${num(A.Power)}</span>
-      <b>ATK / DEF / HP</b><span>${num(A.Atk)} / ${num(A.Def)} / ${num(A.MaxHp)}</span>
-      <b>อัปเดตเมื่อ</b><span>${ago(ME.at)}</span></div>` : `<span class="muted">ยังไม่มีข้อมูลตัวละคร (me.mjs)</span>`}</div>
-    <div class="card"><h3 style="margin-top:0">อัปเดตยังไง</h3>
-      <div class="small">เปิดสคริป Pet Hunt ในเกม → สคริปเช็กเวอร์ชันเกม (PlaceVersion)<br>
-      • เกมอัปเดต → ดึงข้อมูลใหม่ทั้งหมดจาก config ของเกมเอง เขียนทับ <code>data.mjs</code><br>
-      • ข้อมูลตัวละคร (<code>me.mjs</code>) อัปเดตทุก 1 นาทีขณะเล่น<br>
-      กด F5 ที่หน้านี้เพื่อดูข้อมูลล่าสุด</div></div>
+  // normal monsters only: elites come a few at a time and respawn in 10s, so their rate is not sustainable
+  const rows = farmRows(fieldMobs().filter(m => m.role === "normal" && fieldOpen(m.set) && m.level <= (calc.lv || 99) + 5));
+  const top = (k, n) => rows.slice().sort((a, b) => b[k] - a[k]).slice(0, n);
+  const eq = (ME && ME.equipped) || {};
+  let bad = 0, legacy = 0, lines = 0;
+  Object.values(eq).forEach(p => (p.options || []).forEach(l => { lines++; if (!lineWorks(l.key, myClass)) bad++; if (optByKey[l.key] && optByKey[l.key].legacy) legacy++; }));
+  const capped = Array.isArray(A.BonusCapped) ? A.BonusCapped : Object.keys(A.BonusCapped || {});
+  const tile = (pg, t, d) => `<a class="tile" href="#${pg}"><b>${t}</b><span>${d}</span></a>`;
+  const ans = (r, i, val) => `<div class="answer"><span class="rank">${i + 1}.</span><span class="main"><a data-go="mon:${esc(r.id)}"><b>${esc(r.name)}</b></a> <span class="muted small">· ${esc(fieldName(r.set))} · Lv ${r.level} · ฆ่าใน ${dur(r._ttk)}</span></span><span class="val">${val}</span></div>`;
+  return `<h2>สวัสดี${ME ? " " + esc(ME.display) : ""} 👋 <span class="muted small">${ME ? `${esc(myClass)} Lv ${myLv}` : ""}</span></h2>
+  <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(380px,1fr))">
+    <div class="card"><h3 style="margin-top:0">💰 ฟาร์มทองที่ไหนดี</h3><div class="small muted">มอนธรรมดา · คิดจากสเตตัสของคุณ ตีทีละตัว (ใช้สกิลหมู่จะได้มากกว่านี้)</div>
+      ${top("_gps", 5).map((r, i) => ans(r, i, num(r._gps, 0) + " ทอง/วิ")).join("")}
+      <div style="margin-top:8px"><a href="#monsters">ดูทั้งหมด →</a></div></div>
+    ${myLv < ((D.leveling || {}).maxLevel || 99) ? `<div class="card"><h3 style="margin-top:0">⭐ เก็บเลเวลที่ไหนดี</h3><div class="small muted">EXP ต่อวินาทีสูงสุด</div>
+      ${top("_eps", 5).map((r, i) => ans(r, i, num(r._eps, 0) + " EXP/วิ")).join("")}</div>` : ""}
+    <div class="card"><h3 style="margin-top:0">🛡️ ของที่ใส่อยู่</h3>${ME ? `
+      <div class="answer"><span class="main">บรรทัดที่ <b>ไม่มีผล</b> กับ ${esc(myClass)}</span><span class="val ${bad ? "" : ""}" style="color:var(--${bad ? "bad" : "good"})">${bad} / ${lines}</span></div>
+      <div class="answer"><span class="main">บรรทัด Attack แบบเก่า (ยังได้ผล)</span><span class="val">${legacy}</span></div>
+      <div class="answer"><span class="main">สเตตัสที่ชนเพดานแล้ว</span><span class="val" style="color:var(--${capped.length ? "warn" : "good"})">${capped.length ? capped.map(statName).join(", ") : "ไม่มี"}</span></div>
+      <div class="answer"><span class="main">โอกาสคริ</span><span class="val">${num(Math.min(1, A.Crit || 0) * 100, 1)}%${A.Crit >= 1 ? " (ตันแล้ว)" : ""}</span></div>
+      <div style="margin-top:8px"><a href="#me">ดูรายละเอียด →</a></div>` : '<span class="muted">เปิดสคริปในเกมแล้วรอ 1 นาที</span>'}</div>
   </div>
-  <div class="card"><h3 style="margin-top:0">ฟิลด์</h3>${table("fields", fields.map((f, i) => ({...f, i})), [
+  <h3>อยากรู้เรื่องอะไร</h3>
+  <div class="tiles">
+    ${tile("me", "🧍 ตัวฉัน", "สเตตัส ของที่ใส่ บรรทัดไหนไม่มีผล โบนัสรวม")}
+    ${tile("monsters", "🐾 ฟาร์มมอน", "มอนทุกตัว ฆ่ากี่วิ ทอง/EXP ต่อวินาที ของดรอป %")}
+    ${tile("bosses", "👑 บอส", "บอสฟิลด์ World Boss บอสดัน · ดรอป การ์ด สกิล")}
+    ${tile("cards", "🃏 การ์ด", "การ์ดทุกใบ ดรอปจากไหน โอกาสจริง Fusion")}
+    ${tile("options", "📜 ออฟชั่นอุปกรณ์", "ออฟชั่นไหนใช้กับอาชีพไหน โรลได้เท่าไหร่")}
+    ${tile("gear", "⚔️ อุปกรณ์", "อุปกรณ์ทุกชิ้น ค่าพื้นฐาน ได้จากไหน")}
+    ${tile("dungeons", "🏰 ดันเจี้ยน", "ของดรอปแต่ละความยาก หีบ ราคากุญแจ")}
+    ${tile("items", "🎒 ไอเทม", "ไอเทมทุกชนิด ราคาขาย ดรอปจากไหน")}
+    ${tile("classes", "🎓 อาชีพ", "สเตตัสตามเลเวล สกิล อาชีพที่ 2")}
+    ${tile("formulas", "🧮 สูตร & ตีบวก", "สูตรดาเมจ ผลของแต้มสเตตัส โอกาสตีบวก")}
+  </div>
+  <details class="card" style="margin-top:14px"><summary>ข้อมูลเกม & ฟิลด์ทั้งหมด</summary>
+    <div class="kv" style="margin:10px 0"><b>เวอร์ชันเกม</b><span>${D.meta.placeVersion} · ดึงเมื่อ ${when(D.meta.dumpedAt)}</span>
+      <b>อัปเดตยังไง</b><span>เปิดสคริปในเกม → เกมอัปเดตเมื่อไหร่ ดึงข้อมูลใหม่ให้เอง · ข้อมูลตัวละครอัปเดตทุก 1 นาที · กด F5 ที่หน้านี้</span></div>
+    ${table("fields", fields.map((f, i) => ({...f, i})), [
     {h: "#", k: "i", num: true, v: r => r.i + 1},
     {h: "ฟิลด์", k: "name"},
     {h: "เลเวลมอน", k: r => (r.levels || [0])[0], v: r => r.levels ? r.levels.join(" - ") : "-"},
     {h: "บอสฟิลด์", k: "boss", v: r => r.boss ? `<a data-go="mon:${esc(r.boss)}">${esc(nameOf(r.boss))}</a>` : "-"},
     {h: "เงื่อนไขเข้า", k: r => r.gate && r.gate.level, v: r => r.gate ? [r.gate.level ? "Lv " + r.gate.level : "", r.gate.boss ? "ชนะ " + esc(nameOf(r.gate.boss)) : ""].filter(Boolean).join(" · ") || "-" : "-"},
-    {h: "เปิด", k: "opensAt", v: r => r.opensAt ? (r.opensAt * 1000 > Date.now() ? `<span class="pill warn">${when(r.opensAt)}</span>` : `<span class="pill good">เปิดแล้ว</span>`) : `<span class="pill good">เปิดแล้ว</span>`},
-  ])}</div>`;
+    {h: "เปิด", k: "opensAt", v: r => fieldOpen(r.id) ? `<span class="pill good">เปิดแล้ว</span>` : `<span class="pill warn">${when(r.opensAt)}</span>`},
+  ])}</details>`;
 };
 
 P.me = () => {
@@ -315,7 +347,7 @@ P.me = () => {
   <div class="card"><h3 style="margin-top:0">โบนัสรวม (Bonus) แยกที่มา</h3>
     <div class="small muted">รวม = ทุกแหล่ง (ของ การ์ด สกิลติดตัว ความสำเร็จ ฯลฯ) · จากบรรทัดโรล = เฉพาะออฟชั่นอุปกรณ์ (มีเพดาน) · บอส = การ์ดบอส${capped.length ? ` · <span class="pill bad">ชนเพดาน: ${capped.map(statName).join(", ")}</span>` : ""}</div>
     ${table("mybonus", bonusRows, [
-      {h: "สเตตัส", k: "k", v: r => esc(statName(r.k)) + ` <span class="muted small">${r.k}</span>`},
+      {h: "สเตตัส", k: "k", v: r => esc(statName(r.k))},
       {h: "รวม", k: "total", num: true, v: r => fmtStat(r.k, r.total)},
       {h: "จากบรรทัดโรล", k: "rolled", num: true, v: r => r.rolled ? fmtStat(r.k, r.rolled) : "-"},
       {h: "เพดานบรรทัดโรล", k: "cap", num: true, v: r => r.cap != null ? fmtStat(r.k, r.cap) + (r.rolled >= r.cap - 1e-9 ? ' <span class="pill bad">ตัน</span>' : "") : "-"},
@@ -363,17 +395,18 @@ P.options = () => {
   const lvKey = levels.includes(lv) ? lv : levels[levels.length - 1];
   const R = (EQ.rangesByLevel || {})[String(lvKey)] || {lines: {}, mains: {}};
   const pool = (EQ.lineChanceByClass || {})[cls] || {};
-  const rows = (EQ.options || []).map(o => ({...o, works: !o.classes || o.classes.includes(cls), chance: pool[o.key], range: R.lines[o.key]}));
+  const onlyMine = store.get("optMine", true);
+  const rows = (EQ.options || []).map(o => ({...o, works: !o.classes || o.classes.includes(cls), chance: pool[o.key], range: R.lines[o.key]}))
+    .filter(o => !onlyMine || o.works || o.legacy);
   const mains = Object.entries(EQ.mainOptions || {});
-  return `<h2>ออฟชั่นอุปกรณ์ (บรรทัดที่โรล)</h2>
-  <div class="note">เกมแยกออฟชั่นตามสายชัดเจน: ออฟชั่นที่มีรายชื่ออาชีพ ใส่อาชีพอื่นแล้ว <b>ไม่มีผล</b> และจะสุ่มออกเฉพาะของที่ตรงสาย (อาวุธใช้สายของอาวุธ ชุดใช้สายของคนที่ดรอป) ·
-  ออฟชั่น <b>legacy</b> (เช่น Attack แบบค่าตายตัว) เกมเลิกสุ่มแล้ว แต่ของที่มีอยู่ยังได้ค่าเต็มทุกอาชีพ</div>
+  return `<h2>ออฟชั่นอุปกรณ์</h2>
+  <div class="note">• ออฟชั่นบางตัวเป็นของสายเดียว ใส่อาชีพอื่นแล้ว <b>ไม่มีผล</b><br>• <b>พลังโจมตีแบบค่าตายตัว</b> เกมเลิกสุ่มแล้ว แต่ของที่มีอยู่ยังได้ผลเต็มทุกอาชีพ<br>• "ช่วงค่า" = โรลได้ต่ำสุด ~ สูงสุด ที่เลเวลของชิ้นที่เลือก</div>
   <div class="filters">
     <label>อาชีพ <select id="optCls">${(CL.list || []).map(c => `<option ${c === cls ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></label>
     <label>เลเวลของชิ้น <select id="optLv">${levels.map(l => `<option ${l === lvKey ? "selected" : ""}>${l}</option>`).join("")}</select></label>
-    <span class="muted small">ช่วงค่าโรล = ข้อความเดียวกับที่เกมใช้ (lineOdds) ที่เลเวลนั้น</span></div>
+    <label class="toggle"><input type="checkbox" id="optMine" ${onlyMine ? "checked" : ""}> เฉพาะที่ได้ผลกับอาชีพนี้</label></div>
   ${table("opts", rows, [
-    {h: "ออฟชั่น", k: r => statName(r.key), v: r => `<b>${esc(statName(r.key))}</b> <span class="muted small">${r.key}</span>`},
+    {h: "ออฟชั่น", k: r => statName(r.key), v: r => `<b title="${esc((EQ.lineNames || {})[r.key] || r.key)}">${esc(statName(r.key))}</b>`},
     {h: "ใช้กับ " + esc(cls), k: r => r.works ? 1 : 0, v: r => r.legacy ? '<span class="pill warn">legacy · ยังได้ผล</span>' : r.works ? '<span class="pill good">ได้ผล</span>' : '<span class="pill bad">ไม่มีผล</span>'},
     {h: "สายที่ใช้ได้", k: r => r.classes ? r.classes.join() : "", v: r => r.classes ? r.classes.map(c => `<span class="pill ${c === cls ? "good" : ""}">${esc(c)}</span>`).join("") : '<span class="muted">ทุกอาชีพ</span>'},
     {h: `ช่วงค่าที่ Lv ${lvKey}`, k: r => r.range || "", v: r => r.range ? esc(r.range) : (r.legacy ? '<span class="muted">ไม่สุ่มแล้ว</span>' : '<span class="muted">-</span>')},
@@ -415,6 +448,16 @@ P.gear = () => {
   }, {i: 3, d: -1})}`;
 };
 
+function farmRows(list) {
+  return list.map(m => {
+    const hit = hitOn(m), hits = Math.ceil(m.hp / Math.max(1, hit)), ttk = hits * calc.interval;
+    const gold = ((m.gold || [0, 0])[0] + (m.gold || [0, 0])[1]) / 2 * (1 + calc.goldPct), exp = (m.exp || 0) * (1 + calc.expPct);
+    const cyc = ttk + (calc.travel || 0);
+    return {...m, _hit: hit, _hits: hits, _ttk: ttk, _gps: gold / cyc, _eps: exp / cyc, _gold: gold};
+  });
+}
+const fieldMobs = () => Object.values(MON.defs || {}).filter(m => !m.dungeon && !m.dungeonBoss && m.set !== "dungeon" && m.respawn != null && m.role !== "boss");
+const fieldOpen = id => { const f = fields.find(z => z.id === id); return !f || !f.opensAt || f.opensAt * 1000 <= Date.now(); };
 P.monsters = () => {
   const f = store.get("monF", {field: "", role: ""});
   const q = (state.q || "").toLowerCase();
@@ -424,39 +467,39 @@ P.monsters = () => {
   if (f.role) rows = rows.filter(m => m.role === f.role);
   if (f.field) rows = rows.filter(m => m.set === f.field);
   if (q) rows = rows.filter(m => (m.name || "").toLowerCase().includes(q) || m.id.includes(q));
-  rows = rows.map(m => {
-    const hit = hitOn(m), hits = Math.ceil(m.hp / Math.max(1, hit)), ttk = hits * calc.interval;
-    const gold = ((m.gold || [0, 0])[0] + (m.gold || [0, 0])[1]) / 2 * (1 + calc.goldPct), exp = (m.exp || 0) * (1 + calc.expPct);
-    const cyc = ttk + (calc.travel || 0);
-    return {...m, _hit: hit, _hits: hits, _ttk: ttk, _gps: gold / cyc, _eps: exp / cyc, _gold: gold};
-  });
+  rows = farmRows(rows);
+  const full = store.get("monFull", false);
   const inp = (k, label, step) => `<label>${label}<input data-calc="${k}" type="number" step="${step || "any"}" value="${calc[k]}"></label>`;
-  return `<h2>มอนสเตอร์ & คำนวณดาเมจ <span class="muted small">${rows.length} ตัว · กดแถวดูของดรอป</span></h2>
-  <div class="card"><h3 style="margin-top:0">ค่าของฉันที่ใช้คำนวณ ${ME ? `<span class="muted small">(ดึงจากตัวละคร ${ago(ME.at)} · แก้ได้)</span>` : ""}</h3>
-    <div class="calc">${inp("atk", "ATK")}${inp("lv", "เลเวล", 1)}${inp("crit", "Crit Rate (0-1)")}${inp("critDmg", "Crit Damage เพิ่ม (0.2 = +20%)")}${inp("armorPen", "Armor Pierce (สูงสุด 0.5)")}
-    ${inp("dmgPct", "Damage % (0.1 = +10%)")}${inp("bossDmgPct", "Boss Damage %")}${inp("interval", "ตีทุก (วินาที)")}${inp("goldPct", "Gold % รวม")}${inp("expPct", "EXP % รวม")}${inp("travel", "เวลาเดินหาตัวถัดไป (วิ)")}</div>
-    <div style="margin-top:8px"><button id="calcReset">ใช้ค่าจากตัวละครตอนนี้</button></div>
-    <div class="warnbox">ตัวเลขดาเมจเป็นค่าประมาณจากสูตรในโค้ดเกม (Formulas.damage): ATK × (1 + Damage% [+ Boss%]) × ส่วนต่างเลเวล − DEF×0.5 เฉลี่ยรวมคริ · คิดเฉพาะการตีปกติ ไม่รวมสกิลและออร่า ส่วนนี้คำนวณบนเซิร์ฟเวอร์ ค่าจริงอาจต่างได้</div></div>
-  <div class="filters">
-    <select data-f="monF.field"><option value="">ทุกฟิลด์</option>${fields.map(z => `<option value="${z.id}" ${f.field === z.id ? "selected" : ""}>${esc(z.name)}</option>`).join("")}</select>
-    <select data-f="monF.role"><option value="">ธรรมดา + Elite</option><option value="normal" ${f.role === "normal" ? "selected" : ""}>ธรรมดา</option><option value="elite" ${f.role === "elite" ? "selected" : ""}>Elite</option><option value="boss" ${f.role === "boss" ? "selected" : ""}>บอส</option></select>
-  </div>
-  ${table("mons", rows, [
+  const cols = [
     {h: "มอน", k: "name", v: r => `<b data-id="${esc(r.id)}">${esc(r.name)}</b> ${r.role !== "normal" ? `<span class="pill ${r.role === "boss" ? "bad" : "warn"}">${roleTh(r.role)}</span>` : ""}`},
     {h: "ฟิลด์", k: r => fieldOrder(r.set), v: r => esc(fieldName(r.set))},
     {h: "Lv", k: "level", num: true},
-    {h: "HP", k: "hp", num: true, v: r => num(r.hp)},
-    {h: "ATK", k: "atk", num: true, v: r => num(r.atk)},
-    {h: "DEF", k: "def", num: true, v: r => num(r.def)},
-    {h: "EXP", k: "exp", num: true, v: r => num(r.exp)},
-    {h: "ทอง", k: r => r._gold, num: true, v: r => (r.gold || []).join("-")},
-    {h: "เกิดใหม่", k: "respawn", num: true, v: r => r.respawn != null ? r.respawn + "s" : "-"},
-    {h: "ดาเมจ/ตี", k: "_hit", num: true, v: r => num(r._hit)},
-    {h: "ตีกี่ที", k: "_hits", num: true, v: r => num(r._hits)},
-    {h: "เวลาฆ่า", k: "_ttk", num: true, v: r => dur(r._ttk)},
-    {h: "ทอง/วิ", k: "_gps", num: true, v: r => num(r._gps, 1)},
-    {h: "EXP/วิ", k: "_eps", num: true, v: r => num(r._eps, 0)},
-  ], monDetail, {i: 12, d: -1})}`;
+    ...(full ? [
+      {h: "HP", k: "hp", num: true, v: r => num(r.hp)},
+      {h: "ATK", k: "atk", num: true, v: r => num(r.atk)},
+      {h: "DEF", k: "def", num: true, v: r => num(r.def)},
+      {h: "EXP", k: "exp", num: true, v: r => num(r.exp)},
+      {h: "ทองที่ดรอป", k: r => r._gold, num: true, v: r => (r.gold || []).join("-")},
+      {h: "เกิดใหม่", k: "respawn", num: true, v: r => r.respawn != null ? r.respawn + "s" : "-"},
+      {h: "ดาเมจ/ตี", k: "_hit", num: true, v: r => num(r._hit)},
+      {h: "ตีกี่ที", k: "_hits", num: true, v: r => num(r._hits)}] : []),
+    {h: "ฆ่าได้ใน", k: "_ttk", num: true, v: r => dur(r._ttk)},
+    {h: "ทอง / วินาที", k: "_gps", num: true, v: r => `<b>${num(r._gps, 0)}</b>`},
+    {h: "EXP / วินาที", k: "_eps", num: true, v: r => num(r._eps, 0)},
+  ];
+  return `<h2>ฟาร์มมอน <span class="muted small">${rows.length} ตัว · เรียงจากทองต่อวินาทีมากสุด · กดที่ชื่อเพื่อดูของดรอป</span></h2>
+  <div class="filters">
+    <select data-f="monF.field"><option value="">ทุกฟิลด์</option>${fields.map(z => `<option value="${z.id}" ${f.field === z.id ? "selected" : ""}>${esc(z.name)}</option>`).join("")}</select>
+    <select data-f="monF.role"><option value="">มอนธรรมดา + Elite</option><option value="normal" ${f.role === "normal" ? "selected" : ""}>ธรรมดา</option><option value="elite" ${f.role === "elite" ? "selected" : ""}>Elite</option><option value="boss" ${f.role === "boss" ? "selected" : ""}>บอส</option></select>
+    <label class="toggle"><input type="checkbox" id="monFull" ${full ? "checked" : ""}> แสดงตัวเลขทั้งหมด</label>
+  </div>
+  ${table("mons", rows, cols, monDetail, {i: cols.length - 2, d: -1})}
+  <details class="card" style="margin-top:14px"><summary>ตัวเลขพวกนี้คิดจากอะไร / แก้ค่าที่ใช้คำนวณ ${ME ? `<span class="muted small">(ตอนนี้ใช้สเตตัสของ ${esc(ME.display)})</span>` : ""}</summary>
+    <div class="calc">${inp("atk", "ATK")}${inp("lv", "เลเวล", 1)}${inp("crit", "Crit Rate (0-1)")}${inp("critDmg", "Crit Damage เพิ่ม (0.2 = +20%)")}${inp("armorPen", "Armor Pierce (สูงสุด 0.5)")}
+    ${inp("dmgPct", "Damage % (0.1 = +10%)")}${inp("bossDmgPct", "Boss Damage %")}${inp("interval", "ตีทุก (วินาที)")}${inp("goldPct", "Gold % รวม")}${inp("expPct", "EXP % รวม")}${inp("travel", "เวลาเดินหาตัวถัดไป (วิ)")}</div>
+    <div style="margin-top:8px"><button id="calcReset">ใช้ค่าจากตัวละครตอนนี้</button></div>
+    <div class="warnbox">ค่าประมาณจากสูตรในโค้ดเกม: คิดเฉพาะการตีปกติ ไม่รวมสกิล · ทอง/วินาที = ทองที่มอนดรอป (รวมโบนัสทอง) ÷ (เวลาฆ่า + เวลาเดินหาตัวถัดไป) ไม่รวมเงินจากขายของ</div></details>
+`;
 };
 function monDetail(m) {
   const card = (CARDS.defs || {})[m.petId || m.id];
@@ -621,6 +664,8 @@ function render() {
   bind("clsLv", "clsLv", v => Math.max(1, Math.min(99, parseInt(v) || 1)));
   bind("optLv", "optLv", v => parseInt(v));
   bind("optCls", "optCls", v => v);
+  const chk = (id, key) => { const el = $("#" + id); if (el) el.onchange = () => { store.set(key, el.checked); render(); }; };
+  chk("monFull", "monFull"); chk("optMine", "optMine");
   const cr = $("#calcReset"); if (cr) cr.onclick = () => { calc = round4(calcDefault()); store.set("calc", calc); render(); };
 }
 // global search: jump to the page that has the best hit
