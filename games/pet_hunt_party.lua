@@ -78,6 +78,10 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phTowerEnter = false,   -- in town: enter the Endless Tower by itself (solo / as party leader)
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
+	phDgSellOn = false,     -- Auto Sell dungeon gear by per-item option rules (tab "ขายของดัน") -- user: default off, never flip it for them
+	phDgSell = nil,         -- {[baseId] = {on, opts = {key = true}, mains = {key = true}, pct, need}}
+	phDgSellTiers = nil,    -- {normal = true, awakened = true, nightmare = true}
+	phDgSellRefined = false, -- also sell refined (+N) dungeon pieces
 	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
 	phFuseRar = nil,        -- {Common = true, ...}
 	phChestWalk = true,     -- Auto Chest on: walk to party chests within 150 studs (server checks range)
@@ -4972,6 +4976,7 @@ local Tabs = {
 	Boss = TG:Tab({Name = "Auto Boss", Image = "rbxassetid://10723346959"}),
 	Dungeon = TG:Tab({Name = "ดันเจี้ยน", Image = "rbxassetid://10723396107"}),
 	Sell = TG:Tab({Name = "Auto Sell", Image = "rbxassetid://10709769841"}),
+	DgSell = TG:Tab({Name = "ขายของดัน", Image = "rbxassetid://10709769841"}),
 	Fusion = TG:Tab({Name = "Auto Fusion", Image = "rbxassetid://10723396107"}),
 	Gear = TG:Tab({Name = "เก็บ/สวม", Image = "rbxassetid://10723345576"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
@@ -5291,7 +5296,7 @@ do
 	end
 	refreshLvVisibility()
 end
-SLs:Label({Text = "ไม่ขายเด็ดขาด: Tier V, ของดันเจี้ยน (DG), ของที่ lock, ที่ใส่อยู่, ของราคา 0\n(ใช้คำสั่งขายปกติของเกม ไม่ต้องมี Auto Sell Pass)"})
+SLs:Label({Text = "ไม่ขายเด็ดขาด: Tier V, ของดันเจี้ยน (DG), ของที่ lock, ที่ใส่อยู่, ของราคา 0\n(ของดันตั้งขายแยกได้ที่แท็บ \"ขายของดัน\")\n(ใช้คำสั่งขายปกติของเกม ไม่ต้องมี Auto Sell Pass)"})
 SLs:Header({Text = "ขยะจากมอน (วัตถุดิบ)"})
 SLs:Toggle({Name = "ขายวัตถุดิบอัตโนมัติ (ปุ่ม SELL LOOT ของเกม)", Default = e.phSellMats,
 	Callback = function(v) e.phSellMats = v; sv() end}, "PHSellMats")
@@ -5334,6 +5339,443 @@ end)
 local SRs = Tabs.Sell:Section({Side = "Right"})
 SRs:Header({Text = "สถานะ"})
 local sellLbl = SRs:Label({Text = "-"})
+
+-- ------------------------------------------------- auto sell: dungeon gear (DG)
+-- user: "อยากเพิ่ม auto sell อุปกรณ์ดันเจี้ยน แต่เลือกชิ้นส่วนที่จะขายแยกได้ และเลือกออฟชั่นแต่ละชิ้น
+-- และช่วง" -> picked: keep what passes, sell the rest; range = % of the roll range; DG only,
+-- every item separately, "default off นะห้ามเปิดเด็ดขาด ห้ามขายของล็อก".
+-- One rule per dungeon item (base id: "bonestring_bow" also covers awakened_/nightmare_).
+-- A piece of a switched-on item is KEPT when (mains picked -> its main is one of them and
+-- rolled >= pct) and (options picked -> at least `need` of its lines are picked keys rolled
+-- >= pct). Roll % = where the value sits in that piece's own range (Equipment.lineOdds /
+-- mainOdds, which depend on the item level), so one % works for L55, L95 and L99.
+-- Never sold: locked, worn, in any gear preset, refined (unless allowed), an item whose
+-- rule is off or has nothing picked.
+-- (a function, not a do-block: the main chunk is at the register limit)
+;(function()
+	if type(e.phDgSell) ~= "table" then e.phDgSell = {} end
+	if type(e.phDgSellTiers) ~= "table" then e.phDgSellTiers = {normal = true, awakened = true, nightmare = true} end
+	local okE, EQ = pcall(require, RS.Shared.Config.Equipment)
+	if not okE or type(EQ) ~= "table" or type(EQ.defs) ~= "table" then return end
+	local CLASSES = {"Swordsman", "Archer", "Mage", "Cleric", "Summoner", "Gunner", "Thief", "Merchant"}
+	local TIERS = {{"normal", "ธรรมดา"}, {"awakened", "Awakened"}, {"nightmare", "Nightmare"}}
+	local function tierKey(id)
+		if id:match("^awakened_") then return "awakened" end
+		if id:match("^nightmare_") then return "nightmare" end
+		return "normal"
+	end
+	local function baseOf(id)
+		local b = tostring(id):gsub("^awakened_", "")
+		b = b:gsub("^nightmare_", "")
+		return b
+	end
+
+	-- the dungeon items, grouped by base id
+	local items, byBase = {}, {}
+	for id, def in pairs(EQ.defs) do
+		if type(def) == "table" and def.dungeon then
+			local b = baseOf(id)
+			local it = byBase[b]
+			if not it then
+				it = {base = b, ids = {}, type = def.type, class = def.class}
+				byBase[b] = it
+				table.insert(items, it)
+			end
+			table.insert(it.ids, id)
+			if id == b then it.name = def.name end
+			if not it.rep or tierKey(id) == "awakened" then it.rep = id end
+			it.fallbackName = it.fallbackName or tostring(def.name):gsub("^Awakened ", ""):gsub("^Nightmare ", "")
+		end
+	end
+	if #items == 0 then return end
+	local typeRank = {}
+	for i, t in ipairs(EQ.types or {}) do typeRank[t] = i end
+	for _, it in ipairs(items) do
+		it.name = it.name or it.fallbackName
+		table.sort(it.ids, function(a, b) return (tonumber(EQ.defs[a].level) or 0) > (tonumber(EQ.defs[b].level) or 0) end)
+		it.label = ("%s · %s%s"):format(it.name, (EQ.typeNames or {})[it.type] or tostring(it.type),
+			it.class and (" (" .. it.class .. ")") or "")
+	end
+	table.sort(items, function(a, b)
+		local ra, rb = typeRank[a.type] or 99, typeRank[b.type] or 99
+		if ra ~= rb then return ra < rb end
+		return a.name < b.name
+	end)
+
+	-- roll ranges: "+3% ~ +17.7%" / "-3% ~ -11.8%" / "+490 ~ +3930"
+	local function parseRange(str)
+		str = tostring(str)
+		local a, b = str:match("([%d%.]+)%%?%s*~%s*[%+%-]?([%d%.]+)")
+		a, b = tonumber(a), tonumber(b)
+		if not (a and b) then return nil end
+		local pct = str:find("%%") ~= nil
+		if pct then a, b = a / 100, b / 100 end
+		return {lo = math.min(a, b), hi = math.max(a, b), pct = pct, text = str}
+	end
+	local rangeCache = {}
+	local function ranges(defId)   -- {lines = {key -> rg}, order = {key...}, mains = {key -> rg}, mainOrder}
+		if rangeCache[defId] then return rangeCache[defId] end
+		local def = EQ.defs[defId]
+		local r = {lines = {}, order = {}, mains = {}, mainOrder = {}}
+		local function add(list, into, order)
+			if type(list) ~= "table" then return end
+			for _, l in ipairs(list) do
+				local k = tostring(l.key)
+				if not into[k] then
+					local rg = parseRange(l.range)
+					if rg then into[k] = rg; table.insert(order, k) end
+				end
+			end
+		end
+		if def then
+			-- class lines (Skill Power, Crit Damage...) only show up for a class
+			for _, c in ipairs(def.class and {def.class} or CLASSES) do
+				local ok, l = pcall(EQ.lineOdds, def, c)
+				if ok then add(l, r.lines, r.order) end
+			end
+			local ok, l = pcall(EQ.lineOdds, def)
+			if ok then add(l, r.lines, r.order) end
+			ok, l = pcall(EQ.mainOdds, def)
+			if ok then add(l, r.mains, r.mainOrder) end
+			-- flat "Attack +480" (key atk): an old line that no longer rolls, so no range --
+			-- still pickable; a picked atk line always counts as passing
+			if not r.lines.atk then table.insert(r.order, "atk") end
+		end
+		rangeCache[defId] = r
+		return r
+	end
+	-- 0..1 = where the value sits in its range; nil = range unknown
+	local function quality(defId, line, isMain)
+		local r = ranges(defId)
+		local rg = (isMain and r.mains or r.lines)[tostring(line.key)]
+		if not rg then return nil end
+		local v = math.abs(tonumber(line.value) or 0)
+		if rg.hi <= rg.lo then return v >= rg.hi and 1 or 0 end
+		return math.clamp((v - rg.lo) / (rg.hi - rg.lo), 0, 1)
+	end
+	local function lineName(k)
+		return (EQ.lineNames or {})[k] or k
+	end
+	local function lineStr(defId, l, isMain)
+		local ok, t = pcall(EQ.lineText, l)
+		local q = quality(defId, l, isMain)
+		return ("%s [%s]"):format(ok and t or (lineName(tostring(l.key)) .. " " .. tostring(l.value)),
+			q and ("%d%%"):format(math.floor(q * 100 + 0.5)) or "?")
+	end
+
+	local function rule(b)
+		local r = e.phDgSell[b]
+		if type(r) ~= "table" then r = {}; e.phDgSell[b] = r end
+		if type(r.opts) ~= "table" then r.opts = {} end
+		if type(r.mains) ~= "table" then r.mains = {} end
+		r.pct = math.clamp(tonumber(r.pct) or 70, 0, 100)
+		r.need = math.clamp(math.floor(tonumber(r.need) or 1), 1, 4)
+		r.on = r.on == true
+		return r
+	end
+
+	local function protectSet(g)
+		local set = {}
+		for _, uid in pairs(type(g.equipped) == "table" and g.equipped or {}) do set[tostring(uid)] = true end
+		for _, pr in pairs(type(g.presets) == "table" and g.presets or {}) do
+			if type(pr) == "table" and type(pr.equipped) == "table" then
+				for _, uid in pairs(pr.equipped) do set[tostring(uid)] = true end
+			end
+		end
+		return set
+	end
+
+	-- "sell" / "keep" / nil (not handled), reason
+	local function judge(piece, uid, prot)
+		local def = EQ.defs[piece.id]
+		if not (def and def.dungeon) then return nil end
+		local it = byBase[baseOf(piece.id)]
+		if not it then return nil end
+		local r = rule(it.base)
+		if not r.on then return nil, "ปิดอยู่" end
+		if not e.phDgSellTiers[tierKey(tostring(piece.id))] then return nil, "ระดับนี้ไม่ได้เลือก" end
+		if piece.locked then return "keep", "ล็อก" end
+		if prot[tostring(uid)] then return "keep", "ใส่อยู่/อยู่ในพรีเซ็ต" end
+		if (tonumber(piece.refine) or 0) > 0 and not e.phDgSellRefined then return "keep", "ตีบวก +" .. tostring(piece.refine) end
+		if (tonumber(def.sellPrice) or 0) <= 0 then return nil, "ขายไม่ได้" end
+		local anyOpt, anyMain = next(r.opts) ~= nil, next(r.mains) ~= nil
+		if not anyOpt and not anyMain then return nil, "ยังไม่ได้เลือกออฟชั่น" end
+		local p = r.pct / 100 - 1e-6
+		if anyMain then
+			local m = piece.main
+			if type(m) ~= "table" or not r.mains[tostring(m.key)] then return "sell", "main ไม่ตรง" end
+			local q = quality(piece.id, m, true)
+			if q and q < p then return "sell", ("main %d%%"):format(math.floor(q * 100 + 0.5)) end
+		end
+		if anyOpt then
+			local hit = 0
+			for _, l in pairs(type(piece.options) == "table" and piece.options or {}) do
+				if type(l) == "table" and r.opts[tostring(l.key)] then
+					local q = quality(piece.id, l)
+					if q == nil or q >= p then hit += 1 end   -- unknown range: count it (never sell on a guess)
+				end
+			end
+			if hit < r.need then return "sell", ("ผ่าน %d/%d บรรทัด"):format(hit, r.need) end
+		end
+		return "keep", "ผ่าน"
+	end
+
+	local function scan(onlyBase)
+		if not hooks() then return nil end
+		local ok, g = pcall(GearState.get)
+		if not ok or type(g) ~= "table" or type(g.gear) ~= "table" then return nil end
+		local prot = protectSet(g)
+		local res = {sell = {}, keep = 0, total = 0, gold = 0, skip = 0}
+		for uid, piece in pairs(g.gear) do
+			if type(piece) == "table" and piece.id and EQ.defs[piece.id] and EQ.defs[piece.id].dungeon then
+				local b = baseOf(piece.id)
+				if byBase[b] and (not onlyBase or b == onlyBase) then
+					res.total += 1
+					local v, why = judge(piece, uid, prot)
+					if v == "sell" then
+						table.insert(res.sell, {uid = uid, piece = piece, why = why})
+						res.gold += tonumber(EQ.defs[piece.id].sellPrice) or 0
+					elseif v == "keep" then
+						res.keep += 1
+					else
+						res.skip += 1
+					end
+				end
+			end
+		end
+		table.sort(res.sell, function(a, b) return tostring(a.uid) < tostring(b.uid) end)
+		return res
+	end
+	stats.dgScan = scan   -- diagnostics: getgenv().__PHP_STATS.dgScan(base?) -> {sell, keep, total, gold, skip}
+	local function pieceText(s)
+		local pc = s.piece
+		local def = EQ.defs[pc.id]
+		local parts = {}
+		if type(pc.main) == "table" then table.insert(parts, "main " .. lineStr(pc.id, pc.main, true)) end
+		for _, l in pairs(type(pc.options) == "table" and pc.options or {}) do
+			if type(l) == "table" then table.insert(parts, lineStr(pc.id, l)) end
+		end
+		return ("%s L%s (%s): %s"):format(tostring(def and def.name or pc.id), tostring(def and def.level or "?"),
+			tostring(s.why), table.concat(parts, " · "))
+	end
+	local function goldText(g)
+		return g >= 1e6 and ("%.2fM"):format(g / 1e6) or (g >= 1e3 and ("%.0fk"):format(g / 1e3) or tostring(g))
+	end
+
+	-- sell loop
+	stats.dgSell = "ปิดอยู่"
+	stats.dgSold = stats.dgSold or 0
+	task.spawn(function()
+		while alive() do
+			if not e.phDgSellOn then stats.dgSell = "ปิดอยู่"; task.wait(1); continue end
+			local res = scan()
+			if not res then stats.dgSell = "รอเข้าเกม"; task.wait(2); continue end
+			if #res.sell == 0 then
+				stats.dgSell = "ไม่มีชิ้นที่ต้องขาย"
+			else
+				stats.dgSell = ("กำลังขาย %d ชิ้น (~%s ทอง)"):format(#res.sell, goldText(res.gold))
+				for _, it in ipairs(res.sell) do
+					if not alive() or not e.phDgSellOn then break end
+					-- re-judge right before selling: it may have been locked / worn since the scan
+					local ok, g = pcall(GearState.get)
+					local cur = ok and type(g) == "table" and type(g.gear) == "table" and g.gear[it.uid]
+					if cur and judge(cur, it.uid, protectSet(g)) == "sell" then
+						print("[PHP] DG sell " .. pieceText({piece = cur, why = it.why}))
+						pcall(function() gearRemote:FireServer("sell", it.uid) end)
+						stats.dgSold += 1
+						task.wait(0.2)
+					end
+				end
+			end
+			local wait = math.max(tonumber(e.phSellEvery) or 20, 5)
+			for _ = 1, wait do if not alive() or not e.phDgSellOn then break end task.wait(1) end
+		end
+	end)
+
+	-- UI
+	local L = Tabs.DgSell:Section({Side = "Left"})
+	local R = Tabs.DgSell:Section({Side = "Right"})
+	L:Header({Text = "ขายของดันเจี้ยนอัตโนมัติ"})
+	L:Toggle({Name = "เปิด Auto Sell ของดัน", Default = e.phDgSellOn,
+		Callback = function(v) e.phDgSellOn = v; sv() end}, "PHDgSellOn")
+	local tierOpts, tierDef, tierBy = {}, {}, {}
+	-- user: "แสดงด้วย ว่าแต่ละอัน ของเวลไหน" -> label each tier with its item levels (from defs)
+	local tierLv = {}
+	for id, def in pairs(EQ.defs) do
+		if type(def) == "table" and def.dungeon and def.level then
+			local k = tierKey(id)
+			tierLv[k] = tierLv[k] or {}
+			tierLv[k][tonumber(def.level)] = true
+		end
+	end
+	for _, t in ipairs(TIERS) do
+		local lvs = {}
+		for lv in pairs(tierLv[t[1]] or {}) do table.insert(lvs, lv) end
+		table.sort(lvs)
+		local lbl = #lvs > 0 and ("%s (Lv %s)"):format(t[2], table.concat(lvs, "/")) or t[2]
+		table.insert(tierOpts, lbl); tierBy[lbl] = t[1]
+		if e.phDgSellTiers[t[1]] then table.insert(tierDef, lbl) end
+	end
+	L:Dropdown({Name = "ระดับของที่ให้ระบบนี้จัดการ", Multi = true, Required = false,
+		Options = tierOpts, Default = tierDef,
+		Callback = function(v)
+			local sel = {}
+			for lbl in pairs(readMulti(v)) do if tierBy[lbl] then sel[tierBy[lbl]] = true end end
+			e.phDgSellTiers = sel; sv()
+		end}, "PHDgSellTiers")
+	L:Toggle({Name = "ขายชิ้นที่ตีบวกแล้ว (+1 ขึ้นไป) ด้วย", Default = e.phDgSellRefined,
+		Callback = function(v) e.phDgSellRefined = v; sv() end}, "PHDgSellRefined")
+	L:Label({Text = "เปิดทีละชิ้นด้านล่าง: ชิ้นที่ผ่านเงื่อนไข = เก็บ · ไม่ผ่าน = ขาย\nไม่ขายเด็ดขาด: ของที่ lock · ที่ใส่อยู่ · ที่อยู่ในพรีเซ็ต\nชิ้นที่ยังไม่เปิด หรือยังไม่เลือกออฟชั่น = ไม่แตะ"})
+
+	L:Header({Text = "ตั้งค่าแต่ละชิ้น"})
+	local cur = items[1]
+	local ui = {}
+	local itemLabels, itemBy = {}, {}
+	for _, it in ipairs(items) do table.insert(itemLabels, it.label); itemBy[it.label] = it end
+	local function optList(it)   -- labels + label->key for the option / main dropdowns
+		local rg = ranges(it.rep)
+		local o, oBy, m, mBy = {}, {}, {}, {}
+		for _, k in ipairs(rg.order) do
+			local lbl = ("%s (%s)"):format(lineName(k), rg.lines[k] and rg.lines[k].text or "ค่าตายตัวแบบเก่า")
+			table.insert(o, lbl); oBy[lbl] = k
+		end
+		for _, k in ipairs(rg.mainOrder) do
+			local lbl = ("%s (%s)"):format(lineName(k), rg.mains[k].text)
+			table.insert(m, lbl); mBy[lbl] = k
+		end
+		return o, oBy, m, mBy
+	end
+	local function picked(by, set)
+		local out = {}
+		for lbl, k in pairs(by) do if set[k] then table.insert(out, lbl) end end
+		return out
+	end
+	local function fmtAt(rg, p)
+		local v = rg.lo + p * (rg.hi - rg.lo)
+		if rg.pct then return ("%.1f%%"):format(v * 100) end
+		return tostring(math.ceil(v - 1e-6))
+	end
+	local function thresholdText()
+		local r = rule(cur.base)
+		local p = r.pct / 100
+		local lines = {}
+		local function each(set, isMain, order)
+			for _, k in ipairs(order) do
+				if set[k] then
+					local parts = {}
+					for _, id in ipairs(cur.ids) do
+						local rr = ranges(id)
+						local rg = (isMain and rr.mains or rr.lines)[k]
+						if rg then table.insert(parts, ("≥%s (L%s)"):format(fmtAt(rg, p), tostring(EQ.defs[id].level))) end
+					end
+					if #parts == 0 then parts = {"นับผ่านทุกค่า (ออฟชั่นแบบเก่า)"} end
+					table.insert(lines, ("%s%s: %s"):format(isMain and "main " or "", lineName(k), table.concat(parts, " · ")))
+				end
+			end
+		end
+		local rg = ranges(cur.rep)
+		each(r.mains, true, rg.mainOrder)
+		each(r.opts, false, rg.order)
+		if #lines == 0 then return "ยังไม่ได้เลือกออฟชั่น → ชิ้นนี้จะไม่ถูกขาย" end
+		return ("เก็บถ้า%s:\n"):format(next(r.opts) and (" มีอย่างน้อย " .. r.need .. " บรรทัดถึงค่านี้") or " main ถึงค่านี้")
+			.. table.concat(lines, "\n")
+	end
+	local function refreshThr()
+		if ui.thr then pcall(function() ui.thr:UpdateName(thresholdText()) end) end
+	end
+	local loading = false
+	ui.item = L:Dropdown({Name = "เลือกชิ้นที่จะตั้งค่า", Multi = false, Required = true, Search = true,
+		Options = itemLabels, Default = 1,
+		Callback = function(v)
+			local it = itemBy[type(v) == "table" and (next(v)) or v]
+			if not it or it == cur then return end
+			cur = it
+			local r = rule(it.base)
+			local o, oBy, m, mBy = optList(it)
+			ui.oBy, ui.mBy = oBy, mBy
+			loading = true
+			pcall(function()
+				ui.on:UpdateState(r.on)
+				ui.opts:ClearOptions(); ui.opts:InsertOptions(o); ui.opts:UpdateSelection(picked(oBy, r.opts))
+				ui.mains:ClearOptions(); ui.mains:InsertOptions(m); ui.mains:UpdateSelection(picked(mBy, r.mains))
+				ui.pct:UpdateValue(r.pct)
+				ui.need:UpdateValue(r.need)
+			end)
+			loading = false
+			refreshThr()
+		end})
+	local r0 = rule(cur.base)
+	local o0, oBy0, m0, mBy0 = optList(cur)
+	ui.oBy, ui.mBy = oBy0, mBy0
+	ui.on = L:Toggle({Name = "ขายชิ้นนี้ (ไม่ผ่านเงื่อนไข = ขาย)", Default = r0.on,
+		Callback = function(v)
+			if loading then return end
+			rule(cur.base).on = v == true; sv()
+		end})
+	ui.opts = L:Dropdown({Name = "ออฟชั่นที่อยากได้ (บรรทัดรอง)", Multi = true, Required = false, Search = true,
+		Options = o0, Default = picked(oBy0, r0.opts),
+		Callback = function(v)
+			if loading then return end
+			local set = {}
+			for lbl in pairs(readMulti(v)) do if ui.oBy[lbl] then set[ui.oBy[lbl]] = true end end
+			rule(cur.base).opts = set; sv(); refreshThr()
+		end})
+	ui.mains = L:Dropdown({Name = "Main ที่อยากได้ (ไม่เลือก = ไม่สน main)", Multi = true, Required = false,
+		Options = m0, Default = picked(mBy0, r0.mains),
+		Callback = function(v)
+			if loading then return end
+			local set = {}
+			for lbl in pairs(readMulti(v)) do if ui.mBy[lbl] then set[ui.mBy[lbl]] = true end end
+			rule(cur.base).mains = set; sv(); refreshThr()
+		end})
+	ui.pct = L:Slider({Name = "ขั้นต่ำ (% ของช่วงที่โรลได้)", Minimum = 0, Maximum = 100, Default = r0.pct,
+		Precision = 0, DisplayMethod = "Round", Suffix = "%",
+		Callback = function(v)
+			if loading then return end
+			rule(cur.base).pct = math.floor(v + 0.5); sv(); refreshThr()
+		end})
+	ui.need = L:Slider({Name = "ต้องผ่านอย่างน้อย (บรรทัด)", Minimum = 1, Maximum = 4, Default = r0.need,
+		Precision = 0, DisplayMethod = "Round", Suffix = " บรรทัด",
+		Callback = function(v)
+			if loading then return end
+			rule(cur.base).need = math.floor(v + 0.5); sv(); refreshThr()
+		end})
+	ui.thr = L:Label({Text = thresholdText()})
+	stats.dgUi = ui   -- diagnostics
+	L:Label({Text = "0% = ค่าต่ำสุดที่โรลได้ · 100% = ค่าสูงสุด (คิดตามเลเวลของชิ้นนั้น)\nเช่น Crit Rate L95 โรลได้ 3% ~ 17.7% → ตั้ง 70% = ต้องได้ ≥ 13.3%"})
+
+	R:Header({Text = "สถานะ"})
+	local stLbl = R:Label({Text = "-"})
+	R:Header({Text = "ชิ้นที่เลือกอยู่"})
+	local pvLbl = R:Label({Text = "-"})
+	R:Button({Name = "พิมพ์รายการที่จะขายทั้งหมดลง console (F9)", Callback = function()
+		local res = scan()
+		if not res then return end
+		print(("[PHP] DG sell preview: %d pieces would be sold (~%s gold)"):format(#res.sell, goldText(res.gold)))
+		for _, s2 in ipairs(res.sell) do print("[PHP]   " .. pieceText(s2)) end
+	end})
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local all = scan()
+				local on = 0
+				for _, it in ipairs(items) do if rule(it.base).on then on += 1 end end
+				stLbl:UpdateName(("Auto Sell ของดัน: %s · %s\nขายไปแล้ว %d ชิ้น · เปิดไว้ %d/%d ชิ้น\nเข้าเงื่อนไขขายตอนนี้: %s"):format(
+					e.phDgSellOn and "เปิด" or "ปิด", tostring(stats.dgSell), stats.dgSold, on, #items,
+					all and ("%d ชิ้น (~%s ทอง)"):format(#all.sell, goldText(all.gold)) or "-"))
+				local one = scan(cur.base)
+				if one then
+					local t = {("%s\nมี %d ชิ้น · เก็บ %d · จะขาย %d%s"):format(cur.label, one.total, one.keep, #one.sell,
+						rule(cur.base).on and "" or " (ชิ้นนี้ยังปิดอยู่)")}
+					for i = 1, math.min(#one.sell, 8) do table.insert(t, "✕ " .. pieceText(one.sell[i])) end
+					if #one.sell > 8 then table.insert(t, ("... อีก %d ชิ้น (กดปุ่มด้านล่างดูทั้งหมด)"):format(#one.sell - 8)) end
+					pvLbl:UpdateName(table.concat(t, "\n"))
+				end
+			end)
+			task.wait(1.5)
+		end
+	end)
+end)()
 
 -- Gear tab: collect + equip
 local GLs = Tabs.Gear:Section({Side = "Left"})
