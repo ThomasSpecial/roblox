@@ -3307,6 +3307,15 @@ local function dgTick(hum, hrp)
 	end
 	if #pool > 0 then
 		local anchor = center and Vector3.new(center.X, pos.Y, center.Z) or pos
+		-- user: "ดันมันยกยักไม่สมูท": in the long halls (75 x 18) it walked back to the hall
+		-- centre after every kill and out again for the next one (13 direction flips in 20s).
+		-- Ordinary rooms now anchor where we already stand (clamped inside the room), so we
+		-- only move when the next target is out of reach -- and then stay there.
+		if center and not bossRoom then
+			local mx = math.max((roomHX or radius) - 6, 2)
+			local mz = math.max((roomHZ or radius) - 4, 1)
+			anchor = Vector3.new(math.clamp(pos.X, center.X - mx, center.X + mx), pos.Y, math.clamp(pos.Z, center.Z - mz, center.Z + mz))
+		end
 		local function reachOf(m) return ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5 end
 		local function inReach(m, from)
 			local mp = m.PrimaryPart.Position
@@ -3352,6 +3361,15 @@ local function dgTick(hum, hrp)
 				dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
 			end
 			stand = anchor + dir * R
+			-- sticky orbit spot: the boss shuffles every tick and the spot swung with it
+			-- (the jitter). Keep the last spot while it's within 10 of the new one and safe.
+			local prev = dgMark.stand
+			if prev and flatDist(prev, stand) < 10 and safeEverywhere(prev) then
+				stand = Vector3.new(prev.X, pos.Y, prev.Z)
+			end
+			dgMark.stand = stand
+		else
+			dgMark.stand = nil
 		end
 		if not inReach(best, stand) then
 			local dir = Vector3.new(bp.X - stand.X, 0, bp.Z - stand.Z)
@@ -3430,12 +3448,22 @@ local function dgTick(hum, hrp)
 		if sr then what = ("[วงบีบ r%d] "):format(sr) .. what end
 		if boss and best ~= boss and boss:GetAttribute("Shielded") == true then what = what .. "ลูกน้อง(บอสมีโล่)" end
 		stats.farm = (tower and ("Tower ชั้น %d%s: "):format(tFloor, bossRoom and " (บอส)" or "") or ("ดันเจี้ยน ด่าน %d/%d: "):format(run.stage, nStages))
-			.. ("%s %s (%d%%)%s"):format(what, best.Name, hp, off > DG_HOLD_R and " · กลับกลางห้อง" or "")
+			.. ("%s %s (%d%%)%s"):format(what, best.Name, hp, off > DG_HOLD_R and (bossRoom and " · กลับกลางห้อง" or " · เดินเข้าระยะ") or "")
 		return true
 	end
 	-- room empty (next wave spawning / gate just opened): stand in the room's middle
+	-- ...in the boss room. A hall: just stay where we are inside it (walking back to the
+	-- middle between waves was the other half of the zig-zag); only a new stage (we're
+	-- outside its rect) walks us in -- to its near end, clamped, not across to its centre.
 	fightFocus = nil
-	if center and flatDist(pos, center) > 10 then
+	local waitAt = center
+	if center and not bossRoom then
+		local mx = math.max((roomHX or radius) - 6, 2)
+		local mz = math.max((roomHZ or radius) - 4, 1)
+		waitAt = Vector3.new(math.clamp(pos.X, center.X - mx, center.X + mx), center.Y, math.clamp(pos.Z, center.Z - mz, center.Z + mz))
+	end
+	if waitAt and flatDist(pos, waitAt) > 10 then
+		center = waitAt
 		setAuto(false)
 		if stuckFor > 3 then pathTo(hum, hrp, center) else pathReset(); dgWalk(hum, hrp, run, center) end
 		stats.farm = ("ดันเจี้ยน ด่าน %d/%d: เดินไปห้องถัดไป (ห่าง %.0f)"):format(run.stage, nStages, flatDist(pos, center))
