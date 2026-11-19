@@ -3595,6 +3595,10 @@ pcall(function()
 			dgStats.runs = dgStats.runs + 1
 			if data.win ~= false then dgStats.wins = dgStats.wins + 1 end
 			dgStats.lastSec = tonumber(data.seconds)
+			do
+				local sec = tonumber(data.seconds)
+				if sec and sec > 20 then dgStats.runAvg = dgStats.runAvg and (dgStats.runAvg * 0.7 + sec * 0.3) or sec end
+			end
 			dgStats.backAt = os.clock() + (tonumber(data.returnIn) or (DG and DG.returnDelay) or 15)
 			-- the result card's REPLAY button = Dungeon:replay(id, diff), a party vote:
 			-- once everyone voted the same run restarts without the trip to town
@@ -3610,6 +3614,13 @@ pcall(function()
 				while dgLootPhase and (e.phDgOn or e.phAutoRejoin) and os.clock() - tW < 10 and alive() do
 					dgStats.status = "เก็บของจากหีบก่อน แล้วค่อยกด REPLAY"
 					task.wait(0.2)
+				end
+				do
+					local hold = stats.wbHold and stats.wbHold()
+					if hold then
+						dgStats.status = hold .. " → ไม่กด REPLAY กลับเมืองไปตีก่อน"
+						return
+					end
 				end
 				-- user: "ตี้ 3 คน แล้วมีคนใดคนนึงหลุดไม่ได้อยู่ในดันเจี้ยน พอตีบอสเสร็จ ให้มันไม่ต้อง
 				-- ต่อ แต่ออกมา แล้วเริ่มใหม่ เข้าดันด้วยกันใหม่": a member who started with us is
@@ -3702,6 +3713,26 @@ do
 		end)
 		task.spawn(function() while alive() do task.wait(1) end; pcall(function() skipConn:Disconnect() end) end)
 	end
+	-- user: "ดูเหมือนตีๆบอสอยู่ animation ขึ้นมาอีกรอบ 2": the boss ENRAGE scene. BossFx calls
+	-- task.spawn(BossIntro.enrage, scene, name) for every player in scene.watching: controls
+	-- disabled, every GUI hidden, scripted camera until scene.endsAt -- and it has no SKIP
+	-- button. It's client presentation only (the server runs the enrage by its own clock),
+	-- and BossFx looks the function up on the module table each time -> swapping the field
+	-- mutes it. Same toggle as the intro skip. Original kept in getgenv so reloads don't stack.
+	pcall(function()
+		local C = controllers()
+		local BI = C and require(C:WaitForChild("BossIntro", 10))
+		if type(BI) ~= "table" or type(BI.enrage) ~= "function" then return end
+		getgenv().__PHP_ENRAGE_ORIG = getgenv().__PHP_ENRAGE_ORIG or BI.enrage
+		local orig = getgenv().__PHP_ENRAGE_ORIG
+		BI.enrage = function(...)
+			if alive() and e.phDgSkipIntro then
+				stats.enrageSkipped = (stats.enrageSkipped or 0) + 1
+				return
+			end
+			return orig(...)
+		end
+	end)
 end
 if dgConn then
 	task.spawn(function() while alive() do task.wait(1) end; pcall(function() dgConn:Disconnect() end) end)
@@ -3780,6 +3811,43 @@ pcall(function()
 	task.spawn(function() while alive() do task.wait(1) end; c:Disconnect() end)
 end)
 
+-- user: "กรณีเปิด Auto Worldboss แล้วลงดันอยู่ พอจบดัน ให้มาตี worldboss พอบอสตายค่อยกลับไป
+-- ลงดัน". Returns a reason while the dungeon loop must stand aside (no REPLAY vote, no new
+-- run); the main loop then fights the world boss from town as usual, and once it's dead
+-- (and its loot is picked up) this returns nil and Auto Replay goes back in.
+--   * a world boss that passes the name/field picks is announced ("soon") or alive
+--   * not announced yet but it lands before one more run could end: world bosses land on
+--     a fixed grid (WorldBoss.every = 1800 -> every :00 and :30, WorldBossAt confirmed on
+--     it). Only with no name/field filter -- which boss comes is unknown until announced.
+-- (a stats field, not a chunk local: the main chunk is at the register limit)
+stats.wbHold = function()
+	if not e.phWBOn then return nil end
+	local okC, WBC = pcall(require, RS.Shared.Config.WorldBoss)
+	if okC and type(WBC) == "table" and WBC.enabled == false then return nil end
+	if lootPhase then return "เก็บของ World Boss" end
+	local w = wbInfo()
+	local live = false
+	for _, m in ipairs(workspace.Monsters:GetChildren()) do
+		if m:GetAttribute("WorldBoss") and (tonumber(m:GetAttribute("Health")) or 0) > 0 then live = true; break end
+	end
+	if w and w.field and (w.state == "soon" or live) then
+		local name = w.id and (WB_LABEL[w.id] or WB_LABEL["wb_" .. tostring(w.id)])
+		if not wbNamePicked(name) or not wbFieldPicked(w.field) then return nil end
+		return ("World Boss %s %s"):format(tostring(name or w.id), live and "เกิดแล้ว" or "กำลังจะมา")
+	end
+	if w then return nil end   -- results / cleanup: nothing left to fight
+	local filtered = (type(e.phWBPick) == "table" and next(e.phWBPick) ~= nil) or (type(e.phWBFields) == "table" and next(e.phWBFields) ~= nil)
+	if filtered then return nil end
+	local every = okC and type(WBC) == "table" and tonumber(WBC.every) or 1800
+	local now = workspace:GetServerTimeNow()
+	local nextIn = math.ceil(now / every) * every - now
+	local runLen = (dgStats.runAvg or 150) + 30   -- + loading / walk-in
+	if nextIn < runLen then
+		return ("World Boss รอบถัดไปอีก %d วิ (ดันรอบนึง ~%d วิ)"):format(math.floor(nextIn), math.floor(runLen))
+	end
+	return nil
+end
+
 -- AUTO REPLAY: back in town -> enter again (solo, or as party leader). A party member
 -- can't start a run; it rides the leader's ready check (auto-joined above).
 task.spawn(function()
@@ -3811,6 +3879,10 @@ task.spawn(function()
 				continue
 			end
 			dgStats.regroupUntil = nil
+		end
+		do
+			local hold = stats.wbHold and stats.wbHold()
+			if hold then dgStats.status = hold .. " → ตี World Boss ก่อน แล้วค่อยกลับมาลงดัน"; continue end
 		end
 		if now - dgStats.lastTry < 8 then continue end
 		dgStats.lastTry = now
@@ -5179,7 +5251,7 @@ DLs:Toggle({Name = "Auto Replay (กดปุ่ม REPLAY หน้าจบด
 	Callback = function(v) e.phDgReplay = v; sv() end}, "PHDgReplay")
 DLs:Toggle({Name = "└ เพื่อนในตี้หลุด → ไม่ REPLAY กลับเมืองแล้วเข้าดันพร้อมกันใหม่", Default = e.phDgRegroup,
 	Callback = function(v) e.phDgRegroup = v; sv() end}, "PHDgRegroup")
-DLs:Toggle({Name = "Auto Skip ฉากเปิดตัวบอส (กด SKIP ให้เอง)", Default = e.phDgSkipIntro,
+DLs:Toggle({Name = "Auto Skip ฉากบอส (เปิดตัว + ตอนบอสคลั่ง)", Default = e.phDgSkipIntro,
 	Callback = function(v) e.phDgSkipIntro = v; sv() end}, "PHDgSkipIntro")
 DLs:Toggle({Name = "Auto Join ปาร์ตี้ (ลูกปาร์ตี้: กด Join ให้เองตอนหัวหน้าเรียก)", Default = e.phDgAccept,
 	Callback = function(v) e.phDgAccept = v; sv() end}, "PHDgAccept")
