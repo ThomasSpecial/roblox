@@ -79,7 +79,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phStayPut = true,       -- farm spot set: stand exactly on it, only shoot what's in range
 	phSellMats = false,     -- sell monster junk (Items type "material") via the shop's SELL LOOT
 	phDgSellOn = false,     -- Auto Sell dungeon gear by per-item option rules (tab "ขายของดัน") -- user: default off, never flip it for them
-	phDgSell = nil,         -- {[baseId] = {on, opts = {key = true}, mains = {key = true}, pct, need}}
+	phDgSell = nil,         -- {[baseId] = {on, mains = {key = true}, pct}} (main line only)
 	phDgSellTiers = nil,    -- {normal = true, awakened = true, nightmare = true}
 	phDgSellRefined = false, -- also sell refined (+N) dungeon pieces
 	phFuseOn = false,       -- Auto Fusion: fuse spare plain cards of the picked rarities (same biome, game's cost)
@@ -5345,9 +5345,9 @@ local sellLbl = SRs:Label({Text = "-"})
 -- และช่วง" -> picked: keep what passes, sell the rest; range = % of the roll range; DG only,
 -- every item separately, "default off นะห้ามเปิดเด็ดขาด ห้ามขายของล็อก".
 -- One rule per dungeon item (base id: "bonestring_bow" also covers awakened_/nightmare_).
--- A piece of a switched-on item is KEPT when (mains picked -> its main is one of them and
--- rolled >= pct) and (options picked -> at least `need` of its lines are picked keys rolled
--- >= pct). Roll % = where the value sits in that piece's own range (Equipment.lineOdds /
+-- A piece of a switched-on item is KEPT when its MAIN line is one of the picked mains and
+-- rolled >= pct; everything else is sold (user: "บรรทัดรองตัดออก ... บรรทัดหลักฉันอยากได้
+-- เช่น ไม่ขายเฉพาะอันที่ max หรือสเตตัสประเภทไหน เช่น atk, boss" -> 100% = max only). Roll % = where the value sits in that piece's own range (Equipment.lineOdds /
 -- mainOdds, which depend on the item level), so one % works for L55, L95 and L99.
 -- Never sold: locked, worn, in any gear preset, refined (unless allowed), an item whose
 -- rule is off or has nothing picked.
@@ -5466,10 +5466,9 @@ local sellLbl = SRs:Label({Text = "-"})
 	local function rule(b)
 		local r = e.phDgSell[b]
 		if type(r) ~= "table" then r = {}; e.phDgSell[b] = r end
-		if type(r.opts) ~= "table" then r.opts = {} end
+		r.opts, r.need = nil, nil   -- secondary-line rules removed (main only)
 		if type(r.mains) ~= "table" then r.mains = {} end
 		r.pct = math.clamp(tonumber(r.pct) or 70, 0, 100)
-		r.need = math.clamp(math.floor(tonumber(r.need) or 1), 1, 4)
 		r.on = r.on == true
 		return r
 	end
@@ -5498,25 +5497,14 @@ local sellLbl = SRs:Label({Text = "-"})
 		if prot[tostring(uid)] then return "keep", "ใส่อยู่/อยู่ในพรีเซ็ต" end
 		if (tonumber(piece.refine) or 0) > 0 and not e.phDgSellRefined then return "keep", "ตีบวก +" .. tostring(piece.refine) end
 		if (tonumber(def.sellPrice) or 0) <= 0 then return nil, "ขายไม่ได้" end
-		local anyOpt, anyMain = next(r.opts) ~= nil, next(r.mains) ~= nil
-		if not anyOpt and not anyMain then return nil, "ยังไม่ได้เลือกออฟชั่น" end
-		local p = r.pct / 100 - 1e-6
-		if anyMain then
-			local m = piece.main
-			if type(m) ~= "table" or not r.mains[tostring(m.key)] then return "sell", "main ไม่ตรง" end
-			local q = quality(piece.id, m, true)
-			if q and q < p then return "sell", ("main %d%%"):format(math.floor(q * 100 + 0.5)) end
-		end
-		if anyOpt then
-			local hit = 0
-			for _, l in pairs(type(piece.options) == "table" and piece.options or {}) do
-				if type(l) == "table" and r.opts[tostring(l.key)] then
-					local q = quality(piece.id, l)
-					if q == nil or q >= p then hit += 1 end   -- unknown range: count it (never sell on a guess)
-				end
-			end
-			if hit < r.need then return "sell", ("ผ่าน %d/%d บรรทัด"):format(hit, r.need) end
-		end
+		if next(r.mains) == nil then return nil, "ยังไม่ได้เลือก main" end
+		-- main values are stored to 3 decimals, the same as the shown range -> 100% = exact max
+		local p = r.pct / 100 - 1e-3
+		local m = piece.main
+		if type(m) ~= "table" then return nil, "ไม่มี main" end
+		if not r.mains[tostring(m.key)] then return "sell", "main ไม่ใช่ที่เลือก" end
+		local q = quality(piece.id, m, true)
+		if q and q < p then return "sell", ("main %d%%"):format(math.floor(q * 100 + 0.5)) end
 		return "keep", "ผ่าน"
 	end
 
@@ -5552,9 +5540,6 @@ local sellLbl = SRs:Label({Text = "-"})
 		local def = EQ.defs[pc.id]
 		local parts = {}
 		if type(pc.main) == "table" then table.insert(parts, "main " .. lineStr(pc.id, pc.main, true)) end
-		for _, l in pairs(type(pc.options) == "table" and pc.options or {}) do
-			if type(l) == "table" then table.insert(parts, lineStr(pc.id, l)) end
-		end
 		return ("%s L%s (%s): %s"):format(tostring(def and def.name or pc.id), tostring(def and def.level or "?"),
 			tostring(s.why), table.concat(parts, " · "))
 	end
@@ -5625,7 +5610,7 @@ local sellLbl = SRs:Label({Text = "-"})
 		end}, "PHDgSellTiers")
 	L:Toggle({Name = "ขายชิ้นที่ตีบวกแล้ว (+1 ขึ้นไป) ด้วย", Default = e.phDgSellRefined,
 		Callback = function(v) e.phDgSellRefined = v; sv() end}, "PHDgSellRefined")
-	L:Label({Text = "เปิดทีละชิ้นด้านล่าง: ชิ้นที่ผ่านเงื่อนไข = เก็บ · ไม่ผ่าน = ขาย\nไม่ขายเด็ดขาด: ของที่ lock · ที่ใส่อยู่ · ที่อยู่ในพรีเซ็ต\nชิ้นที่ยังไม่เปิด หรือยังไม่เลือกออฟชั่น = ไม่แตะ"})
+	L:Label({Text = "เปิดทีละชิ้นด้านล่าง: ชิ้นที่ผ่านเงื่อนไข = เก็บ · ไม่ผ่าน = ขาย\nไม่ขายเด็ดขาด: ของที่ lock · ที่ใส่อยู่ · ที่อยู่ในพรีเซ็ต\nชิ้นที่ยังไม่เปิด หรือยังไม่เลือก main = ไม่แตะ"})
 
 	L:Header({Text = "ตั้งค่าแต่ละชิ้น"})
 	local cur = items[1]
@@ -5675,10 +5660,9 @@ local sellLbl = SRs:Label({Text = "-"})
 		end
 		local rg = ranges(cur.rep)
 		each(r.mains, true, rg.mainOrder)
-		each(r.opts, false, rg.order)
-		if #lines == 0 then return "ยังไม่ได้เลือกออฟชั่น → ชิ้นนี้จะไม่ถูกขาย" end
-		return ("เก็บถ้า%s:\n"):format(next(r.opts) and (" มีอย่างน้อย " .. r.need .. " บรรทัดถึงค่านี้") or " main ถึงค่านี้")
-			.. table.concat(lines, "\n")
+		if #lines == 0 then return "ยังไม่ได้เลือก main → ชิ้นนี้จะไม่ถูกขาย" end
+		return ("เก็บเฉพาะ main %s:\n"):format(r.pct >= 100 and "ที่ max" or "ที่ถึงค่านี้")
+			.. table.concat(lines, "\n") .. "\nmain อื่น / ไม่ถึง = ขาย"
 	end
 	local function refreshThr()
 		if ui.thr then pcall(function() ui.thr:UpdateName(thresholdText()) end) end
@@ -5696,10 +5680,8 @@ local sellLbl = SRs:Label({Text = "-"})
 			loading = true
 			pcall(function()
 				ui.on:UpdateState(r.on)
-				ui.opts:ClearOptions(); ui.opts:InsertOptions(o); ui.opts:UpdateSelection(picked(oBy, r.opts))
 				ui.mains:ClearOptions(); ui.mains:InsertOptions(m); ui.mains:UpdateSelection(picked(mBy, r.mains))
 				ui.pct:UpdateValue(r.pct)
-				ui.need:UpdateValue(r.need)
 			end)
 			loading = false
 			refreshThr()
@@ -5712,15 +5694,7 @@ local sellLbl = SRs:Label({Text = "-"})
 			if loading then return end
 			rule(cur.base).on = v == true; sv()
 		end})
-	ui.opts = L:Dropdown({Name = "ออฟชั่นที่อยากได้ (บรรทัดรอง)", Multi = true, Required = false, Search = true,
-		Options = o0, Default = picked(oBy0, r0.opts),
-		Callback = function(v)
-			if loading then return end
-			local set = {}
-			for lbl in pairs(readMulti(v)) do if ui.oBy[lbl] then set[ui.oBy[lbl]] = true end end
-			rule(cur.base).opts = set; sv(); refreshThr()
-		end})
-	ui.mains = L:Dropdown({Name = "Main ที่อยากได้ (ไม่เลือก = ไม่สน main)", Multi = true, Required = false,
+	ui.mains = L:Dropdown({Name = "Main ที่จะเก็บ (main อื่น = ขาย)", Multi = true, Required = false,
 		Options = m0, Default = picked(mBy0, r0.mains),
 		Callback = function(v)
 			if loading then return end
@@ -5728,21 +5702,15 @@ local sellLbl = SRs:Label({Text = "-"})
 			for lbl in pairs(readMulti(v)) do if ui.mBy[lbl] then set[ui.mBy[lbl]] = true end end
 			rule(cur.base).mains = set; sv(); refreshThr()
 		end})
-	ui.pct = L:Slider({Name = "ขั้นต่ำ (% ของช่วงที่โรลได้)", Minimum = 0, Maximum = 100, Default = r0.pct,
+	ui.pct = L:Slider({Name = "Main ขั้นต่ำ (% ของช่วง · 100% = max เท่านั้น)", Minimum = 0, Maximum = 100, Default = r0.pct,
 		Precision = 0, DisplayMethod = "Round", Suffix = "%",
 		Callback = function(v)
 			if loading then return end
 			rule(cur.base).pct = math.floor(v + 0.5); sv(); refreshThr()
 		end})
-	ui.need = L:Slider({Name = "ต้องผ่านอย่างน้อย (บรรทัด)", Minimum = 1, Maximum = 4, Default = r0.need,
-		Precision = 0, DisplayMethod = "Round", Suffix = " บรรทัด",
-		Callback = function(v)
-			if loading then return end
-			rule(cur.base).need = math.floor(v + 0.5); sv(); refreshThr()
-		end})
 	ui.thr = L:Label({Text = thresholdText()})
 	stats.dgUi = ui   -- diagnostics
-	L:Label({Text = "0% = ค่าต่ำสุดที่โรลได้ · 100% = ค่าสูงสุด (คิดตามเลเวลของชิ้นนั้น)\nเช่น Crit Rate L95 โรลได้ 3% ~ 17.7% → ตั้ง 70% = ต้องได้ ≥ 13.3%"})
+	L:Label({Text = "0% = ค่าต่ำสุดที่โรลได้ · 100% = ค่าสูงสุด (คิดตามเลเวลของชิ้นนั้น)\nเช่น main Attack L95 โรลได้ 1.5% ~ 7.4% → 100% = เก็บเฉพาะ 7.4%\nดูแค่ main (บรรทัดบนสุด) ไม่ดูบรรทัดรอง"})
 
 	R:Header({Text = "สถานะ"})
 	local stLbl = R:Label({Text = "-"})
