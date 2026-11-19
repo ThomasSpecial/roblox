@@ -5517,7 +5517,7 @@ local sellLbl = SRs:Label({Text = "-"})
 		for uid, piece in pairs(g.gear) do
 			if type(piece) == "table" and piece.id and EQ.defs[piece.id] and EQ.defs[piece.id].dungeon then
 				local b = baseOf(piece.id)
-				if byBase[b] and (not onlyBase or b == onlyBase) then
+				if byBase[b] and (not onlyBase or b == onlyBase or (type(onlyBase) == "table" and onlyBase[b])) then
 					res.total += 1
 					local v, why = judge(piece, uid, prot)
 					if v == "sell" then
@@ -5612,27 +5612,34 @@ local sellLbl = SRs:Label({Text = "-"})
 		Callback = function(v) e.phDgSellRefined = v; sv() end}, "PHDgSellRefined")
 	L:Label({Text = "เปิดทีละชิ้นด้านล่าง: ชิ้นที่ผ่านเงื่อนไข = เก็บ · ไม่ผ่าน = ขาย\nไม่ขายเด็ดขาด: ของที่ lock · ที่ใส่อยู่ · ที่อยู่ในพรีเซ็ต\nชิ้นที่ยังไม่เปิด หรือยังไม่เลือก main = ไม่แตะ"})
 
-	L:Header({Text = "ตั้งค่าแต่ละชิ้น"})
-	local cur = items[1]
+	-- user: "ทำให้เลือกหลายชิ้นได้ดิ" -> the piece picker is multi-select; the controls below
+	-- write to every picked piece. Each piece only takes the mains it can roll (a Mid Head
+	-- has no Attack main) -- a piece left with none stays unconfigured = never sold.
+	L:Header({Text = "ตั้งค่าชิ้น (เลือกได้หลายชิ้น)"})
 	local ui = {}
 	local itemLabels, itemBy = {}, {}
 	for _, it in ipairs(items) do table.insert(itemLabels, it.label); itemBy[it.label] = it end
-	local function optList(it)   -- labels + label->key for the option / main dropdowns
-		local rg = ranges(it.rep)
-		local o, oBy, m, mBy = {}, {}, {}, {}
-		for _, k in ipairs(rg.order) do
-			local lbl = ("%s (%s)"):format(lineName(k), rg.lines[k] and rg.lines[k].text or "ค่าตายตัวแบบเก่า")
-			table.insert(o, lbl); oBy[lbl] = k
+	local sel, selSet = {items[1]}, {[items[1].base] = true}
+	local function mainList()   -- union of the mains the picked pieces can roll
+		local m, mBy, seen = {}, {}, {}
+		for _, it in ipairs(sel) do
+			for _, k in ipairs(ranges(it.rep).mainOrder) do
+				if not seen[k] then
+					seen[k] = true
+					local lbl = lineName(k)
+					table.insert(m, lbl); mBy[lbl] = k
+				end
+			end
 		end
-		for _, k in ipairs(rg.mainOrder) do
-			local lbl = ("%s (%s)"):format(lineName(k), rg.mains[k].text)
-			table.insert(m, lbl); mBy[lbl] = k
-		end
-		return o, oBy, m, mBy
+		return m, mBy
 	end
-	local function picked(by, set)
+	local function pickedMains(mBy)   -- labels of every main picked on any selected piece
 		local out = {}
-		for lbl, k in pairs(by) do if set[k] then table.insert(out, lbl) end end
+		for lbl, k in pairs(mBy) do
+			for _, it in ipairs(sel) do
+				if rule(it.base).mains[k] then table.insert(out, lbl); break end
+			end
+		end
 		return out
 	end
 	local function fmtAt(rg, p)
@@ -5641,76 +5648,91 @@ local sellLbl = SRs:Label({Text = "-"})
 		return tostring(math.ceil(v - 1e-6))
 	end
 	local function thresholdText()
-		local r = rule(cur.base)
-		local p = r.pct / 100
-		local lines = {}
-		local function each(set, isMain, order)
-			for _, k in ipairs(order) do
-				if set[k] then
-					local parts = {}
-					for _, id in ipairs(cur.ids) do
-						local rr = ranges(id)
-						local rg = (isMain and rr.mains or rr.lines)[k]
-						if rg then table.insert(parts, ("≥%s (L%s)"):format(fmtAt(rg, p), tostring(EQ.defs[id].level))) end
+		if #sel == 0 then return "ยังไม่ได้เลือกชิ้น" end
+		local out = {}
+		for _, it in ipairs(sel) do
+			local r = rule(it.base)
+			local p = r.pct / 100
+			local parts = {}
+			for _, k in ipairs(ranges(it.rep).mainOrder) do
+				if r.mains[k] then
+					local lv = {}
+					for _, id in ipairs(it.ids) do
+						local rg = ranges(id).mains[k]
+						if rg then table.insert(lv, ("≥%s L%s"):format(fmtAt(rg, p), tostring(EQ.defs[id].level))) end
 					end
-					if #parts == 0 then parts = {"นับผ่านทุกค่า (ออฟชั่นแบบเก่า)"} end
-					table.insert(lines, ("%s%s: %s"):format(isMain and "main " or "", lineName(k), table.concat(parts, " · ")))
+					table.insert(parts, lineName(k) .. " " .. table.concat(lv, " / "))
 				end
 			end
+			table.insert(out, ("%s %s (%d%%): %s"):format(r.on and "●" or "○", it.name, r.pct,
+				#parts > 0 and table.concat(parts, " · ") or "ยังไม่ได้เลือก main → ไม่ขาย"))
 		end
-		local rg = ranges(cur.rep)
-		each(r.mains, true, rg.mainOrder)
-		if #lines == 0 then return "ยังไม่ได้เลือก main → ชิ้นนี้จะไม่ถูกขาย" end
-		return ("เก็บเฉพาะ main %s:\n"):format(r.pct >= 100 and "ที่ max" or "ที่ถึงค่านี้")
-			.. table.concat(lines, "\n") .. "\nmain อื่น / ไม่ถึง = ขาย"
+		return "เก็บเฉพาะ main ที่ถึงค่า (● เปิดขาย · ○ ปิด):\n" .. table.concat(out, "\n") .. "\nmain อื่น / ไม่ถึง = ขาย"
 	end
 	local function refreshThr()
 		if ui.thr then pcall(function() ui.thr:UpdateName(thresholdText()) end) end
 	end
 	local loading = false
-	ui.item = L:Dropdown({Name = "เลือกชิ้นที่จะตั้งค่า", Multi = false, Required = true, Search = true,
-		Options = itemLabels, Default = 1,
+	local function loadControls()
+		local m, mBy = mainList()
+		ui.mBy = mBy
+		local first = sel[1] and rule(sel[1].base)
+		loading = true
+		pcall(function()
+			ui.on:UpdateState(first and first.on or false)
+			ui.mains:ClearOptions(); ui.mains:InsertOptions(m); ui.mains:UpdateSelection(pickedMains(mBy))
+			ui.pct:UpdateValue(first and first.pct or 70)
+		end)
+		loading = false
+		refreshThr()
+	end
+	ui.item = L:Dropdown({Name = "เลือกชิ้นที่จะตั้งค่า (หลายชิ้นได้)", Multi = true, Required = false, Search = true,
+		Options = itemLabels, Default = {items[1].label},
 		Callback = function(v)
-			local it = itemBy[type(v) == "table" and (next(v)) or v]
-			if not it or it == cur then return end
-			cur = it
-			local r = rule(it.base)
-			local o, oBy, m, mBy = optList(it)
-			ui.oBy, ui.mBy = oBy, mBy
-			loading = true
-			pcall(function()
-				ui.on:UpdateState(r.on)
-				ui.mains:ClearOptions(); ui.mains:InsertOptions(m); ui.mains:UpdateSelection(picked(mBy, r.mains))
-				ui.pct:UpdateValue(r.pct)
-			end)
-			loading = false
-			refreshThr()
+			local picked = readMulti(v)
+			local nsel, nset = {}, {}
+			for _, it in ipairs(items) do
+				if picked[it.label] then table.insert(nsel, it); nset[it.base] = true end
+			end
+			local same = #nsel == #sel
+			if same then for b in pairs(nset) do if not selSet[b] then same = false; break end end end
+			if same then return end
+			sel, selSet = nsel, nset
+			if ui.on then loadControls() end
 		end})
-	local r0 = rule(cur.base)
-	local o0, oBy0, m0, mBy0 = optList(cur)
-	ui.oBy, ui.mBy = oBy0, mBy0
-	ui.on = L:Toggle({Name = "ขายชิ้นนี้ (ไม่ผ่านเงื่อนไข = ขาย)", Default = r0.on,
+	local m0, mBy0 = mainList()
+	ui.mBy = mBy0
+	local r0 = rule(items[1].base)
+	ui.on = L:Toggle({Name = "ขายชิ้นที่เลือก (ไม่ผ่านเงื่อนไข = ขาย)", Default = r0.on,
 		Callback = function(v)
 			if loading then return end
-			rule(cur.base).on = v == true; sv()
+			for _, it in ipairs(sel) do rule(it.base).on = v == true end
+			sv(); refreshThr()
 		end})
 	ui.mains = L:Dropdown({Name = "Main ที่จะเก็บ (main อื่น = ขาย)", Multi = true, Required = false,
-		Options = m0, Default = picked(mBy0, r0.mains),
+		Options = m0, Default = pickedMains(mBy0),
 		Callback = function(v)
 			if loading then return end
-			local set = {}
-			for lbl in pairs(readMulti(v)) do if ui.mBy[lbl] then set[ui.mBy[lbl]] = true end end
-			rule(cur.base).mains = set; sv(); refreshThr()
+			local want = {}
+			for lbl in pairs(readMulti(v)) do if ui.mBy[lbl] then want[ui.mBy[lbl]] = true end end
+			for _, it in ipairs(sel) do
+				local can = ranges(it.rep).mains
+				local set = {}
+				for k in pairs(want) do if can[k] then set[k] = true end end
+				rule(it.base).mains = set
+			end
+			sv(); refreshThr()
 		end})
 	ui.pct = L:Slider({Name = "Main ขั้นต่ำ (% ของช่วง · 100% = max เท่านั้น)", Minimum = 0, Maximum = 100, Default = r0.pct,
 		Precision = 0, DisplayMethod = "Round", Suffix = "%",
 		Callback = function(v)
 			if loading then return end
-			rule(cur.base).pct = math.floor(v + 0.5); sv(); refreshThr()
+			for _, it in ipairs(sel) do rule(it.base).pct = math.floor(v + 0.5) end
+			sv(); refreshThr()
 		end})
 	ui.thr = L:Label({Text = thresholdText()})
 	stats.dgUi = ui   -- diagnostics
-	L:Label({Text = "0% = ค่าต่ำสุดที่โรลได้ · 100% = ค่าสูงสุด (คิดตามเลเวลของชิ้นนั้น)\nเช่น main Attack L95 โรลได้ 1.5% ~ 7.4% → 100% = เก็บเฉพาะ 7.4%\nดูแค่ main (บรรทัดบนสุด) ไม่ดูบรรทัดรอง"})
+	L:Label({Text = "ตั้งค่าด้านบนใช้กับทุกชิ้นที่เลือก · ชิ้นไหนโรล main นั้นไม่ได้ก็ข้ามไป\n0% = ค่าต่ำสุดที่โรลได้ · 100% = ค่าสูงสุด (คิดตามเลเวลของชิ้นนั้น)\nเช่น main Attack L95 โรลได้ 1.5% ~ 7.4% → 100% = เก็บเฉพาะ 7.4%"})
 
 	R:Header({Text = "สถานะ"})
 	local stLbl = R:Label({Text = "-"})
@@ -5731,11 +5753,14 @@ local sellLbl = SRs:Label({Text = "-"})
 				stLbl:UpdateName(("Auto Sell ของดัน: %s · %s\nขายไปแล้ว %d ชิ้น · เปิดไว้ %d/%d ชิ้น\nเข้าเงื่อนไขขายตอนนี้: %s"):format(
 					e.phDgSellOn and "เปิด" or "ปิด", tostring(stats.dgSell), stats.dgSold, on, #items,
 					all and ("%d ชิ้น (~%s ทอง)"):format(#all.sell, goldText(all.gold)) or "-"))
-				local one = scan(cur.base)
+				if #sel == 0 then pvLbl:UpdateName("ยังไม่ได้เลือกชิ้น"); return end
+				local one = scan(selSet)
 				if one then
-					local t = {("%s\nมี %d ชิ้น · เก็บ %d · จะขาย %d%s"):format(cur.label, one.total, one.keep, #one.sell,
-						rule(cur.base).on and "" or " (ชิ้นนี้ยังปิดอยู่)")}
-					for i = 1, math.min(#one.sell, 8) do table.insert(t, "✕ " .. pieceText(one.sell[i])) end
+					local names = {}
+					for _, it in ipairs(sel) do table.insert(names, it.name) end
+					local t = {("%s\nมี %d ชิ้น · เก็บ %d · จะขาย %d (~%s ทอง)"):format(table.concat(names, ", "),
+						one.total, one.keep, #one.sell, goldText(one.gold))}
+					for i2 = 1, math.min(#one.sell, 8) do table.insert(t, "✕ " .. pieceText(one.sell[i2])) end
 					if #one.sell > 8 then table.insert(t, ("... อีก %d ชิ้น (กดปุ่มด้านล่างดูทั้งหมด)"):format(#one.sell - 8)) end
 					pvLbl:UpdateName(table.concat(t, "\n"))
 				end
