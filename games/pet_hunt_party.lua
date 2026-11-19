@@ -2544,7 +2544,9 @@ task.spawn(function()
 		if ff and ff.Parent and ff.PrimaryPart and (tonumber(ff:GetAttribute("Health")) or 0) > 0 then
 			bossPos = ff.PrimaryPart.Position
 		end
+		local tq = os.clock()
 		local esc = findEscape(pos, bossPos, hum.MoveDirection)
+		stats.cpuEsc = (stats.cpuEsc or 0) + (os.clock() - tq)
 		if not esc and dg then
 			-- enraged double stars (Spirit Star + Eclipse, each with a rotated follow-up)
 			-- leave no gap at our usual margin -> we stood still and ate 4 spokes. Take the
@@ -3979,7 +3981,9 @@ task.spawn(function()
 				getgenv().__PHP_OLDRANGE = nil; getgenv().__PHP_SETRANGE = nil
 			end
 			stayAnchored = false
+			local tq = os.clock()   -- cpu use (diagnostics: stats.cpuDg seconds total)
 			local okT, errT = pcall(dgTick, hum, hrp)
+			stats.cpuDg = (stats.cpuDg or 0) + (os.clock() - tq)
 			if not okT then stats.farm = "ดันเจี้ยน error: " .. tostring(errT) end
 			continue
 		end
