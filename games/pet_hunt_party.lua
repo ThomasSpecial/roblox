@@ -3004,7 +3004,7 @@ local function dgRun(hrp)
 	local def = id and DG and DG.byId[id]
 	if not def then return nil end
 	local slot, bestD = 0, nil
-	for s = 0, math.max((DG.slots or 8) - 1, 0) do
+	for s = 0, math.max(DG.slots or 8, 1) do
 		local ok, c = pcall(DG.roomCenter, def, s, 1)
 		if ok and c then
 			local d = math.abs(c.Z - hrp.Position.Z)
@@ -3019,9 +3019,21 @@ local function dgRun(hrp)
 	return {def = def, id = id, slot = slot, stage = stage, laneZ = okC and c1 and c1.Z or hrp.Position.Z,
 		prefix = ("dg_%s_%s_"):format(id, diff)}
 end
+-- user: "ดันเจี้ยนอัพเดตมาแก้น่อย": rooms are no longer discs -- the wave halls are long
+-- strips along X (hx 75 x hz 18-20), the ossuary 36x36, the throne a 65 square
+-- (DG.extentX/extentZ). The old "radius" (18) cut every monster farther than 28 from the
+-- centre, so the bot stood in the middle "waiting for the next wave" with the hall full.
+-- Returns centre, R (the larger half-extent, for distance-style checks), and the two
+-- half-extents for an exact in-room test.
 local function dgRoom(run, stage)
 	local ok, c = pcall(DG.roomCenter, run.def, run.slot, stage)
-	return ok and c or nil, run.def.stages[stage] and run.def.stages[stage].radius or 30
+	local st = run.def.stages[stage]
+	if not st then return ok and c or nil, 30 end
+	local okX, ex = pcall(function() return DG.extentX and DG.extentX(st) end)
+	local okZ, ez = pcall(function() return DG.extentZ and DG.extentZ(st) end)
+	ex = okX and tonumber(ex) or tonumber(st.radius) or 30
+	ez = okZ and tonumber(ez) or tonumber(st.radius) or 30
+	return ok and c or nil, math.max(ex, ez), ex, ez
 end
 -- the boss chest's prompt (spawns after the boss dies, near the throne room)
 local function dgChestPrompt(run, hrp)
@@ -3191,7 +3203,7 @@ local function dgTick(hum, hrp)
 	end
 	dgStats.chestAt = nil
 	-- current room: the stage attr says which; monsters of our run only
-	local center, radius = dgRoom(run, run.stage)
+	local center, radius, roomHX, roomHZ = dgRoom(run, run.stage)
 	-- HOLD THE MIDDLE (user: "ลากบอสออกไกลเกินเลือดดี / พยายามอยู่ center"): pulling
 	-- the boss away from its room makes it regen to full. We stand on the room centre,
 	-- only shoot what's in range from there, step at most DG_STEP_R out toward a far
@@ -3224,7 +3236,9 @@ local function dgTick(hum, hrp)
 			-- this room only (or something already in range of us): never go hunting
 			-- leftovers down the corridor
 			local reachM = ATTACK_RANGE + (tonumber(m:GetAttribute("Radius")) or 1) - 0.5
-			if (center and flatDist(mp, center) <= radius + 10) or flatDist(mp, pos) <= reachM then
+			local inRoom = center and math.abs(mp.X - center.X) <= (roomHX or radius) + 10
+				and math.abs(mp.Z - center.Z) <= (roomHZ or radius) + 10
+			if inRoom or flatDist(mp, pos) <= reachM then
 				if m:GetAttribute("IsBoss") == true then boss = m else mobs[#mobs + 1] = m end
 			end
 		end
