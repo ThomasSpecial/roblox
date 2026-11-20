@@ -31,9 +31,16 @@ local State = require(plr:WaitForChild("PlayerScripts"):WaitForChild("RunAFarmCl
 
 -- ------------------------------------------------------------------ settings
 local SF = ("RunAFarm/state_%d.json"):format(plr.UserId)
-local UPG_KEYS = {"pads", "price", "hens", "workers"}
-local UPG_NAME = {pads = "ปุ่มซื้อบนพื้น (ตึก/ทุ่ง/ของตกแต่ง)", price = "ราคาไข่", hens = "ซื้อไก่", workers = "จ้าง + อัปคนงาน"}
-local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"pads", "price", "hens", "workers"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
+local UPG_KEYS = {"price", "hens", "hire", "workerUp", "crops", "pads"}
+local UPG_NAME = {
+	price = "ราคาไข่ (Egg Price +)",
+	hens = "ซื้อไก่เข้าเล้า",
+	hire = "จ้างคนงานเพิ่ม",
+	workerUp = "อัปคนงาน (เดินเร็ว / ขนได้มาก)",
+	crops = "ปลดล็อกพืชใหม่",
+	pads = "ปุ่มซื้อบนพื้น (ตึก / ทุ่ง / ของตกแต่ง · เดินไปเหยียบ)",
+}
+local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"price", "hens", "hire", "workerUp", "crops", "pads"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -43,7 +50,12 @@ local function sv()
 		writefile(SF, HS:JSONEncode(e))
 	end)
 end
-local function upgOn(k) return e.upgrade and table.find(e.upgKeys or {}, k) ~= nil end
+-- old saves used one "workers" key for hiring + upgrades
+if type(e.upgKeys) == "table" and table.find(e.upgKeys, "workers") then
+	table.remove(e.upgKeys, table.find(e.upgKeys, "workers"))
+	for _, k in ipairs({"hire", "workerUp"}) do if not table.find(e.upgKeys, k) then table.insert(e.upgKeys, k) end end
+end
+local function upgOn(k) return table.find(e.upgKeys or {}, k) ~= nil end
 
 local st = {status = "-", eggs = 0, trips = 0, quests = 0, lastQuest = "-", seed = "-", pens = 0, water = 0, buys = 0, lastBuy = "-", wd = "-", err = "-"}
 
@@ -749,25 +761,28 @@ local function candidates(d, p)
 			end
 		end
 	end
-	if upgOn("workers") then
+	if upgOn("workerUp") then
 		for key, u in pairs(WorkCfg.UPGRADES or {}) do
-			local lv = (d.workerLevels and d.workerLevels[key]) or 0
-			if lv < u.max then
-				out[#out + 1] = {cost = math.floor(u.cost * u.growth ^ lv + 0.5), name = u.name, call = {"upgradeWorkers", key}}
-			end
+			local c = WorkCfg.upgradeCost(key, (d.workerLevels and d.workerLevels[key]) or 0)
+			if c then out[#out + 1] = {cost = c, name = u.name, call = {"upgradeWorkers", key}} end
 		end
+	end
+	if upgOn("hire") then
 		for _, role in ipairs(WorkCfg.ORDER or {}) do
 			local r = WorkCfg.ROLES[role]
 			local have = (d.workers and d.workers[role]) or 0
-			local okReq = not r.requires or d.owned[r.requires]
-			local cap = r.max
-			if r.perField then
-				cap = 0
-				for i = 1, 6 do if d.owned["Field" .. i] then cap += 1 end end
-				cap = math.min(cap, r.max)
+			local need = WorkCfg.requirement(role, have)
+			local c = WorkCfg.hireCost(role, have)
+			if r and c and (need == nil or d.owned[need]) then
+				out[#out + 1] = {cost = c, name = "จ้าง " .. r.name, call = {"hireWorker", role}}
 			end
-			if okReq and have < cap and r.cost then
-				out[#out + 1] = {cost = math.floor(r.cost * (r.growth or 1) ^ have + 0.5), name = "จ้าง " .. r.name, call = {"hireWorker", role}, guess = true}
+		end
+	end
+	if upgOn("crops") then
+		for _, id in ipairs(CropCfg.seeds or {}) do
+			local c = CropCfg[id]
+			if c and c.unlockPrice and d.unlocked and d.unlocked[id] == false and (not c.needs or d.owned[c.needs]) then
+				out[#out + 1] = {cost = c.unlockPrice, name = "ปลดล็อก " .. (c.name or id), call = {"unlockCrop", id}}
 			end
 		end
 	end
@@ -897,6 +912,7 @@ getgenv().__RAFW = Win
 local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
+	Upgrade = TG:Tab({Name = "Auto Upgrade", Image = "rbxassetid://10723346959"}),
 	Buy = TG:Tab({Name = "Auto Buy", Image = "rbxassetid://10723346959"}),
 	Event = TG:Tab({Name = "Event", Image = "rbxassetid://10723346959"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
@@ -922,28 +938,33 @@ L:Label({Text = "เดินเอง (ไม่วาร์ป): ลงลิ�
 L:Header({Text = "เควส"})
 L:Toggle({Name = "Auto Claim Quest", Default = e.claim, Callback = function(v) e.claim = v; sv() end}, "RAFClaim")
 L:Label({Text = "เควสเสร็จกดรับเงินเอง + รางวัลรายวัน\nเควสเก็บเกี่ยว/ส่งพืช → เปลี่ยนเมล็ดที่ปลูกเป็นพืชตามเควสให้ (ถ้ามีเมล็ด)"})
-L:Header({Text = "อัปเกรด (ใช้เงิน)"})
-L:Toggle({Name = "Auto อัปเกรด (ซื้ออันถูกสุดก่อน)", Default = e.upgrade, Callback = function(v) e.upgrade = v; sv() end}, "RAFUpg")
-local upgOpts, upgDef = {}, {}
-for _, k in ipairs(UPG_KEYS) do upgOpts[#upgOpts + 1] = UPG_NAME[k] end
-for _, k in ipairs(e.upgKeys or {}) do if UPG_NAME[k] then upgDef[#upgDef + 1] = UPG_NAME[k] end end
-L:Dropdown({Name = "└ อัปอะไรบ้าง", Multi = true, Required = false, Options = upgOpts, Default = upgDef,
-	Callback = function(v)
-		local keys = {}
-		for name, on in pairs(type(v) == "table" and v or {}) do
-			local label = type(name) == "number" and on or (on and name)
-			for k, n in pairs(UPG_NAME) do if n == label then keys[#keys + 1] = k end end
-		end
-		e.upgKeys = keys; sv()
-	end}, "RAFUpgKeys")
-L:Input({Name = "└ เก็บเงินไว้ไม่ใช้ ($)", Placeholder = "0", AcceptedCharacters = "Numeric",
-	Default = tostring(e.reserve or 0),
-	Callback = function(v) e.reserve = tonumber(v) or 0; sv() end}, "RAFReserve")
-
 local R = Tabs.Main:Section({Side = "Right"})
 R:Header({Text = "สถานะ"})
 local stLbl = R:Label({Text = "-"})
 R:Button({Name = "เก็บไข่ไปวางแผงตอนนี้", Callback = function() task.spawn(function() pcall(eggJob) end) end})
+
+local U = Tabs.Upgrade:Section({Side = "Left"})
+U:Header({Text = "อัปเกรด (ใช้เงิน)"})
+U:Toggle({Name = "Auto Upgrade", Default = e.upgrade, Callback = function(v) e.upgrade = v; sv() end}, "RAFUpg")
+U:Label({Text = "ซื้ออันที่ถูกสุดในหมวดที่เปิดก่อนเสมอ · ทีละ 1 อย่างทุก ~5 วิ\nซื้อไม่ได้ (เงินไม่พอ / ยังไม่ปลดล็อก) ข้ามไปลองใหม่ใน 30 วิ"})
+U:Header({Text = "หมวดที่จะอัป"})
+for _, k in ipairs(UPG_KEYS) do
+	U:Toggle({Name = UPG_NAME[k], Default = upgOn(k), Callback = function(v)
+		e.upgKeys = e.upgKeys or {}
+		local at = table.find(e.upgKeys, k)
+		if v and not at then table.insert(e.upgKeys, k) elseif not v and at then table.remove(e.upgKeys, at) end
+		sv()
+	end}, "RAFUpg_" .. k)
+end
+U:Input({Name = "เก็บเงินไว้ไม่ใช้ ($)", Placeholder = "0", AcceptedCharacters = "Numeric",
+	Default = tostring(e.reserve or 0),
+	Callback = function(v) e.reserve = tonumber(v) or 0; sv() end}, "RAFReserve")
+U:Label({Text = "เงินส่วนนี้ Auto Upgrade กับ Auto Buy จะไม่แตะ"})
+local UR = Tabs.Upgrade:Section({Side = "Right"})
+UR:Header({Text = "สถานะ"})
+local upgLbl = UR:Label({Text = "-"})
+UR:Header({Text = "คิวถัดไป (ถูกสุดก่อน)"})
+local queueLbl = UR:Label({Text = "-"})
 
 local B = Tabs.Buy:Section({Side = "Left"})
 B:Header({Text = "เมล็ดพันธุ์"})
@@ -969,7 +990,7 @@ B:Input({Name = "└ ซื้อเมื่อเหลือต่ำกว�
 	Default = tostring(e.seedMin or 20), Callback = function(v) e.seedMin = tonumber(v) or 0; sv() end}, "RAFSeedMin")
 B:Input({Name = "└ ซื้อจนมีถึง (ถุง)", Placeholder = "100", AcceptedCharacters = "Numeric",
 	Default = tostring(e.seedMax or 100), Callback = function(v) e.seedMax = tonumber(v) or 0; sv() end}, "RAFSeedMax")
-B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nเว้นเงินไว้ตาม 'เก็บเงินไว้ไม่ใช้' ในแท็บ Auto Farm · พืชที่ยังล็อกข้ามไป"})
+B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nเว้นเงินไว้ตาม 'เก็บเงินไว้ไม่ใช้' ในแท็บ Auto Upgrade · พืชที่ยังล็อกข้ามไป"})
 local BR = Tabs.Buy:Section({Side = "Right"})
 BR:Header({Text = "สถานะ"})
 local buyLbl = BR:Label({Text = "-"})
@@ -1004,7 +1025,6 @@ task.spawn(function()
 				("พืช: %s · เก็บ %d · drop %d ครั้ง · ปลูก %d แปลง"):format(st.crop, st.harvested, st.cropDrops, st.planted),
 				("เหมือง: %s · ขุดได้ %d · ขายแร่ %d"):format(st.mine, st.ores, st.mineSold),
 				("รับเควส %d · ล่าสุด: %s · เมล็ดตามเควส: %s"):format(st.quests, st.lastQuest, st.seed),
-				("อัปเกรด %d · ล่าสุด: %s"):format(st.buys, st.lastBuy),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
 			}, "\n"))
@@ -1026,6 +1046,18 @@ task.spawn(function()
 			else
 				evLbl:UpdateName(st.ev .. "\nยังไม่มีข้อมูลอีเวนต์")
 			end
+			upgLbl:UpdateName(table.concat({
+				e.upgrade and "เปิดอยู่" or "ปิดอยู่",
+				("ซื้อไปแล้ว %d อย่าง · ล่าสุด: %s"):format(st.buys, st.lastBuy),
+				("เงิน $%s · เก็บไว้ $%s"):format(fmt(d.cash), fmt(tonumber(e.reserve) or 0)),
+			}, "\n"))
+			local q, budget = {}, (d.cash or 0) - (tonumber(e.reserve) or 0)
+			local okC, list = pcall(candidates, d, plot())
+			for n, c in ipairs(okC and list or {}) do
+				if n > 6 then q[#q + 1] = ("… อีก %d อย่าง"):format(#list - 6); break end
+				q[#q + 1] = ("%s %s · $%s"):format(c.cost <= budget and "✓" or "✗", c.name, fmt(c.cost))
+			end
+			queueLbl:UpdateName(#q > 0 and table.concat(q, "\n") or "ไม่มีอะไรให้อัปในหมวดที่เปิด")
 			buyLbl:UpdateName(table.concat({
 				st.seedBuy,
 				"มีอยู่: " .. (#seeds > 0 and table.concat(seeds, " · ") or "ยังไม่ได้เลือกเมล็ด"),
