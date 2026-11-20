@@ -101,35 +101,26 @@ local function waitFor(cond, t)
 	end
 	return cond()
 end
--- nothing teleports: every job walks the character with PathfindingService waypoints (straight MoveTo when no path).
--- The server only counts zones / harvests / prompts where the character really stands -- there is no remote for them.
+-- Moving = warp (user, 2026-11-21: "ใช้วาร์ปเอาสิ จะเดินทำไม"): the character is CFramed onto the spot and the camera
+-- follows as usual. The server only counts zones / harvests / prompts where the character really stands, so the
+-- callers still wait there (DWELL for zones, HOP per crop). The spot is snapped onto the ground below it.
+local groundRay = RaycastParams.new()
+groundRay.FilterType = Enum.RaycastFilterType.Exclude
+groundRay.RespectCanCollide = true   -- zone boxes (CanCollide off) must not count as ground
+local function groundAt(pos)
+	local c = plr.Character
+	groundRay.FilterDescendantsInstances = c and {c} or {}
+	local hit = workspace:Raycast(pos + Vector3.new(0, 6, 0), Vector3.new(0, -40, 0), groundRay)
+	return hit and (hit.Position + Vector3.new(0, 3, 0)) or pos
+end
 local function walkPath(target, near, timeout, keepGoing)
-	local h, r = hum(), hrp()
-	if not h or not r then return false end
-	if (r.Position - target).Magnitude <= near then return true end
-	local wps
-	local path = PFS:CreatePath({AgentRadius = 1.8, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 5})
-	local ok = pcall(function() path:ComputeAsync(r.Position, target) end)
-	if ok and path.Status == Enum.PathStatus.Success then wps = path:GetWaypoints() else wps = {{Position = target, Action = Enum.PathWaypointAction.Walk}} end
-	local t0 = os.clock()
-	for _, wp in ipairs(wps) do
-		if not keepGoing() or busyHands() then h:MoveTo(r.Position); return false end
-		if wp.Action == Enum.PathWaypointAction.Jump then h.Jump = true end
-		h:MoveTo(wp.Position)
-		local w0, lastPos = os.clock(), r.Position
-		while ((r.Position - wp.Position) * Vector3.new(1, 0, 1)).Magnitude > 2.5 do
-			if (r.Position - target).Magnitude <= near then h:MoveTo(r.Position); return true end
-			if os.clock() - t0 > timeout or not keepGoing() or busyHands() then h:MoveTo(r.Position); return false end
-			if os.clock() - w0 > 1.5 then
-				if (r.Position - lastPos).Magnitude < 1 then h.Jump = true end
-				if os.clock() - w0 > 4 then break end
-				lastPos = r.Position
-			end
-			task.wait(0.05)
-		end
-		if (r.Position - target).Magnitude <= near then h:MoveTo(r.Position); return true end
-	end
-	return (r.Position - target).Magnitude <= near + 1
+	local r = hrp()
+	if not r or not keepGoing() or busyHands() then return false end
+	local spot = groundAt(target)
+	r.AssemblyLinearVelocity = Vector3.zero
+	r.CFrame = CFrame.new(spot) * (r.CFrame - r.CFrame.Position)
+	task.wait(0.1)
+	return true
 end
 -- zones are polled by the server about every 0.5 s, so standing DWELL seconds always counts
 local DWELL = 0.6
@@ -142,6 +133,31 @@ local function trip(fn)
 	if not ok then st.err = tostring(err):sub(1, 120) end
 end
 local function go(pos, near, timeout) return walkPath(pos, near or 2.5, timeout or 30, alive) end
+
+-- every job runs as its own supervised loop: each pass gets a fresh thread and a time limit. A pass that hangs
+-- (a walk that never resolves, a prompt / remote that never answers) is cancelled and the loop carries on, so one
+-- stuck job can't freeze the others the way the single main loop did (2026-11-21: quests + upgrades sat still).
+local function loopEvery(name, period, limit, body)
+	task.spawn(function()
+		while alive() do
+			local done = false
+			local th = task.spawn(function()
+				local ok, err = pcall(body)
+				if not ok then st.err = name .. ": " .. tostring(err):sub(1, 110) end
+				done = true
+			end)
+			local t0 = os.clock()
+			while not done and alive() and os.clock() - t0 < limit do task.wait(0.2) end
+			if not done then
+				pcall(task.cancel, th)
+				tripBusy, ownMove = false, false
+				pcall(function() local h, r = hum(), hrp(); if h and r then h:MoveTo(r.Position) end end)
+				st.wd = ("%s ค้างเกิน %d วิ → ตัดแล้วเริ่มใหม่ · %s"):format(name, limit, os.date("%H:%M:%S"))
+			end
+			task.wait(period)
+		end
+	end)
+end
 
 -- ------------------------------------------------------------------ eggs: coops -> bag -> stand
 local function bagEggs(d) return (d.basket and d.basket.egg) or 0 end
@@ -360,7 +376,7 @@ local function mineStep()
 	if full and oreInBag(d) > 0 then
 		local dz = mine.Depots:FindFirstChild("DropZone", true)
 		if not dz then st.mine = "หา Ore Depot ไม่เจอ"; return end
-		st.mine = "ถุงเต็ม → เดินไปขายที่ Ore Depot"
+		st.mine = "ถุงเต็ม → วาร์ปไปขายที่ Ore Depot"
 		local spot = Vector3.new(dz.Position.X, dz.Position.Y - dz.Size.Y / 2 + 3, dz.Position.Z)
 		if walkTo(spot, 4, 45) then
 			local before = oreInBag(D())
@@ -398,18 +414,13 @@ local oreConn = State.changed.Event:Connect(function(d)
 	lastOre = n
 end)
 
-task.spawn(function()
-	while alive() do
-		if e.mine then
-			local ok, err = true, nil
-			if not tripBusy then tripBusy = true; ok, err = pcall(mineStep); tripBusy = false end
-			if not ok then st.err = "mine: " .. tostring(err):sub(1, 110); task.wait(1) end
-			task.wait()
-		else
-			st.mine = "ปิดอยู่"
-			task.wait(0.5)
-		end
-	end
+loopEvery("Auto Mine", 0.05, 150, function()
+	if not e.mine then st.mine = "ปิดอยู่"; task.wait(0.5); return end
+	if tripBusy then return end
+	tripBusy = true
+	local ok, err = pcall(mineStep)
+	tripBusy = false
+	if not ok then st.err = "mine: " .. tostring(err):sub(1, 110); task.wait(1) end
 end)
 
 -- ------------------------------------------------------------------ Auto Farm Crop
@@ -434,17 +445,10 @@ local function bagRoom(d) return (d.basketCap or 0) - (d.basketUsed or 0) end
 local function storageFull(d) return (d.storageUsed or 0) >= (d.storageCap or 0) - 2 end
 local function cropOn() return alive() and e.crop end
 
+local HOP = 0.12   -- tested: a 0.12 s stop on each ripe crop always harvested it
 local function moveNear(pos, near, timeout)
-	if ((hrp() and hrp().Position or pos) - pos).Magnitude > 25 then return walkPath(pos, near, timeout, cropOn) end
-	local h, r = hum(), hrp()
-	if not h or not r then return false end
-	local t0 = os.clock()
-	h:MoveTo(pos)
-	while ((r.Position - pos) * Vector3.new(1, 0, 1)).Magnitude > near do
-		if os.clock() - t0 > timeout or not e.crop or busyHands() then h:MoveTo(r.Position); return false end
-		if os.clock() - t0 > 1.2 and r.AssemblyLinearVelocity.Magnitude < 1 then h.Jump = true; h:MoveTo(pos) end
-		task.wait(0.05)
-	end
+	if not walkPath(pos, near, timeout, cropOn) then return false end
+	task.wait(HOP)
 	return true
 end
 local function cropRun(fn)
@@ -608,16 +612,8 @@ local function seedBuyStep()
 	end
 	st.seedBuy = #notes > 0 and table.concat(notes, " · ") or ("เมล็ดพอ (ต่ำกว่า %d → ซื้อถึง %d)"):format(lo, hi)
 end
-task.spawn(function()
-	while alive() do
-		if e.seedBuy then
-			local ok, err = pcall(seedBuyStep)
-			if not ok then st.err = "seed: " .. tostring(err):sub(1, 110) end
-		else
-			st.seedBuy = "ปิดอยู่"
-		end
-		task.wait(3)
-	end
+loopEvery("Auto Buy", 3, 30, function()
+	if e.seedBuy then seedBuyStep() else st.seedBuy = "ปิดอยู่" end
 end)
 
 local function plantField(p, f)
@@ -665,42 +661,31 @@ local cropConn = State.changed.Event:Connect(function(d)
 	lastCrop = n
 end)
 
-task.spawn(function()
-	while alive() do
-		if e.crop then
-			local ok, err = pcall(cropStep)
-			if not ok then st.err = "crop: " .. tostring(err):sub(1, 110) end
-		else
-			st.crop = "ปิดอยู่"
-		end
-		task.wait(0.5)
-	end
+loopEvery("Auto Farm Crop", 0.5, 400, function()
+	if e.crop then cropStep() else st.crop = "ปิดอยู่" end
 end)
 
-task.spawn(function()
-	while alive() do
-		local d, p = D(), plot()
-		if not (e.evWater or e.evFeed) then
-			st.ev = "ปิดอยู่"
-		elseif not d or not p then
-			st.ev = "รอข้อมูลฟาร์ม"
-		elseif not weighLive(d) then
-			st.ev = "อีเวนต์ Weigh-off ไม่เปิดตอนนี้"
-		elseif busyHands() then
-			st.ev = "พัก: " .. busyHands()
-		elseif e.evWater and (tonumber(d.weighoff.wetUntil) or 0) <= now() and not tripBusy then
-			st.ev = "เดินไปรดน้ำที่ถัง"
-			pcall(waterJob)
-		elseif wantFeed(d) and not tripBusy then
-			trip(function() feedNow(p) end)
-		elseif e.evFeed and (d.weighoff.fedToday or 0) >= WeighCfg.DAILY_LB and not e.evFeedOver then
-			st.ev = "ป้อนครบโควต้าวันนี้แล้ว (1,500 lb)"
-		elseif e.evFeed and cropsInBag(d) <= 0 then
-			st.ev = "รอพืชในถุง (เปิด Auto Farm Crop จะเก็บมาป้อนให้)"
-		else
-			st.ev = "รอ (น้ำยังไม่แห้ง)"
-		end
-		task.wait(2)
+loopEvery("Event", 2, 120, function()
+	local d, p = D(), plot()
+	if not (e.evWater or e.evFeed) then
+		st.ev = "ปิดอยู่"
+	elseif not d or not p then
+		st.ev = "รอข้อมูลฟาร์ม"
+	elseif not weighLive(d) then
+		st.ev = "อีเวนต์ Weigh-off ไม่เปิดตอนนี้"
+	elseif busyHands() then
+		st.ev = "พัก: " .. busyHands()
+	elseif e.evWater and (tonumber(d.weighoff.wetUntil) or 0) <= now() and not tripBusy then
+		st.ev = "เดินไปรดน้ำที่ถัง"
+		pcall(waterJob)
+	elseif wantFeed(d) and not tripBusy then
+		trip(function() feedNow(p) end)
+	elseif e.evFeed and (d.weighoff.fedToday or 0) >= WeighCfg.DAILY_LB and not e.evFeedOver then
+		st.ev = "ป้อนครบโควต้าวันนี้แล้ว (1,500 lb)"
+	elseif e.evFeed and cropsInBag(d) <= 0 then
+		st.ev = "รอพืชในถุง (เปิด Auto Farm Crop จะเก็บมาป้อนให้)"
+	else
+		st.ev = "รอ (น้ำยังไม่แห้ง)"
 	end
 end)
 
@@ -829,12 +814,6 @@ local function candidates(d, p)
 			out[#out + 1] = {cost = cost, name = "จ้าง " .. r.name, call = {"hireWorker", role}, pb = payback(cost, nil)}
 		end
 	end
-	for _, id in ipairs(CropCfg.seeds or {}) do
-		local cc = CropCfg[id]
-		if cc and cc.unlockPrice and d.unlocked and d.unlocked[id] == false and (not cc.needs or d.owned[cc.needs]) then
-			out[#out + 1] = {cost = cc.unlockPrice, name = "ปลดล็อก " .. (cc.name or id), call = {"unlockCrop", id}, pb = payback(cc.unlockPrice, nil)}
-		end
-	end
 	table.sort(out, function(a, b)
 		if a.pb ~= b.pb then return a.pb < b.pb end
 		return a.cost < b.cost
@@ -886,47 +865,20 @@ local function upgradeJob()
 end
 
 -- ------------------------------------------------------------------ main loop + watchdog
-local beat = os.clock()
-task.spawn(function()
-	local tick = 0
-	while alive() do
-		tick += 1
-		beat = os.clock()
-		if e.claim and D() then
-			local ok, err = pcall(claimJob)
-			if not ok then st.err = tostring(err):sub(1, 120) end
-		end
-		if e.farm and D() and plot() then
-			local ok, err = pcall(function()
-				local why = busyHands()
-				if why then
-					st.status = "พักการวาร์ป: " .. why
-				else
-					st.status = "ฟาร์มอยู่"
-					eggJob()
-					if not busyHands() then penJob() end
-				end
-				if tick % 5 == 0 then upgradeJob() end
-			end)
-			if not ok then st.err = tostring(err):sub(1, 120) end
-		elseif not e.farm then
-			st.status = "ปิดอยู่"
-			if tick % 5 == 0 then pcall(upgradeJob) end
-		else
-			st.status = "รอข้อมูลฟาร์ม"
-		end
-		task.wait(1)
-	end
+loopEvery("Auto Claim Quest", 2, 30, function()
+	if e.claim and D() then claimJob() end
 end)
-task.spawn(function()
-	while alive() do
-		task.wait(10)
-		if os.clock() - beat > 30 then
-			st.wd = "ลูปค้าง → เริ่มใหม่ · " .. os.date("%H:%M:%S")
-			ownMove = false
-			beat = os.clock()
-		end
-	end
+loopEvery("Auto Farm", 1, 180, function()
+	if not e.farm then st.status = "ปิดอยู่"; return end
+	if not (D() and plot()) then st.status = "รอข้อมูลฟาร์ม"; return end
+	local why = busyHands()
+	if why then st.status = "พัก: " .. why; return end
+	st.status = "ฟาร์มอยู่"
+	eggJob()
+	if not busyHands() then penJob() end
+end)
+loopEvery("Auto Upgrade", 5, 90, function()
+	if e.upgrade and D() then upgradeJob() end
 end)
 
 -- anti-AFK: Roblox's 20-minute idle kick fires Players.LocalPlayer.Idled first; a virtual click resets it
@@ -985,7 +937,7 @@ local Tabs = {
 local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
-L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
+L:Label({Text = "เปิดอันเดียวทำให้หมด (วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
 	.. "watchdog"})
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
 L:Header({Text = "ปลูกพืช"})
@@ -996,7 +948,7 @@ L:Toggle({Name = "Auto Mine", Default = e.mine, Callback = function(v)
 	e.mine = v; sv()
 	if not v then pcall(function() MineAim:FireServer(nil) end); pcall(function() local h, r = hum(), hrp(); if h and r then h:MoveTo(r.Position) end end) end
 end}, "RAFMine")
-L:Label({Text = "เดินเอง (ไม่วาร์ป): ลงลิฟต์ → ขุดแร่แพงสุดก่อน (เดินเท้าขุดได้ชั้นถ่านหิน + ทองแดง) → ไม่มีแร่ขุดหินเปิดทาง\nถุงเต็ม → เดินไปขายที่ Ore Depot · กดเดินเองเมื่อไหร่บอทหยุดรอ"})
+L:Label({Text = "วาร์ป: ลงลิฟต์ → ขุดแร่แพงสุดก่อน (เดินเท้าขุดได้ชั้นถ่านหิน + ทองแดง) → ไม่มีแร่ขุดหินเปิดทาง\nถุงเต็ม → วาร์ปไปขายที่ Ore Depot · กดเดินเองเมื่อไหร่บอทหยุดรอ"})
 L:Header({Text = "เควส"})
 L:Toggle({Name = "Auto Claim Quest", Default = e.claim, Callback = function(v) e.claim = v; sv() end}, "RAFClaim")
 L:Label({Text = "เควสเสร็จกดรับเงินเอง + รางวัลรายวัน\nเควสเก็บเกี่ยว/ส่งพืช → เปลี่ยนเมล็ดที่ปลูกเป็นพืชตามเควสให้ (ถ้ามีเมล็ด)"})
