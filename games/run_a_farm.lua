@@ -33,7 +33,7 @@ local State = require(plr:WaitForChild("PlayerScripts"):WaitForChild("RunAFarmCl
 local SF = ("RunAFarm/state_%d.json"):format(plr.UserId)
 local UPG_KEYS = {"pads", "price", "hens", "workers"}
 local UPG_NAME = {pads = "ปุ่มซื้อบนพื้น (ตึก/ทุ่ง/ของตกแต่ง)", price = "ราคาไข่", hens = "ซื้อไก่", workers = "จ้าง + อัปคนงาน"}
-local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, upgrade = false, upgKeys = {"pads", "price", "hens", "workers"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
+local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"pads", "price", "hens", "workers"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -451,10 +451,52 @@ local function cropRun(fn)
 	trip(fn)
 end
 
+-- ------------------------------------------------------------------ Event: Weigh-off giant pumpkin (Event tab)
+-- WeighoffPatch.FeedCart FeedPrompt / WaterBarrel WaterPrompt: server prompts, 11 studs, hold 0.25 -> walk there and press.
+-- Feed tips the bag's crops into the wheelbarrow: Weighoff.DAILY_LB (1500) a day counts fully, after that AFTER_CAP (20%).
+-- Water is free: WATER_HOURS (3 h) of WATER_LB_HOUR (75 lb/h) growth.
+local WeighCfg = require(Cfg.Weighoff)
+st.ev, st.fed, st.feeds = "-", 0, 0
+local function weighLive(d) local w = d and d.weighoff; return w and w.open and w.phase == "live" and w or nil end
+local function wantFeed(d)
+	local w = weighLive(d)
+	if not e.evFeed or not w or cropsInBag(d) <= 0 then return false end
+	return (w.fedToday or 0) < WeighCfg.DAILY_LB or e.evFeedOver
+end
+local function pressPrompt(pr)
+	if fireproximityprompt then pcall(fireproximityprompt, pr); return end
+	pr:InputHoldBegin(); task.wait(pr.HoldDuration + 0.1); pr:InputHoldEnd()
+end
+-- runs inside a trip: walk to the wheelbarrow, press Feed until the bag's crops stop going down
+local function feedNow(p)
+	local patch = p:FindFirstChild("WeighoffPatch")
+	local pr = patch and patch:FindFirstChild("FeedPrompt", true)
+	if not pr or not pr.Enabled then return false end
+	local at = pr.Parent:IsA("Attachment") and pr.Parent.WorldPosition or pr.Parent.Position
+	st.ev = ("เดินไปป้อน %d ชิ้นที่รถเข็น"):format(cropsInBag(D()))
+	if not walkPath(at + Vector3.new(0, 2, 0), pr.MaxActivationDistance - 4, 45, alive) then return false end
+	local fed0 = (D().weighoff and D().weighoff.fedToday) or 0
+	for _ = 1, 8 do
+		local before = cropsInBag(D())
+		if before <= 0 or not wantFeed(D()) then break end
+		pressPrompt(pr)
+		if not waitFor(function() return cropsInBag(D()) < before end, 2.5) then break end
+	end
+	local gained = ((D().weighoff and D().weighoff.fedToday) or 0) - fed0
+	if gained > 0 then st.fed += gained; st.feeds += 1 end
+	return true
+end
+
 local function dropCrops(p)
 	local dz = p:FindFirstChild("Storage") and p.Storage:FindFirstChild("DropOff")
 	dz = dz and dz:FindFirstChild("DropZone")
 	if not dz then st.crop = "ยังไม่มีจุด DropOff (สร้าง Storage ก่อน)"; return false end
+	-- Auto Feed on: the pumpkin gets the bag first, the storage only what's left
+	if wantFeed(D()) then
+		st.crop = "ถุงเต็ม → เอาไปป้อนฟักทองก่อน"
+		feedNow(p)
+		if cropsInBag(D()) == 0 then st.cropDrops += 1; return true end
+	end
 	st.crop = ("ถุงเต็ม → drop %d ชิ้นที่ Storage"):format(cropsInBag(D()))
 	if not moveNear(Vector3.new(dz.Position.X, dz.Position.Y - dz.Size.Y / 2, dz.Position.Z), 6, 30) then return false end
 	task.wait(DWELL)
@@ -617,6 +659,33 @@ task.spawn(function()
 	end
 end)
 
+task.spawn(function()
+	while alive() do
+		local d, p = D(), plot()
+		if not (e.evWater or e.evFeed) then
+			st.ev = "ปิดอยู่"
+		elseif not d or not p then
+			st.ev = "รอข้อมูลฟาร์ม"
+		elseif not weighLive(d) then
+			st.ev = "อีเวนต์ Weigh-off ไม่เปิดตอนนี้"
+		elseif busyHands() then
+			st.ev = "พัก: " .. busyHands()
+		elseif e.evWater and (tonumber(d.weighoff.wetUntil) or 0) <= now() and not tripBusy then
+			st.ev = "เดินไปรดน้ำที่ถัง"
+			pcall(waterJob)
+		elseif wantFeed(d) and not tripBusy then
+			trip(function() feedNow(p) end)
+		elseif e.evFeed and (d.weighoff.fedToday or 0) >= WeighCfg.DAILY_LB and not e.evFeedOver then
+			st.ev = "ป้อนครบโควต้าวันนี้แล้ว (1,500 lb)"
+		elseif e.evFeed and cropsInBag(d) <= 0 then
+			st.ev = "รอพืชในถุง (เปิด Auto Farm Crop จะเก็บมาป้อนให้)"
+		else
+			st.ev = "รอ (น้ำยังไม่แห้ง)"
+		end
+		task.wait(2)
+	end
+end)
+
 -- ------------------------------------------------------------------ remote chores
 local seedAt = 0
 local function claimJob()
@@ -756,7 +825,6 @@ task.spawn(function()
 					st.status = "ฟาร์มอยู่"
 					eggJob()
 					if not busyHands() then penJob() end
-					if not busyHands() then waterJob() end
 				end
 				if tick % 5 == 0 then upgradeJob() end
 			end)
@@ -830,6 +898,7 @@ local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
 	Buy = TG:Tab({Name = "Auto Buy", Image = "rbxassetid://10723346959"}),
+	Event = TG:Tab({Name = "Event", Image = "rbxassetid://10723346959"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 local L = Tabs.Main:Section({Side = "Left"})
@@ -839,7 +908,7 @@ L:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข�
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
 L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
-	.. "รดน้ำฟักทองยักษ์ (อีเวนต์) · watchdog · anti-AFK"})
+	.. "watchdog"})
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
 L:Header({Text = "ปลูกพืช"})
 L:Toggle({Name = "Auto Farm Crop", Default = e.crop, Callback = function(v) e.crop = v; sv() end}, "RAFCrop")
@@ -905,6 +974,17 @@ local BR = Tabs.Buy:Section({Side = "Right"})
 BR:Header({Text = "สถานะ"})
 local buyLbl = BR:Label({Text = "-"})
 
+local EV = Tabs.Event:Section({Side = "Left"})
+EV:Header({Text = "Weigh-off · ฟักทองยักษ์"})
+EV:Toggle({Name = "Auto Water", Default = e.evWater, Callback = function(v) e.evWater = v; sv() end}, "RAFEvWater")
+EV:Label({Text = "น้ำแห้งเมื่อไหร่ เดินไปรดที่ถังให้ (ฟรี · น้ำอยู่ 3 ชม. · โต 75 lb/ชม.)"})
+EV:Toggle({Name = "Auto Feed Crops", Default = e.evFeed, Callback = function(v) e.evFeed = v; sv() end}, "RAFEvFeed")
+EV:Toggle({Name = "└ ป้อนต่อหลังครบโควต้าวันนี้ (ได้แค่ 20%)", Default = e.evFeedOver, Callback = function(v) e.evFeedOver = v; sv() end}, "RAFEvFeedOver")
+EV:Label({Text = "เอาพืชในถุงไปเทที่รถเข็น · วันละ 1,500 lb · ผลไม้หนักสุด\nเปิด Auto Farm Crop ด้วย → ถุงเต็มจะไปป้อนก่อน เหลือค่อย drop ที่ Storage"})
+local EVR = Tabs.Event:Section({Side = "Right"})
+EVR:Header({Text = "สถานะ"})
+local evLbl = EVR:Label({Text = "-"})
+
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "RAFToggleUI")
@@ -920,7 +1000,7 @@ task.spawn(function()
 				st.status,
 				("เงิน $%s · แผง %s/%s · ถุง %s/%s · ไข่ในเล้า %d"):format(fmt(d.cash), fmt(d.standUsed), fmt(d.standCap),
 					tostring(d.basketUsed or 0), tostring(d.basketCap or 0), total),
-				("ไข่ที่ขนไปแผง %s (%d รอบ) · สัตว์ในคอก %d · รดน้ำ %d"):format(fmt(st.eggs), st.trips, st.pens, st.water),
+				("ไข่ที่ขนไปแผง %s (%d รอบ) · สัตว์ในคอก %d"):format(fmt(st.eggs), st.trips, st.pens),
 				("พืช: %s · เก็บ %d · drop %d ครั้ง · ปลูก %d แปลง"):format(st.crop, st.harvested, st.cropDrops, st.planted),
 				("เหมือง: %s · ขุดได้ %d · ขายแร่ %d"):format(st.mine, st.ores, st.mineSold),
 				("รับเควส %d · ล่าสุด: %s · เมล็ดตามเควส: %s"):format(st.quests, st.lastQuest, st.seed),
@@ -930,6 +1010,22 @@ task.spawn(function()
 			}, "\n"))
 			local seeds = {}
 			for _, id in ipairs(e.seedPick or {}) do seeds[#seeds + 1] = ("%s %d"):format(seedName(id), (d.seeds and d.seeds[id]) or 0) end
+			local w = d.weighoff
+			if w then
+				local t = now()
+				local lb = (w.lb or 0) + WeighCfg.watered(w.at or t, math.min(t, w.wetUntil or 0))
+				local wet = (w.wetUntil or 0) - t
+				local left = WeighCfg.END - t
+				evLbl:UpdateName(table.concat({
+					st.ev,
+					("ฟักทอง %s lb · ป้อนวันนี้ %s / %s lb"):format(fmt(lb), fmt(w.fedToday or 0), fmt(WeighCfg.DAILY_LB)),
+					wet > 0 and ("น้ำ: เปียกอีก %dh %02dm"):format(wet // 3600, (wet % 3600) // 60) or "น้ำ: แห้ง (ไม่โต)",
+					left > 0 and ("อีเวนต์จบใน %dh %02dm"):format(left // 3600, (left % 3600) // 60) or "อีเวนต์จบแล้ว",
+					("รอบนี้: ป้อน %d ครั้ง (+%s lb) · รดน้ำ %d ครั้ง"):format(st.feeds, fmt(st.fed), st.water),
+				}, "\n"))
+			else
+				evLbl:UpdateName(st.ev .. "\nยังไม่มีข้อมูลอีเวนต์")
+			end
 			buyLbl:UpdateName(table.concat({
 				st.seedBuy,
 				"มีอยู่: " .. (#seeds > 0 and table.concat(seeds, " · ") or "ยังไม่ได้เลือกเมล็ด"),
