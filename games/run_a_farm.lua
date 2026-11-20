@@ -33,7 +33,7 @@ local State = require(plr:WaitForChild("PlayerScripts"):WaitForChild("RunAFarmCl
 local SF = ("RunAFarm/state_%d.json"):format(plr.UserId)
 local UPG_KEYS = {"pads", "price", "hens", "workers"}
 local UPG_NAME = {pads = "ปุ่มซื้อบนพื้น (ตึก/ทุ่ง/ของตกแต่ง)", price = "ราคาไข่", hens = "ซื้อไก่", workers = "จ้าง + อัปคนงาน"}
-local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, buySeeds = false, upgrade = false, upgKeys = {"pads", "price", "hens", "workers"}, reserve = 0, pauseOnMove = true, reconnect = true}
+local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, upgrade = false, upgKeys = {"pads", "price", "hens", "workers"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -504,16 +504,65 @@ local function pickSeed(d)
 	local best, bestN = nil, 0
 	for k, n in pairs(d.seeds or {}) do if n > bestN and d.unlocked and d.unlocked[k] then best, bestN = k, n end end
 	if best then act("selectSeed", best); return best end
-	if e.buySeeds and sel then
-		local ok = act("buySeeds", sel, 20)
-		if ok then return sel end
-	end
 	return nil
 end
 
+-- ------------------------------------------------------------------ Auto Buy Crop (seed bags)
+-- buySeeds(id, n) takes any n in one call (tested: 25 wheat in one go); locked crops answer "... seeds are still locked".
+-- The State push lags ~1-2 s, so a crop just bought is skipped for a few seconds instead of being bought twice.
+local CropCfg = require(Cfg.Crops)
+local SEED_IDS = CropCfg.seeds or {"wheat", "carrot", "corn", "potato", "pumpkin"}
+st.seedBuy, st.seedBought, st.seedSpent = "-", 0, 0
+local seedBoughtAt = {}
+local function seedName(id) local c = CropCfg[id]; return (c and c.name) or id end
+local function seedBuyStep()
+	local d = D()
+	if not d or not d.seeds then return end
+	local lo = math.max(0, math.floor(tonumber(e.seedMin) or 0))
+	local hi = math.max(lo + 1, math.floor(tonumber(e.seedMax) or 0))
+	local notes = {}
+	for _, id in ipairs(e.seedPick or {}) do
+		local c = CropCfg[id]
+		local have = d.seeds[id] or 0
+		if c and c.seedPrice and os.clock() - (seedBoughtAt[id] or 0) > 5 then
+			if d.unlocked and d.unlocked[id] == false then
+				notes[#notes + 1] = seedName(id) .. " ยังล็อก"
+			elseif have < lo then
+				local budget = (D().cash or 0) - (tonumber(e.reserve) or 0)
+				local need = math.min(hi - have, math.floor(budget / c.seedPrice))
+				if need <= 0 then
+					notes[#notes + 1] = ("%s เงินไม่พอ ($%s/ถุง)"):format(seedName(id), fmt(c.seedPrice))
+				else
+					local ok, msg = act("buySeeds", id, need)
+					if ok then
+						seedBoughtAt[id] = os.clock()
+						st.seedBought += need
+						st.seedSpent += need * c.seedPrice
+						notes[#notes + 1] = ("ซื้อ %s %d ถุง (%d → %d)"):format(seedName(id), need, have, have + need)
+					else
+						notes[#notes + 1] = seedName(id) .. ": " .. tostring(msg):gsub("[\128-\255]+", "")
+					end
+				end
+			end
+		end
+	end
+	st.seedBuy = #notes > 0 and table.concat(notes, " · ") or ("เมล็ดพอ (ต่ำกว่า %d → ซื้อถึง %d)"):format(lo, hi)
+end
+task.spawn(function()
+	while alive() do
+		if e.seedBuy then
+			local ok, err = pcall(seedBuyStep)
+			if not ok then st.err = "seed: " .. tostring(err):sub(1, 110) end
+		else
+			st.seedBuy = "ปิดอยู่"
+		end
+		task.wait(3)
+	end
+end)
+
 local function plantField(p, f)
 	local seed = pickSeed(D())
-	if not seed then st.crop = "เมล็ดหมด (เปิด 'ซื้อเมล็ดเอง' หรือซื้อที่ร้าน)"; return end
+	if not seed then st.crop = "เมล็ดหมด (เปิด Auto Buy Crop ในแท็บ Auto Buy)"; return end
 	local pr = f:FindFirstChild("PlantPrompt", true)
 	if not pr or not pr.Enabled or not fireproximityprompt then return end
 	local at = pr.Parent:IsA("Attachment") and pr.Parent.WorldPosition or pr.Parent.Position
@@ -735,7 +784,7 @@ end)
 -- anti-AFK: Roblox's 20-minute idle kick fires Players.LocalPlayer.Idled first; a virtual click resets it
 local VirtualUser = game:GetService("VirtualUser")
 local idleConn = plr.Idled:Connect(function()
-	if not alive() then return end
+	if not alive() or not e.antiAfk then return end
 	pcall(function()
 		VirtualUser:CaptureController()
 		VirtualUser:ClickButton2(Vector2.new())
@@ -780,17 +829,20 @@ getgenv().__RAFW = Win
 local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
+	Buy = TG:Tab({Name = "Auto Buy", Image = "rbxassetid://10723346959"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 local L = Tabs.Main:Section({Side = "Left"})
+L:Header({Text = "กันหลุด"})
+L:Toggle({Name = "Anti-AFK (กันโดนเตะตอนยืนนิ่ง 20 นาที)", Default = e.antiAfk, Callback = function(v) e.antiAfk = v; sv() end}, "RAFAntiAfk")
+L:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข้าเกมใหม่เอง)", Default = e.reconnect, Callback = function(v) e.reconnect = v; sv() end}, "RAFReconnect")
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
 L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
-	.. "รดน้ำฟักทองยักษ์ (อีเวนต์) · วาร์ปเสร็จกลับที่เดิม · watchdog · anti-AFK"})
-L:Toggle({Name = "หยุดวาร์ปตอนฉันเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
+	.. "รดน้ำฟักทองยักษ์ (อีเวนต์) · watchdog · anti-AFK"})
+L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
 L:Header({Text = "ปลูกพืช"})
 L:Toggle({Name = "Auto Farm Crop", Default = e.crop, Callback = function(v) e.crop = v; sv() end}, "RAFCrop")
-L:Toggle({Name = "└ ซื้อเมล็ดเองเมื่อหมด (ใช้เงิน)", Default = e.buySeeds, Callback = function(v) e.buySeeds = v; sv() end}, "RAFSeeds")
 L:Label({Text = "แปลงสุก → เก็บทุกต้น · ถุงเต็ม → ไป drop ที่ Storage แล้วกลับมาเก็บต่อ\nแปลงว่าง → ปลูกเมล็ดที่เลือก (เควสเลือกให้) · คลังเต็ม → รอรถขนออก"})
 L:Header({Text = "เหมือง"})
 L:Toggle({Name = "Auto Mine", Default = e.mine, Callback = function(v)
@@ -824,12 +876,39 @@ R:Header({Text = "สถานะ"})
 local stLbl = R:Label({Text = "-"})
 R:Button({Name = "เก็บไข่ไปวางแผงตอนนี้", Callback = function() task.spawn(function() pcall(eggJob) end) end})
 
+local B = Tabs.Buy:Section({Side = "Left"})
+B:Header({Text = "เมล็ดพันธุ์"})
+B:Toggle({Name = "Auto Buy Crop", Default = e.seedBuy, Callback = function(v) e.seedBuy = v; sv() end}, "RAFSeedBuy")
+local seedOpts, seedDef, seedByLabel = {}, {}, {}
+for _, id in ipairs(SEED_IDS) do
+	local c = CropCfg[id]
+	local label = ("%s · $%s/ถุง"):format(seedName(id), fmt(c and c.seedPrice or 0))
+	seedOpts[#seedOpts + 1] = label
+	seedByLabel[label] = id
+	if table.find(e.seedPick or {}, id) then seedDef[#seedDef + 1] = label end
+end
+B:Dropdown({Name = "└ ซื้อเมล็ดอะไรบ้าง", Multi = true, Required = false, Options = seedOpts, Default = seedDef,
+	Callback = function(v)
+		local ids = {}
+		for name, on in pairs(type(v) == "table" and v or {}) do
+			local label = type(name) == "number" and on or (on and name)
+			if label and seedByLabel[label] then ids[#ids + 1] = seedByLabel[label] end
+		end
+		e.seedPick = ids; sv()
+	end}, "RAFSeedPick")
+B:Input({Name = "└ ซื้อเมื่อเหลือต่ำกว่า (ถุง)", Placeholder = "20", AcceptedCharacters = "Numeric",
+	Default = tostring(e.seedMin or 20), Callback = function(v) e.seedMin = tonumber(v) or 0; sv() end}, "RAFSeedMin")
+B:Input({Name = "└ ซื้อจนมีถึง (ถุง)", Placeholder = "100", AcceptedCharacters = "Numeric",
+	Default = tostring(e.seedMax or 100), Callback = function(v) e.seedMax = tonumber(v) or 0; sv() end}, "RAFSeedMax")
+B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nเว้นเงินไว้ตาม 'เก็บเงินไว้ไม่ใช้' ในแท็บ Auto Farm · พืชที่ยังล็อกข้ามไป"})
+local BR = Tabs.Buy:Section({Side = "Right"})
+BR:Header({Text = "สถานะ"})
+local buyLbl = BR:Label({Text = "-"})
+
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "RAFToggleUI")
-S:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข้าเกมใหม่เอง)", Default = e.reconnect,
-	Callback = function(v) e.reconnect = v; sv() end}, "RAFReconnect")
-S:Label({Text = "Anti-AFK เปิดตลอด (กันโดนเตะตอนยืนนิ่ง 20 นาที)\nเข้าเกมใหม่แล้วสคริปต์โหลดเองผ่าน loader พร้อมค่าที่ตั้งไว้"})
+S:Label({Text = "เข้าเกมใหม่แล้วสคริปต์โหลดเองผ่าน loader พร้อมค่าที่ตั้งไว้"})
 S:Label({Text = "ตั้งค่าเซฟที่: " .. SF})
 
 task.spawn(function()
@@ -848,6 +927,13 @@ task.spawn(function()
 				("อัปเกรด %d · ล่าสุด: %s"):format(st.buys, st.lastBuy),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
+			}, "\n"))
+			local seeds = {}
+			for _, id in ipairs(e.seedPick or {}) do seeds[#seeds + 1] = ("%s %d"):format(seedName(id), (d.seeds and d.seeds[id]) or 0) end
+			buyLbl:UpdateName(table.concat({
+				st.seedBuy,
+				"มีอยู่: " .. (#seeds > 0 and table.concat(seeds, " · ") or "ยังไม่ได้เลือกเมล็ด"),
+				("ซื้อไปแล้ว %d ถุง · ใช้เงิน $%s · เงินตอนนี้ $%s"):format(st.seedBought, fmt(st.seedSpent), fmt(d.cash)),
 			}, "\n"))
 		end)
 		task.wait(0.5)
