@@ -31,15 +31,6 @@ local State = require(plr:WaitForChild("PlayerScripts"):WaitForChild("RunAFarmCl
 
 -- ------------------------------------------------------------------ settings
 local SF = ("RunAFarm/state_%d.json"):format(plr.UserId)
-local UPG_KEYS = {"price", "hens", "hire", "workerUp", "crops", "pads"}
-local UPG_NAME = {
-	price = "ราคาไข่ (Egg Price +)",
-	hens = "ซื้อไก่เข้าเล้า",
-	hire = "จ้างคนงานเพิ่ม",
-	workerUp = "อัปคนงาน (เดินเร็ว / ขนได้มาก)",
-	crops = "ปลดล็อกพืชใหม่",
-	pads = "ปุ่มซื้อบนพื้น (ตึก / ทุ่ง / ของตกแต่ง · เดินไปเหยียบ)",
-}
 local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"price", "hens", "hire", "workerUp", "crops", "pads"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -50,12 +41,6 @@ local function sv()
 		writefile(SF, HS:JSONEncode(e))
 	end)
 end
--- old saves used one "workers" key for hiring + upgrades
-if type(e.upgKeys) == "table" and table.find(e.upgKeys, "workers") then
-	table.remove(e.upgKeys, table.find(e.upgKeys, "workers"))
-	for _, k in ipairs({"hire", "workerUp"}) do if not table.find(e.upgKeys, k) then table.insert(e.upgKeys, k) end end
-end
-local function upgOn(k) return table.find(e.upgKeys or {}, k) ~= nil end
 
 local st = {status = "-", eggs = 0, trips = 0, quests = 0, lastQuest = "-", seed = "-", pens = 0, water = 0, buys = 0, lastBuy = "-", wd = "-", err = "-"}
 
@@ -566,7 +551,7 @@ end
 -- The State push lags ~1-2 s, so a crop just bought is skipped for a few seconds instead of being bought twice.
 local CropCfg = require(Cfg.Crops)
 local SEED_IDS = CropCfg.seeds or {"wheat", "carrot", "corn", "potato", "pumpkin"}
-st.seedBuy, st.seedBought, st.seedSpent = "-", 0, 0
+st.seedBuy, st.seedBought, st.seedSpent, st.upgWait = "-", 0, 0, "-"
 local seedBoughtAt = {}
 local function seedName(id) local c = CropCfg[id]; return (c and c.name) or id end
 local function seedBuyStep()
@@ -735,89 +720,148 @@ local function reqMet(d, b)
 	for _, r in ipairs(b.requires or {}) do if not d.owned[r] then return false end end
 	return true
 end
+-- Value model: every purchase gets an estimated extra $/s from the game's own config, payback = price / gain.
+-- Cheapest payback goes first. Things the config gives no income figure for (fields, greenhouses, fishing, orchard,
+-- workers, crop unlocks) are assumed to pay back in UNKNOWN_PAYBACK, so among them the cheapest wins.
+-- Pure storage / speed items (oil tanks, horses) earn nothing by themselves; a tank still counts through the rig it unlocks.
+local OilCfg, RanchCfg = require(Cfg.Oil), require(Cfg.Ranch)
+local UNKNOWN_PAYBACK = 1800
+local function eggSales(p)
+	local stand = p and p:FindFirstChild("Farmyard") and p.Farmyard:FindFirstChild("Stand")
+	local perMin = stand and stand:GetAttribute("PerMin") or 0
+	local avgBuy = (FarmCfg.BUY and (FarmCfg.BUY[1] + FarmCfg.BUY[2]) / 2) or 4
+	return perMin * avgBuy / 60, (stand and stand:GetAttribute("EggPrice")) or 0
+end
+local function oilMult(d) return d.owned.Refinery and (OilCfg.REFINERY or 1) or 1 end
+local function ownedCount(d, pads) local n = 0 for _, id in ipairs(pads or {}) do if d.owned[id] then n += 1 end end return n end
+-- extra $/s, 0 = earns nothing by itself, nil = unknown
+local function gainOf(d, p, b)
+	local desc = b.desc or ""
+	local rate = tonumber(desc:match("^%+(%d+) oil a second"))
+	if rate then return rate * (OilCfg.PRICE or 0) * oilMult(d) end
+	if b.id == "Refinery" then
+		local r = 0
+		for _, rig in ipairs(OilCfg.RIGS or {}) do if d.owned[rig.id] then r += rig.rate or 0 end end
+		return r * (OilCfg.PRICE or 0) * ((OilCfg.REFINERY or 1) - 1)
+	end
+	if b.kind == "oil" and desc:find("^Holds") then return 0 end
+	local sheep = RanchCfg.SHEEP and RanchCfg.SHEEP.pay / RanchCfg.SHEEP.every or 0
+	if desc == "+1 sheep" then return sheep * (d.owned.AutoShearer and 1 or 0.25) end
+	if b.id == "AutoShearer" then return ownedCount(d, RanchCfg.SHEEP and RanchCfg.SHEEP.pads) * sheep * 0.75 end
+	if desc == "+1 cow" and RanchCfg.COW then return RanchCfg.COW.pay / RanchCfg.COW.every end
+	if b.kind == "ranch" and desc:lower():find("horse") then return 0 end
+	local pct = tonumber(desc:match("^%+(%d+)%% customers")) or tonumber(desc:match("^(%d+)%% more customers"))
+	if pct then local eps, price = eggSales(p); return eps * price * pct / 100 end
+	return nil
+end
+local function payback(cost, gain)
+	if gain == nil then return UNKNOWN_PAYBACK end
+	if gain <= 0 then return math.huge end
+	return cost / gain
+end
 local function candidates(d, p)
 	local out = {}
 	local cash = d.cash or 0
-	if upgOn("pads") and p and p:FindFirstChild("Pads") then
+	if p and p:FindFirstChild("Pads") then
 		for _, pad in ipairs(p.Pads:GetChildren()) do
 			local id = pad:GetAttribute("PadId")
 			local b = id and Buttons.byId[id]
 			local top = pad:FindFirstChild("Top")
 			if b and top and not d.owned[id] and reqMet(d, b) and (top.Position.Y > -50) == not inMine() then
 				local price = Tutorial.free(d, id) and 0 or b.price
-				out[#out + 1] = {cost = price, name = b.name or id, pad = top}
+				local g = gainOf(d, p, b)
+				local pb = payback(price, g)
+				-- a pad that unlocks a money-maker (tank -> pumpjack) is worth that next step: price both, earn its gain
+				for _, x in ipairs(Buttons.list) do
+					if not d.owned[x.id] and table.find(x.requires or {}, id) then
+						local gx = gainOf(d, p, x)
+						if gx and gx > 0 then pb = math.min(pb, (price + x.price) / gx) end
+					end
+				end
+				out[#out + 1] = {cost = price, name = b.name or id, pad = top, gain = g, pb = pb}
 			end
 		end
 	end
-	if upgOn("price") then
-		local c = FarmCfg.standUpgradeCost("price", (d.standLevels and d.standLevels.price) or 0)
-		if c then out[#out + 1] = {cost = c, name = "ราคาไข่", call = {"upgradeStand", "price"}} end
+	local c = FarmCfg.standUpgradeCost("price", (d.standLevels and d.standLevels.price) or 0)
+	if c then
+		local eps = eggSales(p)
+		local g = eps * (FarmCfg.PRICE_STEP or 0.5)
+		out[#out + 1] = {cost = c, name = "ราคาไข่", call = {"upgradeStand", "price"}, gain = g, pb = payback(c, g)}
 	end
-	if upgOn("hens") then
-		for k, c in pairs(d.coops or {}) do
-			local n = c.chickens or 0
-			if n < FarmCfg.MAX_CHICKENS then
-				out[#out + 1] = {cost = FarmCfg.chickenPrice(n + 1), name = "ไก่เล้า " .. k, call = {"buyChicken", tonumber(k) or k}}
-			end
+	for k, coop in pairs(d.coops or {}) do
+		local n = coop.chickens or 0
+		if n < FarmCfg.MAX_CHICKENS then
+			local cost = FarmCfg.chickenPrice(n + 1)
+			out[#out + 1] = {cost = cost, name = "ไก่เล้า " .. k, call = {"buyChicken", tonumber(k) or k}, pb = payback(cost, nil)}
 		end
 	end
-	if upgOn("workerUp") then
-		for key, u in pairs(WorkCfg.UPGRADES or {}) do
-			local c = WorkCfg.upgradeCost(key, (d.workerLevels and d.workerLevels[key]) or 0)
-			if c then out[#out + 1] = {cost = c, name = u.name, call = {"upgradeWorkers", key}} end
+	for key, u in pairs(WorkCfg.UPGRADES or {}) do
+		local cost = WorkCfg.upgradeCost(key, (d.workerLevels and d.workerLevels[key]) or 0)
+		if cost then out[#out + 1] = {cost = cost, name = u.name, call = {"upgradeWorkers", key}, pb = payback(cost, nil)} end
+	end
+	for _, role in ipairs(WorkCfg.ORDER or {}) do
+		local r = WorkCfg.ROLES[role]
+		local have = (d.workers and d.workers[role]) or 0
+		local need = WorkCfg.requirement(role, have)
+		local cost = WorkCfg.hireCost(role, have)
+		if r and cost and (need == nil or d.owned[need]) then
+			out[#out + 1] = {cost = cost, name = "จ้าง " .. r.name, call = {"hireWorker", role}, pb = payback(cost, nil)}
 		end
 	end
-	if upgOn("hire") then
-		for _, role in ipairs(WorkCfg.ORDER or {}) do
-			local r = WorkCfg.ROLES[role]
-			local have = (d.workers and d.workers[role]) or 0
-			local need = WorkCfg.requirement(role, have)
-			local c = WorkCfg.hireCost(role, have)
-			if r and c and (need == nil or d.owned[need]) then
-				out[#out + 1] = {cost = c, name = "จ้าง " .. r.name, call = {"hireWorker", role}}
-			end
+	for _, id in ipairs(CropCfg.seeds or {}) do
+		local cc = CropCfg[id]
+		if cc and cc.unlockPrice and d.unlocked and d.unlocked[id] == false and (not cc.needs or d.owned[cc.needs]) then
+			out[#out + 1] = {cost = cc.unlockPrice, name = "ปลดล็อก " .. (cc.name or id), call = {"unlockCrop", id}, pb = payback(cc.unlockPrice, nil)}
 		end
 	end
-	if upgOn("crops") then
-		for _, id in ipairs(CropCfg.seeds or {}) do
-			local c = CropCfg[id]
-			if c and c.unlockPrice and d.unlocked and d.unlocked[id] == false and (not c.needs or d.owned[c.needs]) then
-				out[#out + 1] = {cost = c.unlockPrice, name = "ปลดล็อก " .. (c.name or id), call = {"unlockCrop", id}}
-			end
-		end
-	end
-	table.sort(out, function(a, b) return a.cost < b.cost end)
+	table.sort(out, function(a, b)
+		if a.pb ~= b.pb then return a.pb < b.pb end
+		return a.cost < b.cost
+	end)
 	return out, cash
 end
+-- pick: best payback we can afford now -- but keep saving when the overall best is within 2x of the budget
+-- and the affordable one is 3x+ slower to pay back
 local failUntil = {}
+local function pickUpgrade(list, budget)
+	local best = list[1]
+	for _, c in ipairs(list) do
+		if c.cost <= budget and (failUntil[c.name] or 0) < os.clock() then
+			if c ~= best and best and best.cost <= budget * 2 and c.pb > best.pb * 3 then return nil, best end
+			return c, best
+		end
+	end
+	return nil, best
+end
 local function upgradeJob()
 	if not e.upgrade then return end
 	local d, p = D(), plot()
 	if not d then return end
 	local list, cash = candidates(d, p)
-	for _, c in ipairs(list) do
-		if c.cost > cash - (tonumber(e.reserve) or 0) then break end
-		if (failUntil[c.name] or 0) < os.clock() then
-			local ok, msg
-			if c.pad then
-				if busyHands() then return end
-				trip(function()
-					if go(c.pad.Position + Vector3.new(0, 3, 0), 2, 45) then
-						ok = waitFor(function() return (D().cash or 0) < cash end, 2.5)
-					end
-				end)
-			else
-				ok, msg = act(table.unpack(c.call))
-			end
-			if ok then
-				st.buys += 1
-				st.lastBuy = ("%s ($%s)"):format(c.name, fmt(c.cost))
-				return
-			end
-			failUntil[c.name] = os.clock() + 30
-			if msg then st.lastBuy = ("ซื้อ %s ไม่ได้: %s"):format(c.name, tostring(msg):gsub("[\128-\255]+", "")) end
-		end
+	local c, best = pickUpgrade(list, cash - (tonumber(e.reserve) or 0))
+	if not c then
+		st.upgWait = best and ("เก็บเงินรอ %s ($%s)"):format(best.name, fmt(best.cost)) or "ไม่มีอะไรให้อัป"
+		return
 	end
+	st.upgWait = "-"
+	local ok, msg
+	if c.pad then
+		if busyHands() then return end
+		trip(function()
+			if go(c.pad.Position + Vector3.new(0, 3, 0), 2, 45) then
+				ok = waitFor(function() return (D().cash or 0) < cash end, 2.5)
+			end
+		end)
+	else
+		ok, msg = act(table.unpack(c.call))
+	end
+	if ok then
+		st.buys += 1
+		st.lastBuy = ("%s ($%s)"):format(c.name, fmt(c.cost))
+		return
+	end
+	failUntil[c.name] = os.clock() + 30
+	if msg then st.lastBuy = ("ซื้อ %s ไม่ได้: %s"):format(c.name, (tostring(msg):gsub("[\128-\255]+", ""))) end
 end
 
 -- ------------------------------------------------------------------ main loop + watchdog
@@ -918,9 +962,6 @@ local Tabs = {
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 local L = Tabs.Main:Section({Side = "Left"})
-L:Header({Text = "กันหลุด"})
-L:Toggle({Name = "Anti-AFK (กันโดนเตะตอนยืนนิ่ง 20 นาที)", Default = e.antiAfk, Callback = function(v) e.antiAfk = v; sv() end}, "RAFAntiAfk")
-L:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข้าเกมใหม่เอง)", Default = e.reconnect, Callback = function(v) e.reconnect = v; sv() end}, "RAFReconnect")
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
 L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
@@ -944,26 +985,12 @@ local stLbl = R:Label({Text = "-"})
 R:Button({Name = "เก็บไข่ไปวางแผงตอนนี้", Callback = function() task.spawn(function() pcall(eggJob) end) end})
 
 local U = Tabs.Upgrade:Section({Side = "Left"})
-U:Header({Text = "อัปเกรด (ใช้เงิน)"})
 U:Toggle({Name = "Auto Upgrade", Default = e.upgrade, Callback = function(v) e.upgrade = v; sv() end}, "RAFUpg")
-U:Label({Text = "ซื้ออันที่ถูกสุดในหมวดที่เปิดก่อนเสมอ · ทีละ 1 อย่างทุก ~5 วิ\nซื้อไม่ได้ (เงินไม่พอ / ยังไม่ปลดล็อก) ข้ามไปลองใหม่ใน 30 วิ"})
-U:Header({Text = "หมวดที่จะอัป"})
-for _, k in ipairs(UPG_KEYS) do
-	U:Toggle({Name = UPG_NAME[k], Default = upgOn(k), Callback = function(v)
-		e.upgKeys = e.upgKeys or {}
-		local at = table.find(e.upgKeys, k)
-		if v and not at then table.insert(e.upgKeys, k) elseif not v and at then table.remove(e.upgKeys, at) end
-		sv()
-	end}, "RAFUpg_" .. k)
-end
-U:Input({Name = "เก็บเงินไว้ไม่ใช้ ($)", Placeholder = "0", AcceptedCharacters = "Numeric",
-	Default = tostring(e.reserve or 0),
-	Callback = function(v) e.reserve = tonumber(v) or 0; sv() end}, "RAFReserve")
-U:Label({Text = "เงินส่วนนี้ Auto Upgrade กับ Auto Buy จะไม่แตะ"})
+U:Label({Text = "ซื้ออันที่คุ้มสุดก่อน: ได้เงินเพิ่มเยอะเทียบกับราคา (คืนทุนเร็วสุด)\nอันดีสุดใกล้มีเงินพอ → เก็บเงินรอ ไม่เสียเงินกับของห่วย · ทีละ 1 อย่างทุก ~5 วิ"})
 local UR = Tabs.Upgrade:Section({Side = "Right"})
 UR:Header({Text = "สถานะ"})
 local upgLbl = UR:Label({Text = "-"})
-UR:Header({Text = "คิวถัดไป (ถูกสุดก่อน)"})
+UR:Header({Text = "คิวถัดไป (คุ้มสุดก่อน)"})
 local queueLbl = UR:Label({Text = "-"})
 
 local B = Tabs.Buy:Section({Side = "Left"})
@@ -990,7 +1017,7 @@ B:Input({Name = "└ ซื้อเมื่อเหลือต่ำกว�
 	Default = tostring(e.seedMin or 20), Callback = function(v) e.seedMin = tonumber(v) or 0; sv() end}, "RAFSeedMin")
 B:Input({Name = "└ ซื้อจนมีถึง (ถุง)", Placeholder = "100", AcceptedCharacters = "Numeric",
 	Default = tostring(e.seedMax or 100), Callback = function(v) e.seedMax = tonumber(v) or 0; sv() end}, "RAFSeedMax")
-B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nเว้นเงินไว้ตาม 'เก็บเงินไว้ไม่ใช้' ในแท็บ Auto Upgrade · พืชที่ยังล็อกข้ามไป"})
+B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nพืชที่ยังล็อกข้ามไป"})
 local BR = Tabs.Buy:Section({Side = "Right"})
 BR:Header({Text = "สถานะ"})
 local buyLbl = BR:Label({Text = "-"})
@@ -1009,6 +1036,9 @@ local evLbl = EVR:Label({Text = "-"})
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "RAFToggleUI")
+S:Header({Text = "กันหลุด"})
+S:Toggle({Name = "Anti-AFK (กันโดนเตะตอนยืนนิ่ง 20 นาที)", Default = e.antiAfk, Callback = function(v) e.antiAfk = v; sv() end}, "RAFAntiAfk")
+S:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข้าเกมใหม่เอง)", Default = e.reconnect, Callback = function(v) e.reconnect = v; sv() end}, "RAFReconnect")
 S:Label({Text = "เข้าเกมใหม่แล้วสคริปต์โหลดเองผ่าน loader พร้อมค่าที่ตั้งไว้"})
 S:Label({Text = "ตั้งค่าเซฟที่: " .. SF})
 
@@ -1049,13 +1079,15 @@ task.spawn(function()
 			upgLbl:UpdateName(table.concat({
 				e.upgrade and "เปิดอยู่" or "ปิดอยู่",
 				("ซื้อไปแล้ว %d อย่าง · ล่าสุด: %s"):format(st.buys, st.lastBuy),
-				("เงิน $%s · เก็บไว้ $%s"):format(fmt(d.cash), fmt(tonumber(e.reserve) or 0)),
+				st.upgWait ~= "-" and st.upgWait or "พร้อมซื้ออันถัดไป",
+				("เงิน $%s"):format(fmt(d.cash)),
 			}, "\n"))
 			local q, budget = {}, (d.cash or 0) - (tonumber(e.reserve) or 0)
 			local okC, list = pcall(candidates, d, plot())
 			for n, c in ipairs(okC and list or {}) do
 				if n > 6 then q[#q + 1] = ("… อีก %d อย่าง"):format(#list - 6); break end
-				q[#q + 1] = ("%s %s · $%s"):format(c.cost <= budget and "✓" or "✗", c.name, fmt(c.cost))
+				local pbTxt = c.pb == math.huge and "ไม่เพิ่มรายได้" or c.gain == nil and "ไม่รู้รายได้" or ("คืนทุน ~%d นาที"):format(math.ceil(c.pb / 60))
+				q[#q + 1] = ("%s %s · $%s · %s"):format(c.cost <= budget and "✓" or "✗", c.name, fmt(c.cost), pbTxt)
 			end
 			queueLbl:UpdateName(#q > 0 and table.concat(q, "\n") or "ไม่มีอะไรให้อัปในหมวดที่เปิด")
 			buyLbl:UpdateName(table.concat({
