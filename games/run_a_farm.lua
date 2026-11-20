@@ -197,15 +197,12 @@ local bagConn = State.changed.Event:Connect(function(d)
 end)
 
 -- ------------------------------------------------------------------ pens: milk goats / dig truffles when ready
--- pens (goat milk / truffles) and ranch (sheep shear / cow milk) share one rule: plot attribute "<Kind><i>" =
+-- pens (goat milk / truffles): one rule: plot attribute "<Kind><i>" =
 -- "readyAt lag hold" (server time), animal model at workspace.<folder>.<plot>.<Kind><i>, action(i) needs the character
--- close ("Get closer" otherwise). A ranch machine (RanchShearer / RanchMilker) does its animals itself:
--- ranchShear answers "The machine does it for you", so those kinds are skipped while the machine is owned.
+-- close ("Get closer" otherwise). Sheep / cows are left to the game's own Auto Shearer / Milking Machine pads.
 local PEN = {
 	{kind = "Goat", total = "PenGoats", action = "penMilk", folder = "RunAFarmPens", skip = "PenAuto"},
 	{kind = "Pig", total = "PenPigs", action = "penDig", folder = "RunAFarmPens", skip = "PenAuto"},
-	{kind = "Sheep", total = "RanchSheep", action = "ranchShear", folder = "RunAFarmRanch", skip = "RanchShearer"},
-	{kind = "Cow", total = "RanchCows", action = "ranchMilk", folder = "RunAFarmRanch", skip = "RanchMilker"},
 }
 local function readyPens()
 	local p = plot()
@@ -970,7 +967,7 @@ local Tabs = {
 local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
-L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล / ตัดขนแกะ / รีดนมวัว (ถ้ายังไม่มีเครื่อง)\n"
+L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
 	.. "watchdog"})
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
 L:Header({Text = "ปลูกพืช"})
