@@ -197,16 +197,22 @@ local bagConn = State.changed.Event:Connect(function(d)
 end)
 
 -- ------------------------------------------------------------------ pens: milk goats / dig truffles when ready
+-- pens (goat milk / truffles) and ranch (sheep shear / cow milk) share one rule: plot attribute "<Kind><i>" =
+-- "readyAt lag hold" (server time), animal model at workspace.<folder>.<plot>.<Kind><i>, action(i) needs the character
+-- close ("Get closer" otherwise). A ranch machine (RanchShearer / RanchMilker) does its animals itself:
+-- ranchShear answers "The machine does it for you", so those kinds are skipped while the machine is owned.
 local PEN = {
-	{kind = "Goat", total = "PenGoats", action = "penMilk"},
-	{kind = "Pig", total = "PenPigs", action = "penDig"},
+	{kind = "Goat", total = "PenGoats", action = "penMilk", folder = "RunAFarmPens", skip = "PenAuto"},
+	{kind = "Pig", total = "PenPigs", action = "penDig", folder = "RunAFarmPens", skip = "PenAuto"},
+	{kind = "Sheep", total = "RanchSheep", action = "ranchShear", folder = "RunAFarmRanch", skip = "RanchShearer"},
+	{kind = "Cow", total = "RanchCows", action = "ranchMilk", folder = "RunAFarmRanch", skip = "RanchMilker"},
 }
 local function readyPens()
 	local p = plot()
-	if not p or p:GetAttribute("PenAuto") then return {} end
+	if not p then return {} end
 	local out, t = {}, now()
 	for _, k in ipairs(PEN) do
-		for i = 1, p:GetAttribute(k.total) or 0 do
+		for i = 1, (not p:GetAttribute(k.skip) and p:GetAttribute(k.total)) or 0 do
 			local readyAt = tonumber((tostring(p:GetAttribute(k.kind .. i) or "")):match("^%S+"))
 			if readyAt and readyAt <= t then out[#out + 1] = {k = k, i = i} end
 		end
@@ -218,15 +224,15 @@ local function penJob()
 	local p = plot()
 	local list = readyPens()
 	if #list == 0 then return end
-	local folder = workspace:FindFirstChild("RunAFarmPens")
-	folder = folder and folder:FindFirstChild(p.Name)
 	trip(function()
 		for _, a in ipairs(list) do
 			local key = a.k.kind .. a.i
 			if (penBlock[key] or 0) < os.clock() then
 				local ok, msg = act(a.k.action, a.i)
+				local folder = workspace:FindFirstChild(a.k.folder)
+				folder = folder and folder:FindFirstChild(p.Name)
 				for _ = 1, 4 do
-					if ok or msg ~= "Get closer" then break end
+					if ok or not (type(msg) == "string" and (msg:lower():find("closer") or msg:lower():find("far"))) then break end
 					local m = folder and folder:FindFirstChild(key)
 					if not m then break end
 					go(m:GetPivot().Position + Vector3.new(0, 2, 0), 4, 20)
@@ -964,7 +970,7 @@ local Tabs = {
 local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "ฟาร์ม"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "RAFFarm")
-L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล\n"
+L:Label({Text = "เปิดอันเดียวทำให้หมด (เดินเอง ไม่วาร์ป): เก็บไข่ทุกเล้า (รวมไข่ทอง) → วางขายที่แผง · รีดนมแพะ / ขุดเห็ดทรัฟเฟิล / ตัดขนแกะ / รีดนมวัว (ถ้ายังไม่มีเครื่อง)\n"
 	.. "watchdog"})
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "RAFPause")
 L:Header({Text = "ปลูกพืช"})
