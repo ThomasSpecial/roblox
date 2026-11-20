@@ -31,7 +31,7 @@ local State = require(plr:WaitForChild("PlayerScripts"):WaitForChild("RunAFarmCl
 
 -- ------------------------------------------------------------------ settings
 local SF = ("RunAFarm/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"price", "hens", "hire", "workerUp", "crops", "pads"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
+local DEFAULTS = {farm = true, claim = true, mine = false, crop = false, seedBuy = false, seedPick = {}, seedMin = 20, seedMax = 100, seedUnlock = true, evWater = false, evFeed = false, evFeedOver = false, upgrade = false, upgKeys = {"price", "hens", "hire", "workerUp", "crops", "pads"}, reserve = 0, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -568,7 +568,25 @@ local function seedBuyStep()
 		local have = d.seeds[id] or 0
 		if c and c.seedPrice and os.clock() - (seedBoughtAt[id] or 0) > 5 then
 			if d.unlocked and d.unlocked[id] == false then
-				notes[#notes + 1] = seedName(id) .. " ยังล็อก"
+				-- locked crop: unlockCrop(id) first (Config.Crops unlockPrice; greenhouse crops also need c.needs owned)
+				local budget = (D().cash or 0) - (tonumber(e.reserve) or 0)
+				local needName = c.needs and Buttons.byId[c.needs] and Buttons.byId[c.needs].name or c.needs
+				if not e.seedUnlock then
+					notes[#notes + 1] = seedName(id) .. " ยังล็อก"
+				elseif c.needs and not d.owned[c.needs] then
+					notes[#notes + 1] = ("%s ต้องมี %s ก่อน"):format(seedName(id), tostring(needName))
+				elseif not c.unlockPrice or budget < c.unlockPrice then
+					notes[#notes + 1] = ("%s เก็บเงินปลดล็อก ($%s)"):format(seedName(id), fmt(c.unlockPrice or 0))
+				else
+					local ok, msg = act("unlockCrop", id)
+					seedBoughtAt[id] = os.clock()
+					if ok then
+						st.seedSpent += c.unlockPrice
+						notes[#notes + 1] = ("ปลดล็อก %s แล้ว ($%s)"):format(seedName(id), fmt(c.unlockPrice))
+					else
+						notes[#notes + 1] = ("ปลดล็อก %s ไม่ได้: %s"):format(seedName(id), (tostring(msg):gsub("[\128-\255]+", "")))
+					end
+				end
 			elseif have < lo then
 				local budget = (D().cash or 0) - (tonumber(e.reserve) or 0)
 				local need = math.min(hi - have, math.floor(budget / c.seedPrice))
@@ -999,10 +1017,14 @@ local queueLbl = UR:Label({Text = "-"})
 local B = Tabs.Buy:Section({Side = "Left"})
 B:Header({Text = "เมล็ดพันธุ์"})
 B:Toggle({Name = "Auto Buy Crop", Default = e.seedBuy, Callback = function(v) e.seedBuy = v; sv() end}, "RAFSeedBuy")
+B:Toggle({Name = "└ ยังล็อกอยู่ → จ่ายเงินปลดล็อกให้ก่อน", Default = e.seedUnlock, Callback = function(v) e.seedUnlock = v; sv() end}, "RAFSeedUnlock")
 local seedOpts, seedDef, seedByLabel = {}, {}, {}
 for _, id in ipairs(SEED_IDS) do
 	local c = CropCfg[id]
 	local label = ("%s · $%s/ถุง"):format(seedName(id), fmt(c and c.seedPrice or 0))
+	if c and c.unlockPrice and c.unlockPrice > 0 and not (D() and D().unlocked and D().unlocked[id]) then
+		label ..= (" · ปลดล็อก $%s"):format(fmt(c.unlockPrice))
+	end
 	seedOpts[#seedOpts + 1] = label
 	seedByLabel[label] = id
 	if table.find(e.seedPick or {}, id) then seedDef[#seedDef + 1] = label end
@@ -1020,7 +1042,7 @@ B:Input({Name = "└ ซื้อเมื่อเหลือต่ำกว�
 	Default = tostring(e.seedMin or 20), Callback = function(v) e.seedMin = tonumber(v) or 0; sv() end}, "RAFSeedMin")
 B:Input({Name = "└ ซื้อจนมีถึง (ถุง)", Placeholder = "100", AcceptedCharacters = "Numeric",
 	Default = tostring(e.seedMax or 100), Callback = function(v) e.seedMax = tonumber(v) or 0; sv() end}, "RAFSeedMax")
-B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nพืชที่ยังล็อกข้ามไป"})
+B:Label({Text = "เช่น ต่ำกว่า 20 → ซื้อจนมี 100 · เงินไม่พอซื้อเท่าที่ไหว\nพืชเรือนกระจกต้องซื้อ Greenhouse ก่อน ถึงจะปลดล็อกได้"})
 local BR = Tabs.Buy:Section({Side = "Right"})
 BR:Header({Text = "สถานะ"})
 local buyLbl = BR:Label({Text = "-"})
