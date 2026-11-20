@@ -732,6 +732,8 @@ end
 -- Pure storage / speed items (oil tanks, horses) earn nothing by themselves; a tank still counts through the rig it unlocks.
 local OilCfg, RanchCfg = require(Cfg.Oil), require(Cfg.Ranch)
 local UNKNOWN_PAYBACK = 1800
+-- user (2026-11-21): greenhouse first, its Harvest Robot right after -- these jump the queue and are saved up for
+local PRIORITY = {"Greenhouse1", "HarvestRobot1", "Greenhouse2", "HarvestRobot2", "Greenhouse3", "HarvestRobot3"}
 local function eggSales(p)
 	local stand = p and p:FindFirstChild("Farmyard") and p.Farmyard:FindFirstChild("Stand")
 	local perMin = stand and stand:GetAttribute("PerMin") or 0
@@ -784,7 +786,8 @@ local function candidates(d, p)
 						if gx and gx > 0 then pb = math.min(pb, (price + x.price) / gx) end
 					end
 				end
-				out[#out + 1] = {cost = price, name = b.name or id, pad = top, gain = g, pb = pb}
+				local prio = table.find(PRIORITY, id)
+				out[#out + 1] = {cost = price, name = (b.name or id) .. (b.field and (" (แปลง " .. b.field .. ")") or ""), pad = top, gain = g, pb = pb, prio = prio}
 			end
 		end
 	end
@@ -815,6 +818,7 @@ local function candidates(d, p)
 		end
 	end
 	table.sort(out, function(a, b)
+		if (a.prio or 99) ~= (b.prio or 99) then return (a.prio or 99) < (b.prio or 99) end
 		if a.pb ~= b.pb then return a.pb < b.pb end
 		return a.cost < b.cost
 	end)
@@ -825,6 +829,8 @@ end
 local failUntil = {}
 local function pickUpgrade(list, budget)
 	local best = list[1]
+	-- a priority item (greenhouse / its robot) is never skipped for something cheaper: wait for the money
+	if best and best.prio and best.cost > budget then return nil, best end
 	for _, c in ipairs(list) do
 		if c.cost <= budget and (failUntil[c.name] or 0) < os.clock() then
 			if c ~= best and best and best.cost <= budget * 2 and c.pb > best.pb * 3 then return nil, best end
@@ -959,7 +965,7 @@ R:Button({Name = "เก็บไข่ไปวางแผงตอนนี�
 
 local U = Tabs.Upgrade:Section({Side = "Left"})
 U:Toggle({Name = "Auto Upgrade", Default = e.upgrade, Callback = function(v) e.upgrade = v; sv() end}, "RAFUpg")
-U:Label({Text = "ซื้ออันที่คุ้มสุดก่อน: ได้เงินเพิ่มเยอะเทียบกับราคา (คืนทุนเร็วสุด)\nอันดีสุดใกล้มีเงินพอ → เก็บเงินรอ ไม่เสียเงินกับของห่วย · ทีละ 1 อย่างทุก ~5 วิ"})
+U:Label({Text = "Greenhouse → Harvest Robot มาก่อนเสมอ (เก็บเงินรอ) · ที่เหลือซื้ออันคุ้มสุดก่อน (คืนทุนเร็วสุด)\nอันดีสุดใกล้มีเงินพอ → เก็บเงินรอ ไม่เสียเงินกับของห่วย · ทีละ 1 อย่างทุก ~5 วิ"})
 local UR = Tabs.Upgrade:Section({Side = "Right"})
 UR:Header({Text = "สถานะ"})
 local upgLbl = UR:Label({Text = "-"})
@@ -1063,7 +1069,7 @@ task.spawn(function()
 			local okC, list = pcall(candidates, d, plot())
 			for n, c in ipairs(okC and list or {}) do
 				if n > 6 then q[#q + 1] = ("… อีก %d อย่าง"):format(#list - 6); break end
-				local pbTxt = c.pb == math.huge and "ไม่เพิ่มรายได้" or c.gain == nil and "ไม่รู้รายได้" or ("คืนทุน ~%d นาที"):format(math.ceil(c.pb / 60))
+				local pbTxt = c.prio and "★ ซื้อก่อน (เรือนกระจก)" or c.pb == math.huge and "ไม่เพิ่มรายได้" or c.gain == nil and "ไม่รู้รายได้" or ("คืนทุน ~%d นาที"):format(math.ceil(c.pb / 60))
 				q[#q + 1] = ("%s %s · $%s · %s"):format(c.cost <= budget and "✓" or "✗", c.name, fmt(c.cost), pbTxt)
 			end
 			queueLbl:UpdateName(#q > 0 and table.concat(q, "\n") or "ไม่มีอะไรให้อัปในหมวดที่เปิด")
