@@ -97,6 +97,8 @@ local ANCHORS = {
 	-- spots stream the far half too
 	Zone8 = {Vector3.new(-345, 177, -9180), Vector3.new(-245, 122, -8880), Vector3.new(-245, 177, -9430)},
 	Zone9 = {Vector3.new(-405, 265, -10570), Vector3.new(-565, 305, -11525), Vector3.new(-285, 265, -10910)},
+	-- zone 10 is ~3,400 studs long (easy band z -12.6k..-13k, hard band -13.4k..-13.7k, boss -14,080)
+	Zone10 = {Vector3.new(-275, 302, -12985), Vector3.new(-365, 342, -13365), Vector3.new(-345, 342, -14000)},
 }
 e.spawns = type(e.spawns) == "table" and e.spawns or {}
 local function anchorsOf(zid)
@@ -376,7 +378,7 @@ local shroudSeen = {zone = nil, at = 0}
 local shroudConn = ShroudRE.OnClientEvent:Connect(function(kind, data)
 	if not alive() then return end
 	if kind == "appear" and type(data) == "table" and data.zoneNum then
-		shroudSeen.zone, shroudSeen.at = tonumber(data.zoneNum), os.clock()
+		shroudSeen.zone, shroudSeen.at, shroudSeen.misses = tonumber(data.zoneNum), os.clock(), 0
 		st.annTick = (st.annTick or 0) + 1
 		st.shroud = ("เกิดที่ %s · %s"):format(tostring(data.zone or ("โซน " .. data.zoneNum)), os.date("%H:%M:%S"))
 	elseif kind == "got" then
@@ -389,7 +391,9 @@ end)
 -- after one of these, so the bot doesn't hop around zones where nothing it wants is alive
 -- tiers that are never announced but are (nearly) always out: Easy / Hard / Boss, and Rare (one per zone, back 60 s
 -- after a kill -- e.g. zone 8 "Secret" Tempest Griffin). These get scouted in person; Chase / Divine wait for the announcement.
-local ALWAYS_TIERS = {Easy = true, Hard = true, Boss = true, Rare = true}
+-- Rare was in here too, but (checked 2026-11-22) most zones have no Rare out at a given moment, so walking the zone for
+-- it left the bot standing on empty spawn spots; the remote peek + sightings find it instead.
+local ALWAYS_TIERS = {Easy = true, Hard = true, Boss = true}
 local scoutMiss = {}   -- zoneId -> os.clock() of the last visit that found nothing (skip it for 40 s)
 local spawnSeen = {}   -- kind -> {zone = zoneNum, at = os.clock(), misses = n}
 local announceConn = Remotes:WaitForChild("Announce").OnClientEvent:Connect(function(a)
@@ -406,7 +410,7 @@ local sightings = {}   -- "kind|zone" -> {kind, zone, pos, at}
 local function noteSighting(m)
 	if not alive() or not e.farm or not m.Parent then return end
 	local k, z = m:GetAttribute("Kind"), m:GetAttribute("Zone")
-	if not k or targetMap()[k] ~= z then return end
+	if not k or not z or targetMap()[k] ~= z then return end   -- (the Harvest boss has no Zone: nil == nil let it in)
 	local o = m:GetAttribute("OwnerId")
 	if (o and o ~= plr.UserId) or (m:GetAttribute("HP") or 1) <= 0 then return end
 	if (m:GetAttribute("Size") or 3) < (tonumber(e.minSize) or 1) then return end
@@ -911,7 +915,7 @@ local function farmStep()
 	-- seen from afar (peek / passing by): warp straight to where it was
 	local sKey, sBest
 	for key, sg in pairs(sightings) do
-		if os.clock() - sg.at > 120 or tmap[sg.kind] ~= sg.zone then
+		if os.clock() - sg.at > 120 or not tmap[sg.kind] or tmap[sg.kind] ~= sg.zone then
 			sightings[key] = nil
 		elseif not sBest or sg.at > sBest.at then
 			sKey, sBest = key, sg
@@ -995,6 +999,11 @@ local function farmStep()
 		if findTarget(tmap) or findShroud() or next(sightings) then return end
 	end
 	if not why then scoutMiss[goZone.id] = os.clock() end
+	-- announced Shrouded not found after 3 looks: someone else killed it (no "got" for us) -> stop circling that zone
+	if why == "Shrouded" then
+		shroudSeen.misses = (shroudSeen.misses or 0) + 1
+		if shroudSeen.misses >= 3 then shroudSeen.zone = nil end
+	end
 	-- announced one not found from here: try the other spots a couple of times, then forget it (caught by someone else)
 	if why and why ~= "Shrouded" and spawnSeen[why] then spawnSeen[why].misses += 1 end
 end
