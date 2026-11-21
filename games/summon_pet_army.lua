@@ -301,17 +301,28 @@ local function loopEvery(name, period, limit, body)
 end
 
 -- ------------------------------------------------------------------ souls
-local pending = {}   -- soul id -> kind (summon sent, waiting for Arise)
+-- The soul floats where the creature died and can only be summoned from within Config.Soul.Range (16 studs) of it.
+-- The bot fights from 22-60 studs away, so a summon fired from there is ignored and the soul fades (Life 30 s).
+-- grabSouls() walks over to every pending soul and keeps pressing summon until the server takes it.
+local SoulCfg = (Config.Soul or {})
+local SOUL_RANGE, SOUL_LIFE = SoulCfg.Range or 16, SoulCfg.Life or 30
+local pending = {}   -- soul id -> {kind, pos, t, life}
+local function soulDist(sl)
+	local r = hrp()
+	if not r or typeof(sl.pos) ~= "Vector3" then return math.huge end
+	return Vector3.new(r.Position.X - sl.pos.X, 0, r.Position.Z - sl.pos.Z).Magnitude
+end
 local soulConn = SoulRE.OnClientEvent:Connect(function(kind, id, data)
 	if not alive() then return end
 	if kind == "add" and type(data) == "table" and data.kind then
 		local want = targetMap()[data.kind] ~= nil
 		if e.farm and (want or e.catchOthers) then
-			pending[id] = data.kind
-			pcall(SoulChoice.FireServer, SoulChoice, id, "summon")
+			local sl = {kind = data.kind, pos = data.pos, t = os.clock(), life = tonumber(data.life) or SOUL_LIFE}
+			pending[id] = sl
+			if soulDist(sl) < SOUL_RANGE - 2 then pcall(SoulChoice.FireServer, SoulChoice, id, "summon") end
 		end
 	elseif kind == "remove" and pending[id] then
-		local k = pending[id]
+		local k = pending[id].kind
 		pending[id] = nil
 		if data == "summon" then st.lastSoul, st.lastSoulAt = k, os.clock() else st.missed += 1 end   -- "fade" = the soul ran out before the roll
 	end
@@ -326,6 +337,26 @@ local ariseConn = AriseRE.OnClientEvent:Connect(function(_, who)
 	caughtBy[label] = (caughtBy[label] or 0) + 1
 	st.lastCatch = label .. " · " .. os.date("%H:%M:%S")
 end)
+local function grabSouls()
+	for id, sl in pairs(pending) do
+		if os.clock() - sl.t > sl.life then
+			pending[id] = nil
+		elseif typeof(sl.pos) == "Vector3" then
+			local t0 = os.clock()
+			while pending[id] == sl and alive() and os.clock() - t0 < 5 and os.clock() - sl.t < sl.life do
+				if soulDist(sl) > SOUL_RANGE - 6 then
+					warp(groundAt(sl.pos + Vector3.new(0, 0, 4)), sl.pos)
+					task.wait(0.15)
+				end
+				st.status = "เข้าไปใกล้ soul แล้วกด summon: " .. cname(sl.kind)
+				pcall(SoulChoice.FireServer, SoulChoice, id, "summon")
+				task.wait(0.4)
+			end
+			if pending[id] == sl and os.clock() - t0 >= 5 then pending[id] = nil end   -- server never took it: give up on this one
+		end
+	end
+end
+
 local notifyConn = NotifyRE.OnClientEvent:Connect(function(msg)
 	if not alive() or type(msg) ~= "string" then return end
 	if msg:find("escap") or msg:find("Missed") or msg:find("broke free") then st.missed += 1 end
@@ -537,8 +568,11 @@ local function fight(m)
 	end
 	if dead() then
 		st.kills += 1
-		st.status = name .. " ตายแล้ว → รอ soul แล้วจับ"
-		task.wait(1.5)   -- the soul arrives ~0.3 s after the kill, the summon roll ~0.3 s after that
+		st.status = name .. " ตายแล้ว → รอ soul แล้วเข้าไปจับ"
+		local t1 = os.clock()
+		while os.clock() - t1 < 2 and not next(pending) do task.wait(0.1) end   -- the soul arrives ~0.3 s after the kill
+		grabSouls()
+		task.wait(0.5)
 	end
 end
 
@@ -798,6 +832,7 @@ end
 
 local scoutIdx, zoneCursor = {}, 0   -- scoutIdx[zoneId] = next spawn spot to stand on in that zone
 local function farmStep()
+	if next(pending) and not busyHands() then grabSouls() end   -- souls from kills the army finished while I was elsewhere
 	if e.hboss and not busyHands() and harvestJob() then st.status = "Harvest Boss: " .. tostring(st.hb); return end
 	if not e.farm then
 		st.status = e.drum and "Auto Farm ปิด · ตีกลองอย่างเดียว" or "ปิดอยู่"; st.target = "-"
