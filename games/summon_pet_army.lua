@@ -313,17 +313,18 @@ local soulConn = SoulRE.OnClientEvent:Connect(function(kind, id, data)
 	elseif kind == "remove" and pending[id] then
 		local k = pending[id]
 		pending[id] = nil
-		if data == "summon" then st.lastSoul = k else st.missed += 1 end   -- "fade" = the soul ran out before the roll
+		if data == "summon" then st.lastSoul, st.lastSoulAt = k, os.clock() else st.missed += 1 end   -- "fade" = the soul ran out before the roll
 	end
 end)
 local ariseConn = AriseRE.OnClientEvent:Connect(function(_, who)
 	if not alive() then return end
-	if tostring(who) == plr.Name and st.lastSoul then
-		local k = st.lastSoul
-		st.caught += 1
-		caughtBy[k] = (caughtBy[k] or 0) + 1
-		st.lastCatch = cname(k) .. " · " .. os.date("%H:%M:%S")
-	end
+	if tostring(who) ~= plr.Name then return end
+	local k = st.lastSoul and os.clock() - (st.lastSoulAt or 0) < 4 and st.lastSoul
+	st.lastSoul = nil
+	local label = k and cname(k) or "อื่น ๆ (เปิด Mystery Soul / จับเอง)"
+	st.caught += 1
+	caughtBy[label] = (caughtBy[label] or 0) + 1
+	st.lastCatch = label .. " · " .. os.date("%H:%M:%S")
 end)
 local notifyConn = NotifyRE.OnClientEvent:Connect(function(msg)
 	if not alive() or type(msg) ~= "string" then return end
@@ -451,6 +452,13 @@ end
 -- army never attacks on its own -- my punch starts the fight, then whoever is close gets hit (the player has 100 HP).
 -- So: stand 30 studs off with the army gathered, hop in, punch once, hop straight back; the army finishes it (~1 s).
 -- Punch again only when its HP stops dropping (the army lost interest). Got hit anyway -> back off further.
+st.fightLog = {}
+local function logFight(m, why)
+	local z = ZONE_BY_ID[m:GetAttribute("Zone")]
+	table.insert(st.fightLog, 1, ("%s %s (%s, %s) ← %s"):format(os.date("%H:%M"), m:GetAttribute("DisplayName") or m.Name,
+		z and ("โซน " .. z.index) or tostring(m:GetAttribute("Zone")), tostring(m:GetAttribute("Tier")), why))
+	while #st.fightLog > 6 do table.remove(st.fightLog) end
+end
 local function fight(m)
 	local name = m:GetAttribute("DisplayName") or m.Name
 	if m:GetAttribute("Kind") == "Shroud" or CS:HasTag(m, "Shroud") then name = "Shrouded ???" end
@@ -805,12 +813,13 @@ local function farmStep()
 	end
 	learnSpawns()
 	local sh = findShroud()
-	if sh then return fight(sh) end
+	if sh then logFight(sh, "Shrouded"); return fight(sh) end
 	if penJob() then return end
 
 	local m = findTarget(tmap)
 	if m then
 		if spawnSeen[m:GetAttribute("Kind")] then spawnSeen[m:GetAttribute("Kind")] = nil end
+		logFight(m, "ตัวที่เลือก (" .. tostring(KIND_RAR[m:GetAttribute("Kind")] or "?") .. ")")
 		return fight(m)
 	end
 
@@ -1158,6 +1167,8 @@ R:Header({Text = "สถานะ"})
 local stLbl = R:Label({Text = "-"})
 R:Header({Text = "เป้าที่เลือกไว้ (ทุกโซน)"})
 selLbl = R:Label({Text = "-"})
+R:Header({Text = "บอทไปตีอะไร (ล่าสุดก่อน)"})
+local fightLbl = R:Label({Text = "-"})
 R:Header({Text = "จับได้รอบนี้"})
 local catchLbl = R:Label({Text = "-"})
 
@@ -1199,9 +1210,10 @@ task.spawn(function()
 				"Error: " .. st.err,
 			}, "\n"))
 			local lines = {}
-			for k, n in pairs(caughtBy) do lines[#lines + 1] = ("%s × %d"):format(cname(k), n) end
+			for k, n in pairs(caughtBy) do lines[#lines + 1] = ("%s × %d"):format(k, n) end
 			table.sort(lines)
 			catchLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้จับ")
+			fightLbl:UpdateName(#st.fightLog > 0 and table.concat(st.fightLog, "\n") or "ยังไม่ได้ตี")
 			local _, timer = hbGate()
 			hbLbl:UpdateName(table.concat({
 				tostring(st.hb or (e.hboss and "รอ" or "ปิดอยู่")),
