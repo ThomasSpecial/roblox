@@ -197,9 +197,9 @@ local function gateOpen(b)
 	local d = D()
 	return b.gate == nil or b.gate == "Tutorial" or (d and d.Gates and d.Gates[b.gate] == true)
 end
+-- short on purpose: the dropdown cuts anything past ~28 characters, and the boss name already says the zone
 local function bossLabel(b)
-	local zone = b.gate and ZoneConfig[b.gate] and ZoneConfig[b.gate].Name or tostring(b.gate)
-	return ("%s · %s · Lv %d%s"):format(b.name, zone, b.level, gateOpen(b) and "" or " (ยังล็อก)")
+	return ("Lv %d · %s%s"):format(b.level, b.name, gateOpen(b) and "" or " (ล็อก)")
 end
 local function padState(b)
 	local pads = padTable()
