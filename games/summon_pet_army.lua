@@ -49,6 +49,7 @@ local function sv()
 end
 
 local st = {status = "ปิดอยู่", target = "-", shroud = "-", shroudKills = 0, placed = 0, opened = 0, kills = 0, caught = 0, missed = 0, lastCatch = "-", army = "-", wd = "-", err = "-"}
+getgenv().__SPAST = st   -- read-only peek for debugging from the executor
 local caughtBy = {}
 
 -- ------------------------------------------------------------------ game tables
