@@ -233,7 +233,8 @@ end)
 local function busyHands()
 	local h = hum()
 	if not h or not hrp() or h.Health <= 0 then return "ไม่มีตัวละคร (รอเกิดใหม่)" end
-	if plr:GetAttribute("Drumming") then return "กำลังตีกลอง" end
+	-- drumming (Command training at the plot drum) is left alone: after every night the game parks everyone on the drum,
+	-- and stepping off is all it takes, so Auto Farm just warps away
 	if e.pauseOnMove and os.clock() - lastMove < 3 then return "คุณกำลังเดินเอง" end
 	return nil
 end
@@ -487,7 +488,7 @@ local function penJob()
 	return true
 end
 
-local scoutIdx, zoneCursor, zoneSince = 0, 0, 0
+local scoutIdx, zoneCursor = {}, 0   -- scoutIdx[zoneId] = next spawn spot to stand on in that zone
 local function farmStep()
 	if not e.farm then st.status = "ปิดอยู่"; st.target = "-"; return end
 	local why = busyHands()
@@ -527,16 +528,18 @@ local function farmStep()
 		local mid = (z.zmin + z.zmax) / 2
 		spots = {Vector3.new(0, 20, mid)}
 	end
-	scoutIdx = scoutIdx % #spots + 1
-	st.status = ("หาเป้าใน %s (จุด %d/%d)"):format(z.name, scoutIdx, #spots)
+	-- one spot already streams the whole zone (radius 1024): visit one spot, then move on to the next picked zone
+	scoutIdx[z.id] = (scoutIdx[z.id] or 0) % #spots + 1
+	local si = scoutIdx[z.id]
+	st.status = ("หาเป้าใน %s (จุด %d/%d · โซน %d/%d)"):format(z.name, si, #spots, zoneCursor, #zoneList)
 	st.target = "ยังไม่เจอ (ตัวหายาก Chase/Divine เกิดนาน ๆ ครั้ง)"
-	warpFar(spots[scoutIdx])
+	warpFar(spots[si])
 	local t0 = os.clock()
-	while alive() and e.farm and os.clock() - t0 < 6 do
+	while alive() and e.farm and os.clock() - t0 < 3.5 do
 		task.wait(0.5)
 		if findTarget(tmap) or findShroud() then return end
 	end
-	if scoutIdx >= #spots and not shZone then zoneCursor += 1 end
+	if not shZone then zoneCursor += 1 end
 end
 loopEvery("Auto Farm", 0.1, 300, farmStep)
 
