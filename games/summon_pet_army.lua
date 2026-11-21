@@ -419,7 +419,7 @@ local function myArmy()
 			total += 1
 			if m:GetAttribute("SleepUntil") == nil and m:GetAttribute("Dying") ~= true then
 				awake += 1
-				if r and (m:GetPivot().Position - r.Position).Magnitude < 70 then near += 1 end
+				if r and (m:GetPivot().Position - r.Position).Magnitude < 45 then near += 1 end
 			end
 		end
 	end
@@ -427,7 +427,7 @@ local function myArmy()
 end
 local function armyReady()
 	local total, awake, near = myArmy()
-	return total > 0 and awake >= math.ceil(total * 0.6) and near >= math.max(1, math.ceil(awake * 0.7)), total, awake, near
+	return total > 0 and awake >= math.ceil(total * 0.6) and near >= math.max(1, math.ceil(awake * 0.6)), total, awake, near
 end
 -- stand at `spot` until the army is with me and awake (fainted ones wake after ~10 s)
 local function waitArmy(spot, look, maxWait, why)
@@ -436,63 +436,91 @@ local function waitArmy(spot, look, maxWait, why)
 		local ok, total, awake, near = armyReady()
 		if ok then return true end
 		st.status = ("%s · รอ army: ตื่น %d/%d · มาถึง %d"):format(why, awake, total, near)
-		warp(spot, look)
+		if spot then warp(spot, look) end
 		task.wait(0.5)
 	end
 	return armyReady()
 end
 
+-- Tested 2026-11-21 (Jungle Raptor, 14M HP): wild creatures never attack someone just standing near them, and the
+-- army never attacks on its own -- my punch starts the fight, then whoever is close gets hit (the player has 100 HP).
+-- So: stand 30 studs off with the army gathered, hop in, punch once, hop straight back; the army finishes it (~1 s).
+-- Punch again only when its HP stops dropping (the army lost interest). Got hit anyway -> back off further.
 local function fight(m)
-	local pp = m.PrimaryPart
 	local name = m:GetAttribute("DisplayName") or m.Name
 	if m:GetAttribute("Kind") == "Shroud" or CS:HasTag(m, "Shroud") then name = "Shrouded ???" end
 	local zid = m:GetAttribute("Zone")
 	local boss = m:GetAttribute("Tier") == "Boss"
 	local limit = boss and 240 or 90
 	local function dead() return shroudDead(m) or (m:GetAttribute("HP") or 1) <= 0 end
-	local function spots()
-		pp = m.PrimaryPart
-		local cf, size = m:GetPivot(), pp and pp.Size or select(2, m:GetBoundingBox())
+	local r0 = hrp()
+	local dir = r0 and (r0.Position - m:GetPivot().Position) * Vector3.new(1, 0, 1)
+	dir = (dir and dir.Magnitude > 1) and dir.Unit or Vector3.new(0, 0, 1)
+	local function geom()
+		local pp = m.PrimaryPart
+		local cf = m:GetPivot()
+		local size = pp and pp.Size or select(2, m:GetBoundingBox())
 		local half = math.min(math.max(size.X, size.Z) / 2, 30)
-		local look = cf.LookVector
-		local near = cf.Position - look * (half + 5)
-		local back = cf.Position - look * (half + 45)
-		return groundAt(Vector3.new(near.X, cf.Position.Y, near.Z)), groundAt(Vector3.new(back.X, cf.Position.Y, back.Z)), cf.Position
+		return cf.Position, half
+	end
+	local function standAt(d)
+		if not m.Parent then return end
+		local at, half = geom()
+		local p = at + dir * (half + d)
+		warp(groundAt(Vector3.new(p.X, at.Y, p.Z)), at)
+	end
+	local zoneName = ZONE_BY_ID[zid] and ZONE_BY_ID[zid].name or tostring(zid)
+	local function show(hp)
+		st.target = ("%s (%s) · HP %s / %s"):format(name, zoneName, fmt(hp), fmt(m:GetAttribute("MaxHP")))
 	end
 
-	-- stage out of reach first and let the army catch up (it teleports to me once I'm 120+ studs away)
-	local _, back, at = spots()
-	warp(back, at)
-	if not waitArmy(back, at, 20, "เจอ " .. name) then
-		local _, total, awake = armyReady()
-		if awake == 0 then st.status = name .. ": army สลบหมด / ยังไม่มา → ไว้ทีหลัง"; return end
-	end
-
+	-- 1. stage: 22 studs past its edge (~30 from the centre) and let the army gather around me
+	local gap = 22
+	standAt(gap)
 	local t0 = os.clock()
-	local lastHP, lastDrop = m:GetAttribute("HP"), os.clock()
+	while alive() and e.farm and not dead() and os.clock() - t0 < 12 do
+		local ok, total, awake, near = armyReady()
+		if ok then break end
+		st.status = ("เจอ %s · ยืนห่าง รอ army: ตื่น %d/%d · อยู่ใกล้ %d"):format(name, awake, total, near)
+		standAt(gap)
+		task.wait(0.4)
+	end
+	local _, total0, awake0 = armyReady()
+	if awake0 == 0 then st.status = name .. ": army สลบหมด / ยังไม่มา → ไว้ทีหลัง"; return end
+
+	local h = hum()
+	local lastHP, lastDrop, lastPunch = m:GetAttribute("HP"), 0, 0
+	t0 = os.clock()
 	while alive() and e.farm and not dead() do
 		if busyHands() then st.status = "พัก: " .. busyHands(); return end
 		local o = m:GetAttribute("OwnerId")
 		if o and o ~= plr.UserId then st.status = name .. " มีคนอื่นตีอยู่ → หาตัวใหม่"; return end
-		local near, back2, at2 = spots()
-		-- army fainting or me low on health: step back and wait for them to wake before hitting again
-		local h = hum()
+		local hp = m:GetAttribute("HP") or 0
+		if lastHP and hp < lastHP then lastHP, lastDrop = hp, os.clock() end
+		show(hp)
+		h = hum()
+		if h and h.Health < h.MaxHealth then gap = math.min(gap + 15, 60) end   -- something reached me: stand further off
 		local _, total, awake = armyReady()
-		if (h and h.Health < h.MaxHealth * 0.4) or awake < math.ceil(total * 0.4) then
-			warp(back2, at2)
-			waitArmy(back2, at2, 25, ("ถอยก่อน (%s)"):format(h and h.Health < h.MaxHealth * 0.4 and "เลือดต่ำ" or "army สลบ"))
-			lastDrop = os.clock()
-		else
-			warp(near, at2)
+		if awake < math.ceil(total * 0.4) then
+			st.status = ("%s · army สลบ %d/%d → ถอยรอให้ตื่น"):format(name, total - awake, total)
+			standAt(gap + 20)
+			task.wait(0.5)
+		elseif os.clock() - lastDrop > 3 and os.clock() - lastPunch > 1 then
+			-- 2. hop in, punch once, hop back
+			standAt(2)
+			task.wait(0.3)
 			pcall(Punch.FireServer, Punch, m)
-			local hp = m:GetAttribute("HP") or 0
-			if lastHP and hp < lastHP then lastHP, lastDrop = hp, os.clock() end
-			st.target = ("%s (%s) · HP %s / %s"):format(name, ZONE_BY_ID[zid] and ZONE_BY_ID[zid].name or tostring(zid), fmt(hp), fmt(m:GetAttribute("MaxHP")))
-			st.status = ("กำลังตี %s · army ตื่น %d/%d"):format(name, awake, total)
+			lastPunch = os.clock()
+			task.wait(0.3)
+			standAt(gap)
+			st.status = ("ต่อย %s แล้วถอย · army ตื่น %d/%d"):format(name, awake, total)
+		else
+			standAt(gap)
+			st.status = ("army กำลังตี %s · ยืนห่าง %d · army ตื่น %d/%d"):format(name, gap, awake, total)
 		end
 		if os.clock() - t0 > limit then st.status = name .. " ตีนานเกิน " .. limit .. " วิ → ข้าม"; return end
-		if os.clock() - lastDrop > 25 then st.status = name .. " เลือดไม่ลด 25 วิ → ข้าม"; return end
-		task.wait(0.95)
+		if lastDrop > 0 and os.clock() - lastDrop > 25 then st.status = name .. " เลือดไม่ลด 25 วิ → ข้าม"; return end
+		task.wait(0.25)
 	end
 	if dead() then
 		st.kills += 1
