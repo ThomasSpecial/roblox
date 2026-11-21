@@ -193,10 +193,20 @@ do
 	end
 	table.sort(BOSSES, function(a, b) return a.level < b.level end)
 end
+-- PlayerState.Data.Gates[gate] = true once that zone's boss is BEATEN (PlaceConfig.beaten counts them), so the next
+-- zone's door is open as soon as the boss before it is beaten (user 2026-11-22: Empyrean showed locked but he gets in)
 local function gateOpen(b)
 	local d = D()
-	return b.gate == nil or b.gate == "Tutorial" or (d and d.Gates and d.Gates[b.gate] == true)
+	local gates = d and d.Gates or {}
+	if b.gate == nil or b.gate == "Tutorial" or gates[b.gate] == true then return true end
+	for i, x in ipairs(BOSSES) do
+		if x == b then return i == 1 or gates[BOSSES[i - 1].gate] == true end
+	end
+	return false
 end
+-- a boss the army can't kill would eat every sweep (and the character): after a losing fight it is skipped a while
+local tooStrong = {}   -- name -> os.clock() until which it is skipped
+local function skipped(b) return (tooStrong[b.name] or 0) > os.clock() end
 -- short on purpose: the dropdown cuts anything past ~28 characters, and the boss name already says the zone
 local function bossLabel(b)
 	return ("Lv %d · %s%s"):format(b.level, b.name, gateOpen(b) and "" or " (ล็อก)")
@@ -219,7 +229,7 @@ end
 local function pickBoss()
 	for i = #BOSSES, 1, -1 do   -- strongest picked boss first
 		local b = BOSSES[i]
-		if table.find(e.bosses, b.name) and gateOpen(b) and padState(b) == "alive" then return b end
+		if table.find(e.bosses, b.name) and gateOpen(b) and not skipped(b) and padState(b) == "alive" then return b end
 	end
 end
 
@@ -242,8 +252,22 @@ local function fightBoss(b)
 	end
 	if not m then st.status = b.name .. " ไม่โผล่ (มีคนตีไปแล้ว?)"; task.wait(1); return end
 	t0 = os.clock()
+	local h0 = m:FindFirstChildOfClass("Humanoid")
+	local hp0 = h0 and h0.Health
+	local function giveUp(why)
+		tooStrong[b.name] = os.clock() + 900
+		st.status = ("%s ตีไม่ไหว (%s) → ข้ามตัวนี้ 15 นาที"):format(b.name, why)
+	end
 	while alive() and e.boss and m.Parent and not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") and os.clock() - t0 < 90 do
+		local me = hum()
+		if not me or me.Health <= 0 then giveUp("ตัวละครตาย"); return end
 		if busyHands() then st.status = "พัก: " .. busyHands(); return end
+		-- after 15 s: at this rate would it take more than 90 s? then it's out of reach for now
+		local hn = m:FindFirstChildOfClass("Humanoid")
+		if hp0 and hn and os.clock() - t0 > 15 then
+			local rate = (hp0 - hn.Health) / (os.clock() - t0)
+			if rate <= 0 or hn.Health / rate > 90 then giveUp("เลือดบอสลดช้าเกิน"); return end
+		end
 		local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
 		if root then
 			local r = hrp()
@@ -274,7 +298,7 @@ loopEvery("Boss/Train", 0.3, 150, function()
 		-- wait-for-all: stay on the bench until every picked (unlocked) boss is up, then clear them in one trip
 		local want, up = 0, 0
 		for _, b in ipairs(BOSSES) do
-			if table.find(e.bosses, b.name) and gateOpen(b) then
+			if table.find(e.bosses, b.name) and gateOpen(b) and not skipped(b) then
 				want += 1
 				if padState(b) == "alive" then up += 1 end
 			end
@@ -483,7 +507,8 @@ task.spawn(function()
 			local lines = {}
 			for _, b in ipairs(BOSSES) do
 				if table.find(e.bosses, b.name) then
-					lines[#lines + 1] = ("%s: %s"):format(b.name, not gateOpen(b) and "ยังล็อก" or padState(b) == "alive" and "เกิดแล้ว" or "รอเกิด")
+					lines[#lines + 1] = ("%s: %s"):format(b.name, not gateOpen(b) and "ยังล็อก" or skipped(b) and ("ตีไม่ไหว ข้ามอีก %d นาที"):format(math.ceil((tooStrong[b.name] - os.clock()) / 60))
+					or padState(b) == "alive" and "เกิดแล้ว" or "รอเกิด")
 				end
 			end
 			bossLbl:UpdateName(st.boss .. "\n" .. (#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้เลือกบอส"))
