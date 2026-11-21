@@ -95,6 +95,7 @@ local ANCHORS = {
 	-- zone 8 is ~2,450 studs long (easy band z -8.6k at y 122, hard band z -9.2k..-9.4k at y 177, boss -9722): the hard-band
 	-- spots stream the far half too
 	Zone8 = {Vector3.new(-345, 177, -9180), Vector3.new(-245, 122, -8880), Vector3.new(-245, 177, -9430)},
+	Zone9 = {Vector3.new(-405, 265, -10570), Vector3.new(-565, 305, -11525), Vector3.new(-285, 265, -10910)},
 }
 e.spawns = type(e.spawns) == "table" and e.spawns or {}
 local function anchorsOf(zid)
@@ -396,6 +397,29 @@ local announceConn = Remotes:WaitForChild("Announce").OnClientEvent:Connect(func
 	st.annTick = (st.annTick or 0) + 1
 	st.lastAnn = ("%s เกิดที่ %s · %s"):format(cname(a.kind), tostring(a.zone or a.zoneNum), os.date("%H:%M:%S"))
 end)
+-- Tested 2026-11-22: a peeked zone only stays streamed for ~1 s (RequestStreamAroundAsync never returns, the next
+-- request evicts it), so a picked creature seen by the peek is usually gone again before the farm loop looks.
+-- Every picked creature that streams in is therefore written down with its position the moment it appears, and the
+-- farm warps straight to that spot.
+local sightings = {}   -- "kind|zone" -> {kind, zone, pos, at}
+local function noteSighting(m)
+	if not alive() or not e.farm or not m.Parent then return end
+	local k, z = m:GetAttribute("Kind"), m:GetAttribute("Zone")
+	if not k or targetMap()[k] ~= z then return end
+	local o = m:GetAttribute("OwnerId")
+	if (o and o ~= plr.UserId) or (m:GetAttribute("HP") or 1) <= 0 then return end
+	if (m:GetAttribute("Size") or 3) < (tonumber(e.minSize) or 1) then return end
+	local ok, pos = pcall(function() return m:GetPivot().Position end)
+	if not ok or pos.Magnitude < 1 then return end
+	local key = k .. "|" .. tostring(z)
+	local fresh = not sightings[key]
+	sightings[key] = {kind = k, zone = z, pos = pos, at = os.clock()}
+	if fresh then
+		st.annTick = (st.annTick or 0) + 1   -- wakes the farm loop
+		st.lastSight = ("%s (%s) · %s"):format(cname(k), ZONE_BY_ID[z] and ZONE_BY_ID[z].name or tostring(z), os.date("%H:%M:%S"))
+	end
+end
+local sightConn = CS:GetInstanceAddedSignal("WildCreature"):Connect(function(m) task.delay(0.15, noteSighting, m) end)
 local function shroudDead(m)
 	return not m.Parent or m:GetAttribute("Dying") == true or (m:GetAttribute("HP") ~= nil and m:GetAttribute("HP") <= 0)
 end
@@ -858,14 +882,39 @@ local function farmStep()
 	learnSpawns()
 	local sh = findShroud()
 	if sh then logFight(sh, "Shrouded"); return fight(sh) end
-	if penJob() then return end
 
 	local m = findTarget(tmap)
 	if m then
 		if spawnSeen[m:GetAttribute("Kind")] then spawnSeen[m:GetAttribute("Kind")] = nil end
+		sightings[tostring(m:GetAttribute("Kind")) .. "|" .. tostring(m:GetAttribute("Zone"))] = nil
 		logFight(m, "ตัวที่เลือก (" .. tostring(KIND_RAR[m:GetAttribute("Kind")] or "?") .. ")")
 		return fight(m)
 	end
+
+	-- seen from afar (peek / passing by): warp straight to where it was
+	local sKey, sBest
+	for key, sg in pairs(sightings) do
+		if os.clock() - sg.at > 120 or tmap[sg.kind] ~= sg.zone then
+			sightings[key] = nil
+		elseif not sBest or sg.at > sBest.at then
+			sKey, sBest = key, sg
+		end
+	end
+	if sBest then
+		local z = ZONE_BY_ID[sBest.zone]
+		st.waiting = false
+		st.status = ("เห็น %s ที่ %s จากระยะไกล → วาร์ปไปที่ตัวมันเลย"):format(cname(sBest.kind), z and z.name or tostring(sBest.zone))
+		st.target = "กำลังไปหา " .. cname(sBest.kind)
+		warpFar(sBest.pos + Vector3.new(0, 0, 45))
+		local t0 = os.clock()
+		while alive() and e.farm and os.clock() - t0 < 6 do
+			if findTarget(tmap) or findShroud() then return end
+			task.wait(0.2)
+		end
+		sightings[sKey] = nil   -- not there any more (caught by someone else / wandered off and the zone scan missed it)
+		return
+	end
+	if penJob() then return end
 
 	-- where to look: an announced Shrouded, then announced picks, then picked zones whose picks are always out
 	local goZone, why
@@ -924,9 +973,9 @@ local function farmStep()
 	st.target = "ยังไม่เจอ"
 	warpFar(spots[si])
 	local t0 = os.clock()
-	while alive() and e.farm and os.clock() - t0 < 3.5 do
-		task.wait(0.5)
-		if findTarget(tmap) or findShroud() then return end
+	while alive() and e.farm and os.clock() - t0 < (why and 6 or 3.5) do
+		task.wait(0.2)
+		if findTarget(tmap) or findShroud() or next(sightings) then return end
 	end
 	if not why then scoutMiss[goZone.id] = os.clock() end
 	-- announced one not found from here: try the other spots a couple of times, then forget it (caught by someone else)
@@ -937,28 +986,49 @@ loopEvery("Auto Farm", 0.1, 300, farmStep)
 -- not every rare spawn is announced: while waiting, ask the server to stream one spawn spot of a picked zone at a
 -- time (the character stays put). A picked creature that streams in is seen by findTarget and the farm warps to it.
 local peekZone, peekSpot = 0, {}
-loopEvery("Peek", 0.5, 30, function()
-	if not (e.farm and st.waiting) then return end
-	local tmap = targetMap()
-	local zl = {}
-	-- a Shrouded isn't always announced either: with the Shrouded toggle on, every unlocked zone gets peeked;
-	-- for 90 s after dawn (when it rolls) the picked zones step aside so the sweep goes round faster
-	local dawn = e.shroud and st.dawnAt and os.clock() - st.dawnAt < 90
-	for _, z in ipairs(ZONES) do
-		if unlocked(z) and not (z.secret and not unlocked(z)) then
-			local picked = false
-			for _, zid in pairs(tmap) do if zid == z.id then picked = true; break end end
-			if (picked and not dawn) or e.shroud then zl[#zl + 1] = z end
-		end
-	end
-	if #zl == 0 then return end
-	peekZone = peekZone % #zl + 1
-	local z = zl[peekZone]
-	local spots = anchorsOf(z.id)
-	if #spots == 0 then return end
+local otherCursor, pickPass = 0, 0
+local function peekZoneOnce(z, dawn)
+	local spots = table.clone(ANCHORS[z.id] or {})
+	if #spots == 0 then spots = anchorsOf(z.id) end
+	if #spots == 0 then spots = {Vector3.new(-300, 200, (z.zmin + z.zmax) / 2)} end
 	peekSpot[z.id] = (peekSpot[z.id] or 0) % #spots + 1
 	st.peek = ("%s จุด %d/%d%s"):format(z.name, peekSpot[z.id], #spots, dawn and " (เช้าแล้ว: กวาดหา Shrouded)" or "")
-	streamAround(spots[peekSpot[z.id]], dawn and 2 or 4)
+	local pos = spots[peekSpot[z.id]]
+	task.spawn(function() pcall(function() plr:RequestStreamAroundAsync(pos, 4) end) end)
+	local t0, seenAt = os.clock(), nil
+	while alive() and os.clock() - t0 < 4.5 do
+		if not seenAt then
+			for _, m in ipairs(CS:GetTagged("WildCreature")) do
+				if m:GetAttribute("Zone") == z.id then seenAt = os.clock(); break end
+			end
+		elseif os.clock() - seenAt > 0.6 then
+			break   -- the zone is in; sightings were written as the creatures arrived
+		end
+		task.wait(0.1)
+	end
+end
+loopEvery("Peek", 0.2, 30, function()
+	if not (e.farm and st.waiting) then return end
+	local tmap = targetMap()
+	local picked, other = {}, {}
+	for _, z in ipairs(ZONES) do
+		if unlocked(z) then
+			local isPicked = false
+			for _, zid in pairs(tmap) do if zid == z.id then isPicked = true; break end end
+			if isPicked then picked[#picked + 1] = z elseif e.shroud then other[#other + 1] = z end
+		end
+	end
+	local dawn = e.shroud and st.dawnAt and os.clock() - st.dawnAt < 90
+	local list = dawn and other or picked
+	if #list == 0 then list = #picked > 0 and picked or other end
+	if #list == 0 then return end
+	peekZone = peekZone % #list + 1
+	peekZoneOnce(list[peekZone], dawn)
+	-- after each full pass over the picked zones, one other zone for a Shrouded
+	if not dawn and list == picked and peekZone == #picked and #other > 0 and st.waiting then
+		otherCursor = otherCursor % #other + 1
+		peekZoneOnce(other[otherCursor], false)
+	end
 end)
 
 -- leg-lock guard: BossIntroClient / EntranceClient set WalkSpeed, JumpPower, JumpHeight = 0 for a cutscene and restore
@@ -1354,6 +1424,7 @@ task.spawn(function()
 				("ฆ่า %d · จับได้ %d · ล่าสุด: %s"):format(st.kills, st.caught, st.lastCatch),
 				st.army,
 				"เกมประกาศล่าสุด: " .. tostring(st.lastAnn or "-"),
+				"ส่องเจอจากระยะไกลล่าสุด: " .. tostring(st.lastSight or "-"),
 				"แจ้งเตือนเกม: " .. tostring(st.lastNote or "-"),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
@@ -1378,7 +1449,7 @@ end)
 -- unload: stop every loop and drop the connections when the window closes or the script reloads
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn, jumpConn, noclipConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn, jumpConn, noclipConn, sightConn}) do pcall(function() c:Disconnect() end) end
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__SPA == G then getgenv().__SPA = G + 1 end end)
