@@ -36,7 +36,8 @@ local ShroudRE = Remotes:WaitForChild("Shroud")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("PetArmy/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true}
+local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true,
+	speedOn = false, speed = 100, jumpOn = false, jump = 80, infJump = false, noclip = false, fullbright = false, fovOn = false, fov = 70}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -985,6 +986,89 @@ task.spawn(function()
 	end
 end)
 
+
+-- ------------------------------------------------------------------ misc (speed / jump / noclip / fullbright / fov)
+-- WalkSpeed / jump are only pushed while the game leaves them above 0: a cutscene or the drum sets 0 on purpose,
+-- and the leg-lock guard above already handles a 0 that sticks.
+local SPv = game:GetService("StarterPlayer")
+local Lighting = game:GetService("Lighting")
+local function baseSpeed() return plr:GetAttribute("BaseWalkSpeed") or SPv.CharacterWalkSpeed end
+local function restoreMove()
+	local h = hum()
+	if not h then return end
+	pcall(function()
+		if h.WalkSpeed > 0 then h.WalkSpeed = baseSpeed() end
+		if h.UseJumpPower then if h.JumpPower > 0 then h.JumpPower = SPv.CharacterJumpPower end
+		elseif h.JumpHeight > 0 then h.JumpHeight = SPv.CharacterJumpHeight end
+	end)
+end
+task.spawn(function()
+	while alive() do
+		local h = hum()
+		if h and h.Health > 0 then
+			pcall(function()
+				if e.speedOn and h.WalkSpeed > 0 and h.WalkSpeed ~= e.speed then h.WalkSpeed = e.speed end
+				if e.jumpOn then
+					if h.UseJumpPower then
+						if h.JumpPower > 0 and h.JumpPower ~= e.jump then h.JumpPower = e.jump end
+					else
+						local height = e.jump * e.jump / (2 * workspace.Gravity)   -- same jump as JumpPower e.jump
+						if h.JumpHeight > 0 and math.abs(h.JumpHeight - height) > 0.05 then h.JumpHeight = height end
+					end
+				end
+			end)
+		end
+		task.wait(0.2)
+	end
+end)
+local jumpConn = UIS.JumpRequest:Connect(function()
+	if not alive() or not e.infJump then return end
+	local h = hum()
+	if h and h.Health > 0 and (h.UseJumpPower and h.JumpPower or h.JumpHeight) > 0 then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+local noclipParts = {}
+local noclipConn = game:GetService("RunService").Stepped:Connect(function()
+	if not alive() then return end
+	local c = plr.Character
+	if e.noclip and c then
+		for _, bp in ipairs(c:GetDescendants()) do
+			if bp:IsA("BasePart") and bp.CanCollide then noclipParts[bp] = true; bp.CanCollide = false end
+		end
+	elseif next(noclipParts) then
+		for bp in pairs(noclipParts) do if bp.Parent then bp.CanCollide = true end end
+		table.clear(noclipParts)
+	end
+end)
+local lightSaved
+local function applyFullbright(on)
+	if on then
+		lightSaved = lightSaved or {Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, FogEnd = Lighting.FogEnd,
+			GlobalShadows = Lighting.GlobalShadows, Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient}
+	elseif lightSaved then
+		for k, v in pairs(lightSaved) do pcall(function() Lighting[k] = v end) end
+		lightSaved = nil
+	end
+end
+task.spawn(function()
+	while alive() do
+		if e.fullbright then
+			applyFullbright(true)
+			pcall(function()
+				Lighting.Brightness = 2; Lighting.ClockTime = 14; Lighting.FogEnd = 1e5; Lighting.GlobalShadows = false
+				Lighting.Ambient = Color3.fromRGB(178, 178, 178); Lighting.OutdoorAmbient = Color3.fromRGB(178, 178, 178)
+			end)
+		elseif lightSaved then
+			applyFullbright(false)
+		end
+		local cam = workspace.CurrentCamera
+		if e.fovOn and cam and math.abs(cam.FieldOfView - e.fov) > 0.5 then cam.FieldOfView = e.fov end
+		task.wait(0.5)
+	end
+	applyFullbright(false)
+	if e.noclip then for bp in pairs(noclipParts) do if bp.Parent then bp.CanCollide = true end end end
+	if e.speedOn or e.jumpOn then restoreMove() end
+end)
+
 -- army / storage count for the status panel
 task.spawn(function()
 	while alive() do
@@ -1045,6 +1129,7 @@ local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
 	Event = TG:Tab({Name = "Event", Image = "rbxassetid://10723346959"}),
+	Misc = TG:Tab({Name = "Misc", Image = "rbxassetid://10734950309"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 
@@ -1223,6 +1308,27 @@ local EVR = Tabs.Event:Section({Side = "Right"})
 EVR:Header({Text = "สถานะ"})
 local hbLbl = EVR:Label({Text = "-"})
 
+local MS = Tabs.Misc:Section({Side = "Left"})
+MS:Header({Text = "การเคลื่อนที่"})
+MS:Toggle({Name = "WalkSpeed", Default = e.speedOn, Callback = function(v) e.speedOn = v; sv(); if not v then restoreMove() end end}, "SPASpeedOn")
+MS:Slider({Name = "ความเร็วเดิน", Minimum = 16, Maximum = 300, Default = tonumber(e.speed) or 100,
+	Precision = 0, DisplayMethod = "Round", Callback = function(v) e.speed = math.floor(v + 0.5); sv() end}, "SPASpeed")
+MS:Toggle({Name = "Jump Power", Default = e.jumpOn, Callback = function(v) e.jumpOn = v; sv(); if not v then restoreMove() end end}, "SPAJumpOn")
+MS:Slider({Name = "แรงกระโดด", Minimum = 50, Maximum = 300, Default = tonumber(e.jump) or 80,
+	Precision = 0, DisplayMethod = "Round", Callback = function(v) e.jump = math.floor(v + 0.5); sv() end}, "SPAJump")
+MS:Toggle({Name = "Infinite Jump (กดกระโดดกลางอากาศได้)", Default = e.infJump, Callback = function(v) e.infJump = v; sv() end}, "SPAInfJump")
+MS:Toggle({Name = "Noclip (เดินทะลุกำแพง)", Default = e.noclip, Callback = function(v) e.noclip = v; sv() end}, "SPANoclip")
+MS:Label({Text = ("ความเร็วปกติของตัวละครตอนนี้ %s (เกมเพิ่มตามอัปเกรด)\nช่วง cutscene / ตีกลอง เกมล็อกขาไว้ → ไม่ทับค่า รอให้เกมปล่อยก่อน"):format(fmt(baseSpeed()))})
+local MR = Tabs.Misc:Section({Side = "Right"})
+MR:Header({Text = "ภาพ"})
+MR:Toggle({Name = "Fullbright (สว่างตลอด ไม่มีหมอก)", Default = e.fullbright, Callback = function(v) e.fullbright = v; sv() end}, "SPAFullbright")
+MR:Toggle({Name = "ปรับ FOV", Default = e.fovOn, Callback = function(v)
+	e.fovOn = v; sv()
+	if not v and workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = 70 end
+end}, "SPAFovOn")
+MR:Slider({Name = "FOV", Minimum = 50, Maximum = 120, Default = tonumber(e.fov) or 70,
+	Precision = 0, DisplayMethod = "Round", Callback = function(v) e.fov = math.floor(v + 0.5); sv() end}, "SPAFov")
+
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "SPAToggleUI")
@@ -1272,7 +1378,7 @@ end)
 -- unload: stop every loop and drop the connections when the window closes or the script reloads
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn, jumpConn, noclipConn}) do pcall(function() c:Disconnect() end) end
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__SPA == G then getgenv().__SPA = G + 1 end end)
