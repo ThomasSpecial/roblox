@@ -939,7 +939,7 @@ L:Toggle({Name = "└ เอา Mystery Soul ไปวางฟักที่�
 L:Label({Text = "เกมประกาศเมื่อ Shrouded เกิด → วาร์ปไปโซนนั้นตีก่อนตัวอื่น (ต้องเปิด Auto Farm)\nตายแล้วได้ Mystery Soul → กลับแคมป์วางในคอก ฟัก 15-60 นาที → เปิดได้ Rare / Chase / Divine"})
 L:Toggle({Name = "จับ soul ตัวอื่นที่ตายด้วย (army ตีโดน)", Default = e.catchOthers, Callback = function(v) e.catchOthers = v; sv() end}, "SPAOthers")
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "SPAPause")
--- Anti-AFK / Auto Reconnect sit on this tab and on Settings; both copies stay in sync
+-- Anti-AFK / Auto Reconnect live on the Settings tab only (user, 2026-11-21: duplicate on the main tab was noise)
 local guardTabs, afkT, recT = false, {}, {}
 local function syncSet(key, toggles, v)
 	if guardTabs then return end
@@ -948,9 +948,6 @@ local function syncSet(key, toggles, v)
 	for _, t in ipairs(toggles) do pcall(function() if t:GetState() ~= v then t:UpdateState(v) end end) end
 	guardTabs = false
 end
-L:Header({Text = "กันหลุด"})
-afkT[#afkT + 1] = L:Toggle({Name = "Anti-AFK (กันโดนเตะตอนยืนนิ่ง 20 นาที)", Default = e.antiAfk, Callback = function(v) syncSet("antiAfk", afkT, v) end}, "SPAAntiAfk1")
-recT[#recT + 1] = L:Toggle({Name = "Auto Reconnect (หลุด / โดนเตะ → เข้าเกมใหม่เอง)", Default = e.reconnect, Callback = function(v) syncSet("reconnect", recT, v) end}, "SPAReconnect1")
 
 local R = Tabs.Main:Section({Side = "Right"})
 R:Header({Text = "สถานะ"})
