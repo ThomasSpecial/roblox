@@ -36,7 +36,7 @@ local ShroudRE = Remotes:WaitForChild("Shroud")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("PetArmy/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true,
+local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, equipBest = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true,
 	speedOn = false, speed = 100, jumpOn = false, jump = 80, infJump = false, noclip = false, fullbright = false, fovOn = false, fov = 70}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -48,7 +48,7 @@ local function sv()
 	end)
 end
 
-local st = {status = "ปิดอยู่", target = "-", shroud = "-", shroudKills = 0, placed = 0, opened = 0, kills = 0, caught = 0, missed = 0, lastCatch = "-", army = "-", wd = "-", err = "-"}
+local st = {status = "ปิดอยู่", target = "-", shroud = "-", shroudKills = 0, placed = 0, opened = 0, kills = 0, caught = 0, missed = 0, lastCatch = "-", army = "-", equip = "-", equips = 0, wd = "-", err = "-"}
 getgenv().__SPAST = st   -- read-only peek for debugging from the executor
 local caughtBy = {}
 
@@ -1166,17 +1166,42 @@ task.spawn(function()
 	if e.speedOn or e.jumpOn then restoreMove() end
 end)
 
--- army / storage count for the status panel
+-- army / storage count for the status panel + Auto Equip Best
+-- state.army / state.storage are id strings ("Godslayer|2", "OathboundCentaur|4|Inferno|2"); ArmyRules.power(id) is the
+-- number the army window shows. "equipBest" is the window's EQUIP BEST button -- only sent when storage holds something
+-- stronger than the weakest active one (or a slot is empty), so the army isn't reshuffled mid-fight for nothing.
+local ArmyRules = require(Shared:WaitForChild("ArmyRules"))
+local function powerOf(id) local ok, p = pcall(ArmyRules.power, id); return ok and tonumber(p) or 0 end
 task.spawn(function()
+	local lastPoll = -1e9
 	while alive() do
-		pcall(function()
-			local ok, r = pcall(ArmyAction.InvokeServer, ArmyAction, "get")
-			if ok and type(r) == "table" and type(r.state) == "table" then
+		if os.clock() - lastPoll >= (e.equipBest and 10 or 20) then
+			lastPoll = os.clock()
+			pcall(function()
+				local ok, r = pcall(ArmyAction.InvokeServer, ArmyAction, "get")
+				if not (ok and type(r) == "table" and type(r.state) == "table") then return end
 				local s = r.state
-				st.army = ("army %d/%d · storage %d%s"):format(#(s.army or {}), s.slots or 0, #(s.storage or {}), s.capped and " (เต็ม!)" or "")
-			end
-		end)
-		task.wait(20)
+				local army, stor = s.army or {}, s.storage or {}
+				st.army = ("army %d/%d · storage %d%s"):format(#army, s.slots or 0, #stor, s.capped and " (เต็ม!)" or "")
+				if not e.equipBest or #stor == 0 then return end
+				local weakest = math.huge
+				for _, id in ipairs(army) do weakest = math.min(weakest, powerOf(id)) end
+				local best, bestId = 0, nil
+				for _, id in ipairs(stor) do local p = powerOf(id); if p > best then best, bestId = p, id end end
+				if #army >= (s.slots or 0) and best <= weakest then
+					st.equip = "ใส่ตัวแรงสุดอยู่แล้ว · " .. os.date("%H:%M:%S")
+					return
+				end
+				local ok2, r2 = pcall(ArmyAction.InvokeServer, ArmyAction, "equipBest")
+				if ok2 and type(r2) == "table" and r2.ok then
+					st.equips += 1
+					st.equip = ("Equip Best → ใส่ %s (%s) · %s"):format(tostring(bestId):match("^[^|]+") or "?", fmt(best), os.date("%H:%M:%S"))
+				else
+					st.equip = "Equip Best ไม่ผ่าน: " .. tostring(type(r2) == "table" and r2.msg or r2)
+				end
+			end)
+		end
+		task.wait(1)
 	end
 end)
 
@@ -1375,6 +1400,9 @@ L:Header({Text = "Shrouded ???"})
 L:Toggle({Name = "ล่า Shrouded (เกิดสุ่มทุกโซน)", Default = e.shroud, Callback = function(v) e.shroud = v; sv() end}, "SPAShroud")
 L:Toggle({Name = "└ เอา Mystery Soul ไปวางฟักที่คอก + เปิดเมื่อฟักเสร็จ", Default = e.shroudPen, Callback = function(v) e.shroudPen = v; sv() end}, "SPAShroudPen")
 L:Label({Text = "เกมประกาศเมื่อ Shrouded เกิด → วาร์ปไปโซนนั้นตีก่อนตัวอื่น (ต้องเปิด Auto Farm)\nตายแล้วได้ Mystery Soul → กลับแคมป์วางในคอก ฟัก 15-60 นาที → เปิดได้ Rare / Chase / Divine"})
+L:Header({Text = "Army"})
+L:Toggle({Name = "Auto Equip Best (ใส่ตัวแรงสุดเข้า army)", Default = e.equipBest, Callback = function(v) e.equipBest = v; sv() end}, "SPAEquipBest")
+L:Label({Text = "เช็คทุก 10 วิ · กด EQUIP BEST ให้เฉพาะตอนในคลังมีตัวแรงกว่าตัวที่อ่อนสุดใน army"})
 L:Toggle({Name = "จับ soul ตัวอื่นที่ตายด้วย (army ตีโดน)", Default = e.catchOthers, Callback = function(v) e.catchOthers = v; sv() end}, "SPAOthers")
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "SPAPause")
 -- Anti-AFK / Auto Reconnect live on the Settings tab only (user, 2026-11-21: duplicate on the main tab was noise)
@@ -1449,7 +1477,7 @@ task.spawn(function()
 				("Shrouded: %s · ฆ่า %d · Mystery Soul ถืออยู่ %d · วาง %d · เปิด %d"):format(st.shroud, st.shroudKills,
 					plr:GetAttribute("MysterySouls") or 0, st.placed, st.opened),
 				("ฆ่า %d · จับได้ %d · ล่าสุด: %s"):format(st.kills, st.caught, st.lastCatch),
-				st.army,
+				st.army .. (e.equipBest and (" · " .. st.equip) or ""),
 				"เกมประกาศล่าสุด: " .. tostring(st.lastAnn or "-"),
 				"ส่องเจอจากระยะไกลล่าสุด: " .. tostring(st.lastSight or "-"),
 				"แจ้งเตือนเกม: " .. tostring(st.lastNote or "-"),
