@@ -36,7 +36,7 @@ local ShroudRE = Remotes:WaitForChild("Shroud")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("PetArmy/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true}
+local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -593,8 +593,166 @@ local function waitAnnounce(sec)   -- idle until `sec` passes or the game announ
 	while alive() and os.clock() - t0 < sec and st.annTick == a0 do task.wait(0.05) end
 end
 
+
+-- ------------------------------------------------------------------ harvest boss (event)
+-- Camp.HarvestEvent.Gate: walking through Swirl.Body (a 16x22 portal plane) takes you to Camp.HarvestArena
+-- (ArrivalCF ~ 3000,0,2690, boss at BossCF ~ 3000,0,2590). The gate's "Timer" label reads "NEXT IN mm:ss" while closed.
+-- Every follower deals a flat 100 DPS (Config.Events.Harvest.Boss.FollowerDPS), fight lasts 180 s, reward 1000 Kernels.
+-- Remotes.HarvestBossFX: "slam"(center, radius, delay) and "volley"(?, landing points, radius, flight, stagger) are
+-- warned before they hit -> the fight loop keeps the character out of every warned circle.
+local HBCfg = (Config.Events and Config.Events.Harvest and Config.Events.Harvest.Boss) or {}
+local HB_KIND = HBCfg.Kind or "CornucopiaColossus"
+local danger = {}   -- {pos, r, untilT}
+local hbFxConn = Remotes:WaitForChild("HarvestBossFX").OnClientEvent:Connect(function(kind, a1, a2, a3, a4, a5)
+	if not alive() then return end
+	local t = os.clock()
+	if kind == "slam" and typeof(a1) == "Vector3" then
+		danger[#danger + 1] = {pos = a1, r = (tonumber(a2) or 34) + 8, untilT = t + (tonumber(a3) or 2) + 0.6}
+	elseif kind == "volley" and type(a2) == "table" then
+		local flight, stagger = tonumber(a4) or 2.4, tonumber(a5) or 0
+		for i, pos in ipairs(a2) do
+			if typeof(pos) == "Vector3" then
+				danger[#danger + 1] = {pos = pos, r = (tonumber(a3) or 10) + 6, untilT = t + flight + (i - 1) * stagger + 0.6}
+			end
+		end
+	end
+	st.hbFx = kind .. " · " .. os.date("%H:%M:%S")
+end)
+local function inDanger(pos)
+	local t = os.clock()
+	for i = #danger, 1, -1 do
+		local d = danger[i]
+		if d.untilT < t then
+			table.remove(danger, i)
+		else
+			local v = pos - d.pos
+			if Vector3.new(v.X, 0, v.Z).Magnitude < d.r then return true end
+		end
+	end
+	return false
+end
+local function hbGate()
+	local ev = workspace:FindFirstChild("Camp") and workspace.Camp:FindFirstChild("HarvestEvent")
+	local gate = ev and ev:FindFirstChild("Gate")
+	local body = gate and gate:FindFirstChild("Swirl") and gate.Swirl:FindFirstChild("Body")
+	local timer
+	for _, l in ipairs(gate and gate:GetDescendants() or {}) do
+		if l:IsA("TextLabel") and l.Name == "Timer" then timer = l.Text end
+	end
+	return body, timer
+end
+local function hbBoss()
+	for _, m in ipairs(CS:GetTagged("WildCreature")) do
+		if m:GetAttribute("Kind") == HB_KIND and m.Parent and not m:GetAttribute("Dying") and (m:GetAttribute("HP") or 1) > 0 then return m end
+	end
+	local f = workspace:FindFirstChild("WildCreatures")
+	for _, m in ipairs(f and f:GetChildren() or {}) do
+		if m:GetAttribute("Kind") == HB_KIND and not m:GetAttribute("Dying") and (m:GetAttribute("HP") or 1) > 0 then return m end
+	end
+end
+local function inArena()
+	local r = hrp()
+	local a = workspace:FindFirstChild("Camp") and workspace.Camp:FindFirstChild("HarvestArena")
+	local bcf = a and a:GetAttribute("BossCF")
+	local center = typeof(bcf) == "CFrame" and bcf.Position or Vector3.new(3000, 0, 2590)
+	return r and (Vector3.new(r.Position.X, 0, r.Position.Z) - Vector3.new(center.X, 0, center.Z)).Magnitude < 200, center
+end
+local GATE_AT = Vector3.new(3145, 12, 214)
+local lastGatePeek = 0
+local function hbOpen()
+	local body, timer = hbGate()
+	if not body and os.clock() - lastGatePeek > 20 then   -- out hunting: stream the gate in to read its timer
+		lastGatePeek = os.clock()
+		streamAround(GATE_AT, 2)
+		body, timer = hbGate()
+	end
+	if not body then return false, "ยังไม่เห็นประตู (อยู่ไกลแคมป์)" end
+	if timer and timer:upper():find("NEXT", 1, true) then return false, timer end
+	return true, timer or "?"
+end
+-- walk through the portal plane: start on one side, step across in small hops so the server sees the crossing
+local function hbEnter()
+	local body = hbGate()
+	if not body then warpFar(CAMP); task.wait(0.5); body = hbGate() end
+	if not body then return false end
+	for _, dir in ipairs({1, -1}) do
+		local look = body.CFrame.LookVector * dir
+		local base = body.Position - Vector3.new(0, body.Size.Y / 2 - 3, 0)
+		for k = 0, 8 do
+			warp(base - look * 8 + look * (k * 2), base + look * 30)
+			task.wait(0.06)
+		end
+		local t0 = os.clock()
+		while os.clock() - t0 < 3 do
+			if inArena() then return true end
+			task.wait(0.2)
+		end
+	end
+	return inArena()
+end
+local function hbFight(m)
+	local name = "Harvest Boss"
+	local t0 = os.clock()
+	while alive() and e.hboss and m.Parent and not m:GetAttribute("Dying") and (m:GetAttribute("HP") or 1) > 0 and os.clock() - t0 < 200 do
+		local cf = m:GetPivot()
+		local pp = m.PrimaryPart
+		local size = pp and pp.Size or Vector3.new(20, 20, 20)
+		local reach = (Config.Punch.Range or 11) + size.X / 2 + size.Y / 2 - 2
+		local r0 = math.min(math.max(size.X, size.Z) / 2 + 6, reach)
+		-- pick a spot on a ring around the boss that is outside every warned circle (prefer the closest ring)
+		local spot
+		for _, radius in ipairs({r0, r0 + 15, r0 + 35, r0 + 60}) do
+			for k = 0, 15 do
+				local a = k / 16 * math.pi * 2
+				local cand = cf.Position + Vector3.new(math.cos(a) * radius, 0, math.sin(a) * radius)
+				if not inDanger(cand) then spot = cand; break end
+			end
+			if spot then break end
+		end
+		spot = groundAt(spot or (cf.Position + Vector3.new(0, 0, r0 + 80)))
+		local r = hrp()
+		if r and (inDanger(r.Position) or (r.Position - spot).Magnitude > 6) then warp(spot, cf.Position) end
+		if r and (r.Position - cf.Position).Magnitude <= reach + 4 then pcall(Punch.FireServer, Punch, m) end
+		local _, total, awake = armyReady()
+		st.hb = ("กำลังตี %s · HP %s / %s · army ตื่น %d/%d · หลบ %d วง"):format(name, fmt(m:GetAttribute("HP")), fmt(m:GetAttribute("MaxHP")), awake, total, #danger)
+		task.wait(0.3)
+	end
+	if not m.Parent or m:GetAttribute("Dying") or (m:GetAttribute("HP") or 1) <= 0 then
+		st.hbWins = (st.hbWins or 0) + 1
+		st.hb = "ชนะ Harvest Boss · " .. os.date("%H:%M:%S")
+	end
+end
+-- returns true while it owns the character
+local hbTried = 0
+local function harvestJob()
+	if not e.hboss then st.hb = "ปิดอยู่"; return false end
+	local here = inArena()
+	local boss = hbBoss()
+	if here and boss then hbFight(boss); return true end
+	local open, timer = hbOpen()
+	if not open then
+		st.hb = "ปิด · " .. tostring(timer)
+		return false
+	end
+	if here then st.hb = "อยู่ในสนาม รอบอสโผล่"; task.wait(0.5); return os.clock() - hbTried < 20 end
+	if os.clock() - hbTried < 15 then return false end   -- a failed entry waits a bit before the next try
+	hbTried = os.clock()
+	st.hb = "บอสเปิดแล้ว (" .. tostring(timer) .. ") → เข้าประตู"
+	if hbEnter() then
+		st.hb = "เข้าสนามแล้ว"
+		local t0 = os.clock()
+		while os.clock() - t0 < 8 and not hbBoss() do task.wait(0.2) end
+		boss = hbBoss()
+		if boss then hbFight(boss) end
+		return true
+	end
+	st.hb = "เข้าประตูไม่สำเร็จ (" .. tostring(timer) .. ") → ลองใหม่อีก 15 วิ"
+	return false
+end
+
 local scoutIdx, zoneCursor = {}, 0   -- scoutIdx[zoneId] = next spawn spot to stand on in that zone
 local function farmStep()
+	if e.hboss and not busyHands() and harvestJob() then st.status = "Harvest Boss: " .. tostring(st.hb); return end
 	if not e.farm then
 		st.status = e.drum and "Auto Farm ปิด · ตีกลองอย่างเดียว" or "ปิดอยู่"; st.target = "-"
 		if e.drum and not busyHands() then drumJob() end
@@ -795,6 +953,7 @@ getgenv().__SPAW = Win
 local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
+	Event = TG:Tab({Name = "Event", Image = "rbxassetid://10723346959"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 
@@ -963,6 +1122,14 @@ selLbl = R:Label({Text = "-"})
 R:Header({Text = "จับได้รอบนี้"})
 local catchLbl = R:Label({Text = "-"})
 
+local EV = Tabs.Event:Section({Side = "Left"})
+EV:Header({Text = "🦃 Harvest Boss"})
+EV:Toggle({Name = "Auto Harvest Boss", Default = e.hboss, Callback = function(v) e.hboss = v; sv() end}, "SPAHBoss")
+EV:Label({Text = "ประตู HARVEST BOSS ในแคมป์เปิดเมื่อไหร่ → ทิ้งทุกอย่างเข้าไปตี (ล่าสัตว์ / ตีกลองไว้ก่อน)\nบอสเตือนทุบพื้น / ปาผลไม้ → ยืนนอกวงเตือนเสมอ · ชนะได้ 1,000 Kernels"})
+local EVR = Tabs.Event:Section({Side = "Right"})
+EVR:Header({Text = "สถานะ"})
+local hbLbl = EVR:Label({Text = "-"})
+
 local S = Tabs.Settings:Section({Side = "Left"})
 S:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "SPAToggleUI")
@@ -996,6 +1163,13 @@ task.spawn(function()
 			for k, n in pairs(caughtBy) do lines[#lines + 1] = ("%s × %d"):format(cname(k), n) end
 			table.sort(lines)
 			catchLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้จับ")
+			local _, timer = hbGate()
+			hbLbl:UpdateName(table.concat({
+				tostring(st.hb or (e.hboss and "รอ" or "ปิดอยู่")),
+				"ป้ายประตู: " .. tostring(timer or "-"),
+				("ชนะไปแล้ว %d ครั้ง · Kernels %s"):format(st.hbWins or 0, fmt(plr:GetAttribute("Kernels"))),
+				"ท่าล่าสุดของบอส: " .. tostring(st.hbFx or "-"),
+			}, "\n"))
 		end)
 		task.wait(0.5)
 	end
@@ -1004,7 +1178,7 @@ end)
 -- unload: stop every loop and drop the connections when the window closes or the script reloads
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, inputConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__SPA == G then getgenv().__SPA = G + 1 end end)
