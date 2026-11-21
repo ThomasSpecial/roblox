@@ -36,7 +36,7 @@ local ShroudRE = Remotes:WaitForChild("Shroud")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("PetArmy/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true}
+local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, drum = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -125,11 +125,11 @@ end
 -- ------------------------------------------------------------------ selection
 -- e.zones = {zoneId} picked zones; e.zsel[zoneId] = {rars = {rarity name}, kinds = {kind}} per zone.
 -- Per picked rarity: the picked creatures of that rarity, or all of them when none is picked.
-local KIND_ZONE, KIND_RAR = {}, {}
+local KIND_ZONE, KIND_RAR, KIND_TIER = {}, {}, {}
 for _, z in ipairs(ZONES) do
 	for tier, kinds in pairs(z.tiers) do
 		for _, k in ipairs(kinds) do
-			if not KIND_ZONE[k] then KIND_ZONE[k], KIND_RAR[k] = z.id, rarityOf(z, tier) end
+			if not KIND_ZONE[k] then KIND_ZONE[k], KIND_RAR[k], KIND_TIER[k] = z.id, rarityOf(z, tier), tier end
 		end
 	end
 end
@@ -260,9 +260,19 @@ local function warp(pos, lookAt)
 	r.CFrame = lookAt and CFrame.lookAt(pos, Vector3.new(lookAt.X, pos.Y, lookAt.Z)) or (CFrame.new(pos) * (r.CFrame - r.CFrame.Position))
 	return true
 end
+-- RequestStreamAroundAsync can hang for a long time, so it gets its own thread and at most `wait` seconds
+local function streamAround(pos, wait)
+	local done = false
+	task.spawn(function()
+		pcall(function() plr:RequestStreamAroundAsync(pos, wait) end)
+		done = true
+	end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < wait do task.wait(0.1) end
+end
 -- far warp: ask the server to stream the spot first so the floor exists when the character lands
 local function warpFar(pos)
-	pcall(function() plr:RequestStreamAroundAsync(pos, 4) end)
+	streamAround(pos, 1)
 	if not alive() then return false end
 	return warp(groundAt(pos + Vector3.new(0, 3, 0)))
 end
@@ -329,12 +339,23 @@ local shroudConn = ShroudRE.OnClientEvent:Connect(function(kind, data)
 	if not alive() then return end
 	if kind == "appear" and type(data) == "table" and data.zoneNum then
 		shroudSeen.zone, shroudSeen.at = tonumber(data.zoneNum), os.clock()
+		st.annTick = (st.annTick or 0) + 1
 		st.shroud = ("เกิดที่ %s · %s"):format(tostring(data.zone or ("โซน " .. data.zoneNum)), os.date("%H:%M:%S"))
 	elseif kind == "got" then
 		st.shroudKills += 1
 		st.shroud = "ได้ Mystery Soul · " .. os.date("%H:%M:%S")
 		shroudSeen.zone = nil
 	end
+end)
+-- Remotes.Announce {kind, zoneNum, zone, rarity} = "A <kind> spawned in <zone>!" -- the rare tiers are only hunted
+-- after one of these, so the bot doesn't hop around zones where nothing it wants is alive
+local ALWAYS_TIERS = {Easy = true, Hard = true, Boss = true}   -- these are always out somewhere in their zone
+local spawnSeen = {}   -- kind -> {zone = zoneNum, at = os.clock(), misses = n}
+local announceConn = Remotes:WaitForChild("Announce").OnClientEvent:Connect(function(a)
+	if not alive() or type(a) ~= "table" or not a.kind or not tonumber(a.zoneNum) then return end
+	spawnSeen[a.kind] = {zone = tonumber(a.zoneNum), at = os.clock(), misses = 0}
+	st.annTick = (st.annTick or 0) + 1
+	st.lastAnn = ("%s เกิดที่ %s · %s"):format(cname(a.kind), tostring(a.zone or a.zoneNum), os.date("%H:%M:%S"))
 end)
 local function shroudDead(m)
 	return not m.Parent or m:GetAttribute("Dying") == true or (m:GetAttribute("HP") ~= nil and m:GetAttribute("HP") <= 0)
@@ -387,6 +408,39 @@ local function findTarget(tmap)
 	return best
 end
 
+-- my army = workspace.Followers models with Owner = my UserId; a fainted one has SleepUntil (or Dying) set
+local function myArmy()
+	local total, awake, near = 0, 0, 0
+	local r = hrp()
+	local f = workspace:FindFirstChild("Followers")
+	for _, m in ipairs(f and f:GetChildren() or {}) do
+		if m:GetAttribute("Owner") == plr.UserId then
+			total += 1
+			if m:GetAttribute("SleepUntil") == nil and m:GetAttribute("Dying") ~= true then
+				awake += 1
+				if r and (m:GetPivot().Position - r.Position).Magnitude < 70 then near += 1 end
+			end
+		end
+	end
+	return total, awake, near
+end
+local function armyReady()
+	local total, awake, near = myArmy()
+	return total > 0 and awake >= math.ceil(total * 0.6) and near >= math.max(1, math.ceil(awake * 0.7)), total, awake, near
+end
+-- stand at `spot` until the army is with me and awake (fainted ones wake after ~10 s)
+local function waitArmy(spot, look, maxWait, why)
+	local t0 = os.clock()
+	while alive() and e.farm and os.clock() - t0 < maxWait do
+		local ok, total, awake, near = armyReady()
+		if ok then return true end
+		st.status = ("%s · รอ army: ตื่น %d/%d · มาถึง %d"):format(why, awake, total, near)
+		warp(spot, look)
+		task.wait(0.5)
+	end
+	return armyReady()
+end
+
 local function fight(m)
 	local pp = m.PrimaryPart
 	local name = m:GetAttribute("DisplayName") or m.Name
@@ -394,24 +448,47 @@ local function fight(m)
 	local zid = m:GetAttribute("Zone")
 	local boss = m:GetAttribute("Tier") == "Boss"
 	local limit = boss and 240 or 90
+	local function dead() return shroudDead(m) or (m:GetAttribute("HP") or 1) <= 0 end
+	local function spots()
+		pp = m.PrimaryPart
+		local cf, size = m:GetPivot(), pp and pp.Size or select(2, m:GetBoundingBox())
+		local half = math.min(math.max(size.X, size.Z) / 2, 30)
+		local look = cf.LookVector
+		local near = cf.Position - look * (half + 5)
+		local back = cf.Position - look * (half + 45)
+		return groundAt(Vector3.new(near.X, cf.Position.Y, near.Z)), groundAt(Vector3.new(back.X, cf.Position.Y, back.Z)), cf.Position
+	end
+
+	-- stage out of reach first and let the army catch up (it teleports to me once I'm 120+ studs away)
+	local _, back, at = spots()
+	warp(back, at)
+	if not waitArmy(back, at, 20, "เจอ " .. name) then
+		local _, total, awake = armyReady()
+		if awake == 0 then st.status = name .. ": army สลบหมด / ยังไม่มา → ไว้ทีหลัง"; return end
+	end
+
 	local t0 = os.clock()
 	local lastHP, lastDrop = m:GetAttribute("HP"), os.clock()
-	local function dead() return shroudDead(m) or (m:GetAttribute("HP") or 1) <= 0 end
 	while alive() and e.farm and not dead() do
 		if busyHands() then st.status = "พัก: " .. busyHands(); return end
 		local o = m:GetAttribute("OwnerId")
 		if o and o ~= plr.UserId then st.status = name .. " มีคนอื่นตีอยู่ → หาตัวใหม่"; return end
-		pp = m.PrimaryPart
-		local cf, size = m:GetPivot(), pp and pp.Size or select(2, m:GetBoundingBox())
-		local half = math.min(math.max(size.X, size.Z) / 2, 30)
-		local away = cf.Position - (cf.LookVector * (half + 5))
-		local spot = groundAt(Vector3.new(away.X, cf.Position.Y, away.Z))
-		warp(spot, cf.Position)
-		pcall(Punch.FireServer, Punch, m)
-		local hp = m:GetAttribute("HP") or 0
-		if lastHP and hp < lastHP then lastHP, lastDrop = hp, os.clock() end
-		st.target = ("%s (%s) · HP %s / %s"):format(name, ZONE_BY_ID[zid] and ZONE_BY_ID[zid].name or tostring(zid), fmt(hp), fmt(m:GetAttribute("MaxHP")))
-		st.status = "กำลังตี " .. name
+		local near, back2, at2 = spots()
+		-- army fainting or me low on health: step back and wait for them to wake before hitting again
+		local h = hum()
+		local _, total, awake = armyReady()
+		if (h and h.Health < h.MaxHealth * 0.4) or awake < math.ceil(total * 0.4) then
+			warp(back2, at2)
+			waitArmy(back2, at2, 25, ("ถอยก่อน (%s)"):format(h and h.Health < h.MaxHealth * 0.4 and "เลือดต่ำ" or "army สลบ"))
+			lastDrop = os.clock()
+		else
+			warp(near, at2)
+			pcall(Punch.FireServer, Punch, m)
+			local hp = m:GetAttribute("HP") or 0
+			if lastHP and hp < lastHP then lastHP, lastDrop = hp, os.clock() end
+			st.target = ("%s (%s) · HP %s / %s"):format(name, ZONE_BY_ID[zid] and ZONE_BY_ID[zid].name or tostring(zid), fmt(hp), fmt(m:GetAttribute("MaxHP")))
+			st.status = ("กำลังตี %s · army ตื่น %d/%d"):format(name, awake, total)
+		end
 		if os.clock() - t0 > limit then st.status = name .. " ตีนานเกิน " .. limit .. " วิ → ข้าม"; return end
 		if os.clock() - lastDrop > 25 then st.status = name .. " เลือดไม่ลด 25 วิ → ข้าม"; return end
 		task.wait(0.95)
@@ -449,7 +526,7 @@ local function penJob()
 	local souls = plr:GetAttribute("MysterySouls") or 0
 	if souls <= 0 then
 		-- orbs outside the camp aren't streamed: peek at the camp every few minutes so finished hatches get opened
-		pcall(function() plr:RequestStreamAroundAsync(CAMP, 3) end)
+		streamAround(CAMP, 3)
 		if #myReadyOrbs() == 0 then nextPenCheck = os.clock() + 180; return false end
 	end
 	st.status = ("กลับแคมป์: วาง Mystery Soul %d · เปิดที่ฟักเสร็จ %d"):format(souls, #myReadyOrbs())
@@ -488,9 +565,40 @@ local function penJob()
 	return true
 end
 
+-- Auto Drum: stand at my plot's WarDrum (Camp.Plots.Plot<n>.WarDrum, within ~7 studs of its Skin while Home) to
+-- train Command. Only while there is nothing picked to hunt; leaving the drum is just warping away.
+local lastDrumWarp = 0
+local function drumJob()
+	if plr:GetAttribute("Drumming") then st.drum = "กำลังตีกลอง"; return end
+	if os.clock() - lastDrumWarp < 4 then return end
+	lastDrumWarp = os.clock()
+	local plots = workspace:FindFirstChild("Camp") and workspace.Camp:FindFirstChild("Plots")
+	local plot = plots and plots:FindFirstChild("Plot" .. tostring(plr:GetAttribute("Plot")))
+	local drum = plot and plot:FindFirstChild("WarDrum")
+	if not drum then
+		warpFar(CAMP)
+		task.wait(0.5)
+		plot = plots and plots:FindFirstChild("Plot" .. tostring(plr:GetAttribute("Plot")))
+		drum = plot and plot:FindFirstChild("WarDrum")
+		if not drum then st.drum = "หากลองไม่เจอ"; return end
+	end
+	local skin = drum:FindFirstChild("Skin") or drum.PrimaryPart
+	local at = skin and skin.Position or drum:GetPivot().Position
+	warp(groundAt(at + Vector3.new(4, 0, 0)), at)
+	st.drum = "วาร์ปไปตีกลอง"
+end
+local function waitAnnounce(sec)   -- idle until `sec` passes or the game announces a spawn
+	local a0, t0 = st.annTick, os.clock()
+	while alive() and os.clock() - t0 < sec and st.annTick == a0 do task.wait(0.05) end
+end
+
 local scoutIdx, zoneCursor = {}, 0   -- scoutIdx[zoneId] = next spawn spot to stand on in that zone
 local function farmStep()
-	if not e.farm then st.status = "ปิดอยู่"; st.target = "-"; return end
+	if not e.farm then
+		st.status = e.drum and "Auto Farm ปิด · ตีกลองอย่างเดียว" or "ปิดอยู่"; st.target = "-"
+		if e.drum and not busyHands() then drumJob() end
+		return
+	end
 	local why = busyHands()
 	if why then st.status = "พัก: " .. why; return end
 	local tmap = targetMap()
@@ -503,45 +611,124 @@ local function farmStep()
 	if sh then return fight(sh) end
 	if penJob() then return end
 
-	-- a Shrouded was announced: scout its zone first for 3 minutes (it may sit in a zone with no picked creatures)
-	local shZone = e.shroud and shroudSeen.zone and os.clock() - shroudSeen.at < 180 and ZONES[shroudSeen.zone]
-	if shZone and not unlocked(shZone) then shZone = nil end
-	if shZone then
-		for i, x in ipairs(zoneList) do if x == shZone then table.remove(zoneList, i) break end end
-		table.insert(zoneList, 1, shZone)
-	end
-	if #zoneList == 0 then st.status = e.shroud and "รอ Shrouded เกิด (ยังไม่ได้เลือกตัวอื่น)" or "ยังไม่ได้เลือกตัวที่จะจับ"; st.target = "-"; return end
-
 	local m = findTarget(tmap)
-	if m then return fight(m) end
+	if m then
+		if spawnSeen[m:GetAttribute("Kind")] then spawnSeen[m:GetAttribute("Kind")] = nil end
+		return fight(m)
+	end
 
-	-- nothing streamed in: go to the next targeted zone's spawn spots (one zone at a time, ~6 s per spot)
-	if shZone or zoneCursor < 1 or zoneCursor > #zoneList then zoneCursor = 1 end
-	local z = zoneList[zoneCursor]
-	if not unlocked(z) then
-		st.status = z.name .. " ยังไม่ปลดล็อก → ข้าม"
+	-- where to look: an announced Shrouded, then announced picks, then picked zones whose picks are always out
+	local goZone, why
+	local shZone = e.shroud and shroudSeen.zone and os.clock() - shroudSeen.at < 180 and ZONES[shroudSeen.zone]
+	if shZone and unlocked(shZone) then goZone, why = shZone, "Shrouded" end
+	if not goZone then
+		for kind, info in pairs(spawnSeen) do
+			local z = ZONES[info.zone]
+			if os.clock() - info.at > 600 or info.misses >= 3 then
+				spawnSeen[kind] = nil
+			elseif z and tmap[kind] == z.id and unlocked(z) then
+				goZone, why = z, kind
+				break
+			end
+		end
+	end
+	if not goZone then
+		local common = {}
+		for _, z in ipairs(zoneList) do
+			if unlocked(z) then
+				for kind, zid in pairs(tmap) do
+					if zid == z.id and ALWAYS_TIERS[KIND_TIER[kind]] then common[#common + 1] = z; break end
+				end
+			end
+		end
+		if #common == 0 then
+			st.waiting = #zoneList > 0
+			if #zoneList == 0 then
+				st.status = e.shroud and "รอ Shrouded เกิด (ยังไม่ได้เลือกตัวอื่น)" or "ยังไม่ได้เลือกตัวที่จะจับ"
+			else
+				st.status = "รอตัวที่เลือกเกิด: เกมประกาศ → วาร์ปทันที · ส่องโซนจากที่เดิม (ไม่ย้ายตัว): " .. tostring(st.peek or "-")
+			end
+			st.target = "ล่าสุดที่เกมประกาศ: " .. tostring(st.lastAnn or "-")
+			if e.drum then drumJob(); st.status ..= " · ระหว่างรอ: " .. tostring(st.drum) end
+			waitAnnounce(1)
+			return
+		end
+		if zoneCursor < 1 or zoneCursor > #common then zoneCursor = 1 end
+		goZone, why = common[zoneCursor], nil
 		zoneCursor += 1
-		return
 	end
-	local spots = anchorsOf(z.id)
-	if #spots == 0 then
-		local mid = (z.zmin + z.zmax) / 2
-		spots = {Vector3.new(0, 20, mid)}
+
+	st.waiting = false
+	local spots = anchorsOf(goZone.id)
+	if #spots == 0 then spots = {Vector3.new(0, 20, (goZone.zmin + goZone.zmax) / 2)} end
+	-- one spot already streams the whole zone (radius 1024)
+	scoutIdx[goZone.id] = (scoutIdx[goZone.id] or 0) % #spots + 1
+	local si = scoutIdx[goZone.id]
+	if why == "Shrouded" then
+		st.status = ("Shrouded เกิดที่ %s → วาร์ปไปหา"):format(goZone.name)
+	elseif why then
+		st.status = ("%s เกิดที่ %s → วาร์ปไปหา"):format(cname(why), goZone.name)
+	else
+		st.status = ("หาเป้าใน %s (จุด %d/%d)"):format(goZone.name, si, #spots)
 	end
-	-- one spot already streams the whole zone (radius 1024): visit one spot, then move on to the next picked zone
-	scoutIdx[z.id] = (scoutIdx[z.id] or 0) % #spots + 1
-	local si = scoutIdx[z.id]
-	st.status = ("หาเป้าใน %s (จุด %d/%d · โซน %d/%d)"):format(z.name, si, #spots, zoneCursor, #zoneList)
-	st.target = "ยังไม่เจอ (ตัวหายาก Chase/Divine เกิดนาน ๆ ครั้ง)"
+	st.target = "ยังไม่เจอ"
 	warpFar(spots[si])
 	local t0 = os.clock()
 	while alive() and e.farm and os.clock() - t0 < 3.5 do
 		task.wait(0.5)
 		if findTarget(tmap) or findShroud() then return end
 	end
-	if not shZone then zoneCursor += 1 end
+	-- announced one not found from here: try the other spots a couple of times, then forget it (caught by someone else)
+	if why and why ~= "Shrouded" and spawnSeen[why] then spawnSeen[why].misses += 1 end
 end
 loopEvery("Auto Farm", 0.1, 300, farmStep)
+
+-- not every rare spawn is announced: while waiting, ask the server to stream one spawn spot of a picked zone at a
+-- time (the character stays put). A picked creature that streams in is seen by findTarget and the farm warps to it.
+local peekZone, peekSpot = 0, {}
+loopEvery("Peek", 0.5, 30, function()
+	if not (e.farm and st.waiting) then return end
+	local tmap = targetMap()
+	local zl = {}
+	for _, z in ipairs(ZONES) do
+		if unlocked(z) then
+			for _, zid in pairs(tmap) do if zid == z.id then zl[#zl + 1] = z; break end end
+		end
+	end
+	if #zl == 0 then return end
+	peekZone = peekZone % #zl + 1
+	local z = zl[peekZone]
+	local spots = anchorsOf(z.id)
+	if #spots == 0 then return end
+	peekSpot[z.id] = (peekSpot[z.id] or 0) % #spots + 1
+	st.peek = ("%s จุด %d/%d"):format(z.name, peekSpot[z.id], #spots)
+	streamAround(spots[peekSpot[z.id]], 4)
+end)
+
+-- leg-lock guard: BossIntroClient / EntranceClient set WalkSpeed, JumpPower, JumpHeight = 0 for a cutscene and restore
+-- them afterwards; warping out mid-cutscene can leave them at 0 (2026-11-21: "เดินไม่ได้โดนล็อกขา")
+task.spawn(function()
+	local zeroSince = nil
+	local SP = game:GetService("StarterPlayer")
+	while alive() do
+		local h = hum()
+		if h and h.Health > 0 and h.WalkSpeed == 0 then
+			zeroSince = zeroSince or os.clock()
+			if os.clock() - zeroSince > 10 then
+				pcall(function()
+					h.WalkSpeed = plr:GetAttribute("BaseWalkSpeed") or SP.CharacterWalkSpeed
+					h.JumpPower = SP.CharacterJumpPower
+					h.JumpHeight = SP.CharacterJumpHeight
+				end)
+				st.wd = "ปลดล็อกขาให้ (cutscene ค้าง) · " .. os.date("%H:%M:%S")
+				zeroSince = nil
+			end
+		else
+			zeroSince = nil
+		end
+		task.wait(1)
+	end
+end)
 
 -- army / storage count for the status panel
 task.spawn(function()
@@ -743,6 +930,9 @@ L:Dropdown({Name = "ขนาดขั้นต่ำ", Multi = false, Required 
 		local i = table.find(sizeOpts, label)
 		if i then e.minSize = i; sv() end
 	end}, "SPASize")
+L:Header({Text = "Auto Drum"})
+L:Toggle({Name = "Auto Drum (ไม่มีตัวให้ล่า → ไปตีกลองเก็บ Command)", Default = e.drum, Callback = function(v) e.drum = v; sv() end}, "SPADrum")
+L:Label({Text = "มีตัวที่เลือกเกิด / Shrouded เกิด → ทิ้งกลองไปล่าก่อน แล้วกลับมาตีต่อ"})
 L:Header({Text = "Shrouded ???"})
 L:Toggle({Name = "ล่า Shrouded (เกิดสุ่มทุกโซน)", Default = e.shroud, Callback = function(v) e.shroud = v; sv() end}, "SPAShroud")
 L:Toggle({Name = "└ เอา Mystery Soul ไปวางฟักที่คอก + เปิดเมื่อฟักเสร็จ", Default = e.shroudPen, Callback = function(v) e.shroudPen = v; sv() end}, "SPAShroudPen")
@@ -794,6 +984,7 @@ task.spawn(function()
 					plr:GetAttribute("MysterySouls") or 0, st.placed, st.opened),
 				("ฆ่า %d · จับได้ %d · ล่าสุด: %s"):format(st.kills, st.caught, st.lastCatch),
 				st.army,
+				"เกมประกาศล่าสุด: " .. tostring(st.lastAnn or "-"),
 				"แจ้งเตือนเกม: " .. tostring(st.lastNote or "-"),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
@@ -810,7 +1001,7 @@ end)
 -- unload: stop every loop and drop the connections when the window closes or the script reloads
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, inputConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, inputConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__SPA == G then getgenv().__SPA = G + 1 end end)
