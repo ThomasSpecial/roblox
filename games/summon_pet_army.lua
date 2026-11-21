@@ -695,8 +695,13 @@ local function hbOpen()
 		body, timer = hbGate()
 	end
 	if not body then return false, "ยังไม่เห็นประตู (อยู่ไกลแคมป์)" end
-	if timer and timer:upper():find("NEXT", 1, true) then return false, timer end
-	return true, timer or "?"
+	-- seen 2026-11-21: "NEXT IN mm:ss" (about every 30 min) -> "FIGHTING NOW!" for the ~2 min fight. Walking in while it
+	-- still says NEXT IN gets you bounced back out, and a label that hasn't loaded yet reads "" -- only FIGHT means open.
+	local up = tostring(timer or ""):upper()
+	if up:find("FIGHT", 1, true) then return true, timer end
+	local m, sec = up:match("NEXT IN (%d+):(%d+)")
+	if m and tonumber(m) * 60 + tonumber(sec) <= 2 then return true, timer end
+	return false, (timer and timer ~= "") and timer or "อ่านป้ายไม่ได้"
 end
 -- walk through the portal plane: start on one side, step across in small hops so the server sees the crossing
 local function hbEnter()
