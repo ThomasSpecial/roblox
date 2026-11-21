@@ -327,6 +327,7 @@ local notifyConn = NotifyRE.OnClientEvent:Connect(function(msg)
 	if not alive() or type(msg) ~= "string" then return end
 	if msg:find("escap") or msg:find("Missed") or msg:find("broke free") then st.missed += 1 end
 	st.lastNote = msg:sub(1, 80)
+	if msg:find("Dawn", 1, true) then st.dawnAt = os.clock() end   -- new creatures (and Shrouded) roll at dawn
 end)
 
 -- ------------------------------------------------------------------ shrouded
@@ -642,7 +643,7 @@ local function farmStep()
 			end
 		end
 		if #common == 0 then
-			st.waiting = #zoneList > 0
+			st.waiting = #zoneList > 0 or e.shroud
 			if #zoneList == 0 then
 				st.status = e.shroud and "รอ Shrouded เกิด (ยังไม่ได้เลือกตัวอื่น)" or "ยังไม่ได้เลือกตัวที่จะจับ"
 			else
@@ -690,9 +691,14 @@ loopEvery("Peek", 0.5, 30, function()
 	if not (e.farm and st.waiting) then return end
 	local tmap = targetMap()
 	local zl = {}
+	-- a Shrouded isn't always announced either: with the Shrouded toggle on, every unlocked zone gets peeked;
+	-- for 90 s after dawn (when it rolls) the picked zones step aside so the sweep goes round faster
+	local dawn = e.shroud and st.dawnAt and os.clock() - st.dawnAt < 90
 	for _, z in ipairs(ZONES) do
-		if unlocked(z) then
-			for _, zid in pairs(tmap) do if zid == z.id then zl[#zl + 1] = z; break end end
+		if unlocked(z) and not (z.secret and not unlocked(z)) then
+			local picked = false
+			for _, zid in pairs(tmap) do if zid == z.id then picked = true; break end end
+			if (picked and not dawn) or e.shroud then zl[#zl + 1] = z end
 		end
 	end
 	if #zl == 0 then return end
@@ -701,8 +707,8 @@ loopEvery("Peek", 0.5, 30, function()
 	local spots = anchorsOf(z.id)
 	if #spots == 0 then return end
 	peekSpot[z.id] = (peekSpot[z.id] or 0) % #spots + 1
-	st.peek = ("%s จุด %d/%d"):format(z.name, peekSpot[z.id], #spots)
-	streamAround(spots[peekSpot[z.id]], 4)
+	st.peek = ("%s จุด %d/%d%s"):format(z.name, peekSpot[z.id], #spots, dawn and " (เช้าแล้ว: กวาดหา Shrouded)" or "")
+	streamAround(spots[peekSpot[z.id]], dawn and 2 or 4)
 end)
 
 -- leg-lock guard: BossIntroClient / EntranceClient set WalkSpeed, JumpPower, JumpHeight = 0 for a cutscene and restore
