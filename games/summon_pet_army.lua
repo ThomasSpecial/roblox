@@ -99,6 +99,7 @@ local ANCHORS = {
 	Zone9 = {Vector3.new(-405, 265, -10570), Vector3.new(-565, 305, -11525), Vector3.new(-285, 265, -10910)},
 	-- zone 10 is ~3,400 studs long (easy band z -12.6k..-13k, hard band -13.4k..-13.7k, boss -14,080)
 	Zone10 = {Vector3.new(-275, 302, -12985), Vector3.new(-365, 342, -13365), Vector3.new(-345, 342, -14000)},
+	Zone11 = {Vector3.new(-885, 302, -16263), Vector3.new(-1221, 302, -16862), Vector3.new(-1067, 322, -18096)},
 }
 e.spawns = type(e.spawns) == "table" and e.spawns or {}
 local function anchorsOf(zid)
@@ -1245,8 +1246,8 @@ L:Label({Text = "วาร์ปไปหาตัวที่เลือก �
 
 local zoneOpts, zoneByLabel, zoneLabel = {}, {}, {}
 for _, z in ipairs(ZONES) do
-	if not z.secret or unlocked(z) then
-		local label = ("%d · %s%s"):format(z.index, z.name, unlocked(z) and "" or " (ยังล็อก)")
+	do   -- secret zones (11 the Void, 12 the Great Beyond) listed too; the farm skips any zone not yet found/unlocked
+		local label = ("%d · %s%s"):format(z.index, z.name, unlocked(z) and "" or (z.secret and " (ลับ ยังไม่เจอ)" or " (ยังล็อก)"))
 		zoneOpts[#zoneOpts + 1] = label
 		zoneByLabel[label] = z
 		zoneLabel[z.id] = label
