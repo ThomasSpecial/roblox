@@ -91,7 +91,9 @@ local ANCHORS = {
 	Zone5 = {Vector3.new(3, -38, -3648), Vector3.new(107, -38, -3520)},
 	Zone6 = {Vector3.new(64, 2, -5330), Vector3.new(112, 46, -5626), Vector3.new(0, 46, -5873)},
 	Zone7 = {Vector3.new(-264, 14, -7238), Vector3.new(-260, 2, -6880), Vector3.new(-345, 14, -7583)},
-	Zone8 = {Vector3.new(-345, 122, -8625), Vector3.new(-15, 122, -8650)},
+	-- zone 8 is ~2,450 studs long (easy band z -8.6k at y 122, hard band z -9.2k..-9.4k at y 177, boss -9722): the hard-band
+	-- spots stream the far half too
+	Zone8 = {Vector3.new(-345, 177, -9180), Vector3.new(-245, 122, -8880), Vector3.new(-245, 177, -9430)},
 }
 e.spawns = type(e.spawns) == "table" and e.spawns or {}
 local function anchorsOf(zid)
@@ -350,7 +352,10 @@ local shroudConn = ShroudRE.OnClientEvent:Connect(function(kind, data)
 end)
 -- Remotes.Announce {kind, zoneNum, zone, rarity} = "A <kind> spawned in <zone>!" -- the rare tiers are only hunted
 -- after one of these, so the bot doesn't hop around zones where nothing it wants is alive
-local ALWAYS_TIERS = {Easy = true, Hard = true, Boss = true}   -- these are always out somewhere in their zone
+-- tiers that are never announced but are (nearly) always out: Easy / Hard / Boss, and Rare (one per zone, back 60 s
+-- after a kill -- e.g. zone 8 "Secret" Tempest Griffin). These get scouted in person; Chase / Divine wait for the announcement.
+local ALWAYS_TIERS = {Easy = true, Hard = true, Boss = true, Rare = true}
+local scoutMiss = {}   -- zoneId -> os.clock() of the last visit that found nothing (skip it for 40 s)
 local spawnSeen = {}   -- kind -> {zone = zoneNum, at = os.clock(), misses = n}
 local announceConn = Remotes:WaitForChild("Announce").OnClientEvent:Connect(function(a)
 	if not alive() or type(a) ~= "table" or not a.kind or not tonumber(a.zoneNum) then return end
@@ -829,7 +834,7 @@ local function farmStep()
 		for _, z in ipairs(zoneList) do
 			if unlocked(z) then
 				for kind, zid in pairs(tmap) do
-					if zid == z.id and ALWAYS_TIERS[KIND_TIER[kind]] then common[#common + 1] = z; break end
+					if zid == z.id and ALWAYS_TIERS[KIND_TIER[kind]] and os.clock() - (scoutMiss[z.id] or -99) > 40 then common[#common + 1] = z; break end
 				end
 			end
 		end
@@ -870,6 +875,7 @@ local function farmStep()
 		task.wait(0.5)
 		if findTarget(tmap) or findShroud() then return end
 	end
+	if not why then scoutMiss[goZone.id] = os.clock() end
 	-- announced one not found from here: try the other spots a couple of times, then forget it (caught by someone else)
 	if why and why ~= "Shrouded" and spawnSeen[why] then spawnSeen[why].misses += 1 end
 end
