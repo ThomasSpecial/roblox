@@ -800,6 +800,14 @@ local function arenaFloorY()
 	local cf = a and a:GetAttribute("ArrivalCF")
 	return typeof(cf) == "CFrame" and cf.Position.Y or 0
 end
+-- HarvestVictory (kernels, pos, total, delay) is sent to everyone who took part, also when the army lands the kill
+local hbWonAt = -1e9
+local hbWinConn = Remotes:WaitForChild("HarvestVictory").OnClientEvent:Connect(function()
+	if not alive() then return end
+	if os.clock() - hbWonAt > 60 then st.hbWins = (st.hbWins or 0) + 1 end
+	hbWonAt = os.clock()
+	st.hb = "ชนะ Harvest Boss · " .. os.date("%H:%M:%S")
+end)
 local function hbFight(m)
 	local name = "Harvest Boss"
 	local t0 = os.clock()
@@ -831,7 +839,8 @@ local function hbFight(m)
 		task.wait(0.3)
 	end
 	if not m.Parent or m:GetAttribute("Dying") or (m:GetAttribute("HP") or 1) <= 0 then
-		st.hbWins = (st.hbWins or 0) + 1
+		if os.clock() - hbWonAt > 60 then st.hbWins = (st.hbWins or 0) + 1 end
+		hbWonAt = os.clock()
 		st.hb = "ชนะ Harvest Boss · " .. os.date("%H:%M:%S")
 	end
 end
@@ -839,6 +848,13 @@ end
 local hbTried = 0
 local function harvestJob()
 	if not e.hboss then st.hb = "ปิดอยู่"; return false end
+	-- after a win the gate keeps saying FIGHTING NOW until the round's 180 s run out, so without this the bot walked
+	-- back into the empty arena over and over and never returned to farming / drumming (user, 2026-11-22)
+	if os.clock() - hbWonAt < 600 then
+		if inArena() then warpFar(CAMP) end
+		st.hb = "ชนะรอบนี้แล้ว (" .. os.date("%H:%M", os.time() - math.floor(os.clock() - hbWonAt)) .. ") · รอรอบหน้า"
+		return false
+	end
 	local here = inArena()
 	local boss = hbBoss()
 	if here and boss then hbFight(boss); return true end
@@ -1449,7 +1465,7 @@ end)
 -- unload: stop every loop and drop the connections when the window closes or the script reloads
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn, jumpConn, noclipConn, sightConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({soulConn, ariseConn, notifyConn, shroudConn, announceConn, hbFxConn, inputConn, idleConn, errConn, jumpConn, noclipConn, sightConn, hbWinConn}) do pcall(function() c:Disconnect() end) end
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__SPA == G then getgenv().__SPA = G + 1 end end)
