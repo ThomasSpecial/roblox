@@ -94,6 +94,7 @@ local PLACE_SCRIPTS = {
     [88452215181406]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/pet_hunt_party.lua",   -- [🎉RELEASE] Pet Hunt Party 🐾 RPG
     [79496881832552]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/run_a_farm.lua",       -- [UPD] Run A Farm!
     [89695026030574]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/summon_pet_army.lua",  -- Summon a Pet Army
+    [74183246285569]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/steal_a_superpower.lua", -- [⚡] Steal a Superpower!
     -- Battle Royale universe: the match server and the Killstreak mode share one script
     [108448382032231] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Battle Royale (chest + player ESP)
     [104856666707760] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Killstreak Battle Royale
