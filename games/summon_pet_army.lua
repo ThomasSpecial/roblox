@@ -770,9 +770,15 @@ local function hbEnter()
 	end
 	return inArena()
 end
+local function arenaFloorY()
+	local a = workspace:FindFirstChild("Camp") and workspace.Camp:FindFirstChild("HarvestArena")
+	local cf = a and a:GetAttribute("ArrivalCF")
+	return typeof(cf) == "CFrame" and cf.Position.Y or 0
+end
 local function hbFight(m)
 	local name = "Harvest Boss"
 	local t0 = os.clock()
+	local floorY = arenaFloorY() + 3
 	while alive() and e.hboss and m.Parent and not m:GetAttribute("Dying") and (m:GetAttribute("HP") or 1) > 0 and os.clock() - t0 < 200 do
 		local cf = m:GetPivot()
 		local pp = m.PrimaryPart
@@ -789,9 +795,11 @@ local function hbFight(m)
 			end
 			if spot then break end
 		end
-		spot = groundAt(spot or (cf.Position + Vector3.new(0, 0, r0 + 80)))
+		spot = spot or (cf.Position + Vector3.new(0, 0, r0 + 80))
+		spot = Vector3.new(spot.X, floorY, spot.Z)
 		local r = hrp()
-		if r and (inDanger(r.Position) or (r.Position - spot).Magnitude > 6) then warp(spot, cf.Position) end
+		local off = r and Vector3.new(r.Position.X - spot.X, 0, r.Position.Z - spot.Z).Magnitude
+		if r and (inDanger(r.Position) or off > 6 or math.abs(r.Position.Y - floorY) > 8) then warp(spot, cf.Position) end
 		if r and (r.Position - cf.Position).Magnitude <= reach + 4 then pcall(Punch.FireServer, Punch, m) end
 		local _, total, awake = armyReady()
 		st.hb = ("กำลังตี %s · HP %s / %s · army ตื่น %d/%d · หลบ %d วง"):format(name, fmt(m:GetAttribute("HP")), fmt(m:GetAttribute("MaxHP")), awake, total, #danger)
