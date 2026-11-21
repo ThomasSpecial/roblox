@@ -123,7 +123,8 @@ local function learnSpawns()
 end
 
 -- ------------------------------------------------------------------ selection
--- all multi-select: e.zones = {zoneId}, e.rars = {rarity name}, e.kinds = {kind}; the targets are e.kinds
+-- e.zones = {zoneId} picked zones; e.zsel[zoneId] = {rars = {rarity name}, kinds = {kind}} per zone.
+-- Per picked rarity: the picked creatures of that rarity, or all of them when none is picked.
 local KIND_ZONE, KIND_RAR = {}, {}
 for _, z in ipairs(ZONES) do
 	for tier, kinds in pairs(z.tiers) do
@@ -133,24 +134,72 @@ for _, z in ipairs(ZONES) do
 	end
 end
 local function list(v) return type(v) == "table" and v or {} end
-e.zones, e.rars, e.kinds = list(e.zones), list(e.rars), list(e.kinds)
-if type(e.sel) == "table" and next(e.sel) then   -- settings from the one-zone-at-a-time version
-	for zid, s in pairs(e.sel) do
-		if type(s) == "table" and ZONE_BY_ID[zid] then
-			for _, k in ipairs(list(s.kinds)) do
-				if not table.find(e.kinds, k) then e.kinds[#e.kinds + 1] = k end
-				if not table.find(e.zones, zid) then e.zones[#e.zones + 1] = zid end
-				if KIND_RAR[k] and not table.find(e.rars, KIND_RAR[k]) then e.rars[#e.rars + 1] = KIND_RAR[k] end
+e.zones = list(e.zones)
+e.zsel = type(e.zsel) == "table" and e.zsel or {}
+local function zsel(zid)
+	local s = type(e.zsel[zid]) == "table" and e.zsel[zid] or {}
+	s.rars, s.kinds = list(s.rars), list(s.kinds)
+	e.zsel[zid] = s
+	return s
+end
+do   -- settings from the earlier layouts (one shared rarity / kind list, or e.sel per zone by tier)
+	local migrated = false
+	for _, zid in ipairs(e.zones) do   -- the old shared rarity list -> every picked zone that has those rarities
+		local z = ZONE_BY_ID[zid]
+		for _, r in ipairs(list(e.rars)) do
+			for tier in pairs(z and z.tiers or {}) do
+				local s = zsel(zid)
+				if rarityOf(z, tier) == r and not table.find(s.rars, r) then s.rars[#s.rars + 1] = r end
 			end
 		end
 	end
-	e.sel = nil
-	sv()
+	for _, k in ipairs(list(e.kinds)) do
+		local zid = KIND_ZONE[k]
+		if zid then
+			local s = zsel(zid)
+			if not table.find(s.kinds, k) then s.kinds[#s.kinds + 1] = k end
+			if not table.find(s.rars, KIND_RAR[k]) then s.rars[#s.rars + 1] = KIND_RAR[k] end
+			if not table.find(e.zones, zid) then e.zones[#e.zones + 1] = zid end
+			migrated = true
+		end
+	end
+	if type(e.sel) == "table" then
+		for zid, old in pairs(e.sel) do
+			if type(old) == "table" and ZONE_BY_ID[zid] then
+				for _, k in ipairs(list(old.kinds)) do
+					local s = zsel(zid)
+					if not table.find(s.kinds, k) then s.kinds[#s.kinds + 1] = k end
+					if KIND_RAR[k] and not table.find(s.rars, KIND_RAR[k]) then s.rars[#s.rars + 1] = KIND_RAR[k] end
+					if not table.find(e.zones, zid) then e.zones[#e.zones + 1] = zid end
+					migrated = true
+				end
+			end
+		end
+	end
+	if e.kinds or e.rars or e.sel then e.kinds, e.rars, e.sel, e.viewZone = nil, nil, nil, nil; migrated = true end
+	if migrated then sv() end
+end
+local function zoneTargets(z)   -- list of kinds this zone hunts right now
+	local s = zsel(z.id)
+	local out = {}
+	for _, tier in ipairs(TIERS) do
+		local rar = z.tiers[tier] and rarityOf(z, tier)
+		if rar and table.find(s.rars, rar) then
+			local any = false
+			for _, k in ipairs(z.tiers[tier]) do if table.find(s.kinds, k) then out[#out + 1] = k; any = true end end
+			if not any then   -- no creature picked inside this rarity = the whole rarity
+				for _, k in ipairs(z.tiers[tier]) do out[#out + 1] = k end
+			end
+		end
+	end
+	return out
 end
 local function targetMap()   -- kind -> zoneId
 	local m = {}
-	for _, k in ipairs(e.kinds) do
-		if KIND_ZONE[k] then m[k] = KIND_ZONE[k] end
+	for _, z in ipairs(ZONES) do
+		if table.find(e.zones, z.id) then
+			for _, k in ipairs(zoneTargets(z)) do m[k] = z.id end
+		end
 	end
 	return m
 end
@@ -565,7 +614,7 @@ end
 local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "Auto Farm"})
 L:Toggle({Name = "Auto Farm", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "SPAFarm")
-L:Label({Text = "วาร์ปไปหาตัวที่เลือก → ตี (army ช่วยตี) → ตายแล้วกด summon จับให้\nเลือกโซน (หลายโซนได้) → rarity ที่มีในโซนเหล่านั้น → ตัวที่จะจับ · ที่เลือกเซฟอัตโนมัติ"})
+L:Label({Text = "วาร์ปไปหาตัวที่เลือก → ตี (army ช่วยตี) → ตายแล้วกด summon จับให้\nที่เลือกเซฟอัตโนมัติ · ไปทีละโซนที่มีเป้า"})
 
 local zoneOpts, zoneByLabel, zoneLabel = {}, {}, {}
 for _, z in ipairs(ZONES) do
@@ -576,116 +625,112 @@ for _, z in ipairs(ZONES) do
 		zoneLabel[z.id] = label
 	end
 end
-local RAR_ORDER = table.clone(Config.RarityOrder)
-RAR_ORDER[#RAR_ORDER + 1] = "Boss"
 
-local rebuilding = false
-local rarDD, kindDD, selLbl
-local kindByLabel = {}
+local selLbl
+local zoneUI = {}   -- zoneId -> {rar = dropdown, kind = dropdown, byLabel = {label -> kind}, rebuilding = bool}
 
 local function refreshSelLabel()
 	if not selLbl then return end
-	local byZone = {}
-	for _, k in ipairs(e.kinds) do
-		local zid = KIND_ZONE[k]
-		if zid then byZone[zid] = byZone[zid] or {}; table.insert(byZone[zid], cname(k)) end
-	end
 	local lines = {}
 	for _, z in ipairs(ZONES) do
-		if byZone[z.id] then lines[#lines + 1] = ("%d %s: %s"):format(z.index, z.name, table.concat(byZone[z.id], ", ")) end
-	end
-	selLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้เลือกตัวไหน")
-end
-
--- creatures of every picked zone whose rarity is picked; picks that fall out of the list are dropped
-local function rebuildKinds()
-	local opts, keep, def = {}, {}, {}
-	kindByLabel = {}
-	for _, z in ipairs(ZONES) do
 		if table.find(e.zones, z.id) then
-			for _, tier in ipairs(TIERS) do
-				local rar = z.tiers[tier] and rarityOf(z, tier)
-				if rar and table.find(e.rars, rar) then
-					for _, k in ipairs(z.tiers[tier]) do
-						local label = ("%s · %s · โซน %d"):format(cname(k), rar, z.index)
-						opts[#opts + 1] = label
-						kindByLabel[label] = k
-						if table.find(e.kinds, k) then keep[#keep + 1] = k; def[#def + 1] = label end
-					end
-				end
+			local s = zsel(z.id)
+			if #s.rars == 0 then
+				lines[#lines + 1] = ("%d %s: ยังไม่ได้เลือก rarity"):format(z.index, z.name)
+			else
+				local names = {}
+				for _, k in ipairs(zoneTargets(z)) do names[#names + 1] = cname(k) end
+				lines[#lines + 1] = ("%d %s: %s"):format(z.index, z.name, table.concat(names, ", "))
 			end
 		end
 	end
-	e.kinds = keep
-	rebuilding = true
-	pcall(function() kindDD:ClearOptions() end)
-	if #opts > 0 then pcall(function() kindDD:InsertOptions(opts) end) end
-	pcall(function() kindDD:UpdateSelection(def) end)
-	rebuilding = false
+	selLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้เลือกโซน")
+end
+
+-- one zone's creature list = creatures of its picked rarities; picks outside them are dropped
+local function rebuildKinds(z)
+	local ui = zoneUI[z.id]
+	if not ui then return end
+	local s = zsel(z.id)
+	local opts, keep, def = {}, {}, {}
+	ui.byLabel = {}
+	for _, tier in ipairs(TIERS) do
+		local rar = z.tiers[tier] and rarityOf(z, tier)
+		if rar and table.find(s.rars, rar) then
+			for _, k in ipairs(z.tiers[tier]) do
+				local label = ("%s · %s"):format(cname(k), rar)
+				opts[#opts + 1] = label
+				ui.byLabel[label] = k
+				if table.find(s.kinds, k) then keep[#keep + 1] = k; def[#def + 1] = label end
+			end
+		end
+	end
+	s.kinds = keep
+	ui.rebuilding = true
+	pcall(function() ui.kind:ClearOptions() end)
+	if #opts > 0 then pcall(function() ui.kind:InsertOptions(opts) end) end
+	pcall(function() ui.kind:UpdateSelection(def) end)
+	ui.rebuilding = false
 	sv()
 	refreshSelLabel()
 end
 
--- rarities present in the picked zones (each zone maps its tiers to different rarities)
-local function rebuildRarities()
-	local have = {}
+local function showZones()
 	for _, z in ipairs(ZONES) do
-		if table.find(e.zones, z.id) then
-			for tier in pairs(z.tiers) do have[rarityOf(z, tier)] = true end
+		local ui = zoneUI[z.id]
+		if ui then
+			local on = table.find(e.zones, z.id) ~= nil
+			pcall(function() ui.rar:SetVisibility(on) end)
+			pcall(function() ui.kind:SetVisibility(on) end)
 		end
 	end
-	local opts, keep = {}, {}
-	for _, r in ipairs(RAR_ORDER) do
-		if have[r] then
-			opts[#opts + 1] = r
-			if table.find(e.rars, r) then keep[#keep + 1] = r end
-		end
-	end
-	e.rars = keep
-	rebuilding = true
-	pcall(function() rarDD:ClearOptions() end)
-	if #opts > 0 then pcall(function() rarDD:InsertOptions(opts) end) end
-	pcall(function() rarDD:UpdateSelection(keep) end)
-	rebuilding = false
-	rebuildKinds()
+	refreshSelLabel()
 end
 
-L:Header({Text = "เลือกเป้า (เลือกได้หลายอันทุกช่อง)"})
+L:Header({Text = "เลือกเป้า"})
 local zoneDef = {}
 for _, zid in ipairs(e.zones) do if zoneLabel[zid] then zoneDef[#zoneDef + 1] = zoneLabel[zid] end end
-L:Dropdown({Name = "1. โซน", Multi = true, Required = false, Options = zoneOpts, Default = zoneDef,
+L:Dropdown({Name = "โซน (เลือกได้หลายโซน)", Multi = true, Required = false, Options = zoneOpts, Default = zoneDef,
 	Callback = function(v)
 		local zs = {}
 		for _, label in ipairs(picked(v)) do if zoneByLabel[label] then zs[#zs + 1] = zoneByLabel[label].id end end
+		table.sort(zs, function(a, b) return ZONE_BY_ID[a].index < ZONE_BY_ID[b].index end)
 		e.zones = zs; sv()
-		task.defer(rebuildRarities)
+		task.defer(showZones)
 	end}, "SPAZone")
-rarDD = L:Dropdown({Name = "2. Rarity", Multi = true, Required = false, Options = {}, Default = {},
-	Callback = function(v)
-		if rebuilding then return end
-		local rs = {}
-		for _, label in ipairs(picked(v)) do if table.find(RAR_ORDER, label) then rs[#rs + 1] = label end end
-		e.rars = rs
-		task.defer(rebuildKinds)
-	end}, "SPARarity")
-kindDD = L:Dropdown({Name = "3. ตัวที่จะจับ", Multi = true, Required = false, Options = {}, Default = {},
-	Callback = function(v)
-		if rebuilding then return end
-		local ks = {}
-		for _, label in ipairs(picked(v)) do if kindByLabel[label] then ks[#ks + 1] = kindByLabel[label] end end
-		e.kinds = ks; sv()
-		refreshSelLabel()
-	end}, "SPAKinds")
-L:Button({Name = "เลือกทุกตัวที่อยู่ในช่อง 3", Callback = function()
-	local all = {}
-	for _, k in pairs(kindByLabel) do all[#all + 1] = k end
-	e.kinds = all
-	rebuildKinds()
-end})
-L:Button({Name = "ล้างเป้าทั้งหมด", Callback = function()
-	e.kinds = {}
-	rebuildKinds()
-end})
+L:Label({Text = "เลือกโซนแล้ว แต่ละโซนจะมีช่อง Rarity + ตัวที่จะจับ แยกของตัวเอง\nตัวที่จะจับ ไม่เลือก = จับทุกตัวใน rarity นั้น"})
+
+-- every zone gets its own Rarity + creature dropdowns, shown only while the zone is picked
+for _, z in ipairs(ZONES) do
+	if zoneLabel[z.id] then
+		local s = zsel(z.id)
+		local ui = {byLabel = {}, rebuilding = false}
+		zoneUI[z.id] = ui
+		local rarOpts, rarDef = {}, {}
+		for _, tier in ipairs(TIERS) do
+			if z.tiers[tier] then
+				local rar = rarityOf(z, tier)
+				rarOpts[#rarOpts + 1] = rar
+				if table.find(s.rars, rar) then rarDef[#rarDef + 1] = rar end
+			end
+		end
+		ui.rar = L:Dropdown({Name = ("โซน %d · Rarity"):format(z.index), Multi = true, Required = false, Options = rarOpts, Default = rarDef,
+			Callback = function(v)
+				local rs = {}
+				for _, label in ipairs(picked(v)) do if table.find(rarOpts, label) then rs[#rs + 1] = label end end
+				zsel(z.id).rars = rs
+				task.defer(rebuildKinds, z)
+			end}, "SPARar" .. z.id)
+		ui.kind = L:Dropdown({Name = ("└ โซน %d · ตัวที่จะจับ (ไม่เลือก = ทุกตัว)"):format(z.index), Multi = true, Required = false, Options = {}, Default = {},
+			Callback = function(v)
+				if ui.rebuilding then return end
+				local ks = {}
+				for _, label in ipairs(picked(v)) do if ui.byLabel[label] then ks[#ks + 1] = ui.byLabel[label] end end
+				zsel(z.id).kinds = ks; sv()
+				refreshSelLabel()
+			end}, "SPAKind" .. z.id)
+	end
+end
 L:Header({Text = "ตัวเลือก"})
 local sizeOpts = {}
 for i, n in ipairs(SIZE_NAMES) do sizeOpts[i] = i == 1 and "ทุกขนาด" or (n .. " ขึ้นไป") end
@@ -731,7 +776,10 @@ recT[#recT + 1] = S:Toggle({Name = "Auto Reconnect (หลุด / โดนเ�
 S:Label({Text = "เข้าเกมใหม่แล้วสคริปต์โหลดเองผ่าน loader พร้อมค่าที่ตั้งไว้"})
 S:Label({Text = "ตั้งค่าเซฟที่: " .. SF})
 
-task.defer(rebuildRarities)
+task.defer(function()
+	for _, z in ipairs(ZONES) do if zoneUI[z.id] then rebuildKinds(z) end end
+	showZones()
+end)
 
 task.spawn(function()
 	while alive() do
