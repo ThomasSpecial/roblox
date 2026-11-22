@@ -380,6 +380,7 @@ local function fightBoss(b)
 	end
 	if not m.Parent or m:GetAttribute("Dead") or m:GetAttribute("DeadLocal") then
 		st.kills += 1
+		st.needBank = true
 		st.lastKill = b.name .. " · " .. os.date("%H:%M:%S")
 		-- no standing around (user 2026-11-22): the packs fly to the character wherever it goes and are claimed in the
 		-- lobby safe zone anyway, so go straight on to the next boss / the bench
@@ -433,15 +434,23 @@ local function farmZones()
 	return set
 end
 local farmCamp
+-- "end the run" = go home: packs riding on the character are banked in the lobby safe zone. Done right after a boss
+-- sweep (st.needBank) and before the carry fills -- a pack that drops while the carry is full is lost (user 2026-11-22:
+-- "ตีบอสเสร็จ end run ก่อนแล้วค่อยมาฟามมอน ... การ์ดเต็ม = ไม่ได้การ์ด").
+local CARRY_SPARE = 3
 local function bankPacks()
 	local d = D()
 	local carried = d and type(d.Carried) == "table" and #d.Carried or 0
 	local cap = tonumber(plr:GetAttribute("CarryCapacity")) or 0
-	if cap <= 0 or carried < cap then return false end
-	st.status = ("พกแพ็คเต็ม (%d/%d) → กลับบ้านให้แพ็คเข้าบัญชี"):format(carried, cap)
+	if carried == 0 then st.needBank = false; return false end
+	local full = cap > 0 and carried >= math.max(1, cap - CARRY_SPARE)
+	if not st.needBank and not full then return false end
+	st.status = st.needBank and ("ตีบอสเสร็จ → กลับบ้านจบรอบ ให้แพ็ค %d ใบเข้าบัญชีก่อน"):format(carried)
+		or ("แพ็คใกล้เต็ม (%d/%d) → กลับบ้านให้แพ็คเข้าบัญชี"):format(carried, cap)
 	pcall(function() Remotes.TeleportHome:FireServer() end)
 	local t0 = os.clock()
-	while alive() and os.clock() - t0 < 8 and #((D() or {}).Carried or {}) >= cap do task.wait(0.25) end
+	while alive() and os.clock() - t0 < 8 and #((D() or {}).Carried or {}) > 0 do task.wait(0.25) end
+	st.needBank = false
 	farmCamp = nil
 	return true
 end
