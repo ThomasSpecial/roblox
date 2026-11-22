@@ -96,7 +96,7 @@ local DEFAULTS = {phFarm = false, phSellOn = false, phSellTiers = nil, phSellEve
 	phDgSkipIntro = true,   -- press SKIP on the dungeon boss intro cutscene
 	phDgRegroup = true,     -- a party member dropped out of the run -> no REPLAY, go to town and start again together
 	phFarmProg = false,     -- Auto Farm: move to the field whose monsters fit the level window + kill the gate boss once the next field's level is reached
-	phHookUrl = "",         -- own Discord webhook; "" = the built-in one (BUILTIN_HOOK in the webhook block)
+	phHookUrl = "",         -- own Discord webhook; "" = no notifications (the built-in one was removed)
 	phHookField = true, phHookDungeon = true, phHookWorld = true, phHookPing = false,
 	phFarmBelow = 99, phFarmAbove = 10}  -- farm monsters in [myLv-below, myLv+above]
 local e = {}
@@ -4825,9 +4825,9 @@ do
 		return (kind == "field" and e.phHookField) or (kind == "dungeon" and e.phHookDungeon)
 			or (kind == "world" and e.phHookWorld)
 	end
-	-- user: "ฟิก webhook เลย ที่ส่งไป ไม่ต้องให้ใส่" (chose to ship it in the public script,
-	-- knowing anyone reading the repo can see it): used whenever no own URL is set.
-	local BUILTIN_HOOK = "https://discord.com/api/webhooks/1571905652706648186/1Y5Xppw8M0MJ1CxaTGCBfJQtM11rIsQkVFR3kWkfcoR38xP0Kzj2eVdcd5ex9HLksMgF"
+	-- No built-in webhook any more: the one shipped in this PUBLIC script was read off GitHub and used to spam the
+	-- user's Discord (2026-11-23). Notifications only go to a URL the player enters (Settings -> Webhook URL).
+	local BUILTIN_HOOK = ""
 	function hook.valid(u)
 		return type(u) == "string" and u:match("^https://[%w%.]*discord[%w%.]*%.com/api/webhooks/%d+/[%w_%-]+$") ~= nil
 	end
@@ -5900,7 +5900,7 @@ do
 	local hook = stats.hook
 	local SRw = Tabs.Settings:Section({Side = "Right"})
 	SRw:Header({Text = "Discord Webhook (แจ้งเตือนการ์ดบอส)"})
-	SRw:Input({Name = "Webhook URL", Placeholder = hook.custom() and ("ใช้ของตัวเอง …" .. e.phHookUrl:sub(-6)) or "ใช้ webhook ในตัว (ใส่ของตัวเองเพื่อเปลี่ยน)",
+	SRw:Input({Name = "Webhook URL", Placeholder = hook.custom() and ("ใช้ของตัวเอง …" .. e.phHookUrl:sub(-6)) or "ใส่ Discord webhook ของตัวเอง",
 		AcceptedCharacters = "All",
 		Callback = function(t)
 			t = tostring(t or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -5918,7 +5918,7 @@ do
 	SRw:Toggle({Name = "แท็ก @everyone", Default = e.phHookPing,
 		Callback = function(v) e.phHookPing = v; sv() end}, "PHHookPing")
 	SRw:Button({Name = "ทดสอบส่ง Webhook", Callback = function() task.spawn(hook.test) end})
-	SRw:Button({Name = "กลับไปใช้ webhook ในตัว", Callback = function() e.phHookUrl = ""; sv(); hook.status = "ใช้ webhook ในตัวแล้ว" end})
+	SRw:Button({Name = "ล้าง webhook (ปิดแจ้งเตือน)", Callback = function() e.phHookUrl = ""; sv(); hook.status = "ไม่มี webhook (ปิดแจ้งเตือน)" end})
 	hook.lbl = SRw:Label({Text = "Webhook: " .. hook.status})
 end
 
