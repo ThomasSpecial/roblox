@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, autoSacrifice = false, autoTree = false, autoAscend = false, godMode = false, autoSkill = true, pierce = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, mobFarm = false, mobZones = false, autoSacrifice = false, autoTree = false, autoAscend = false, godMode = false, autoSkill = true, pierce = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -55,6 +55,7 @@ local st = {status = "-", boss = "-", kills = 0, opened = 0, rebirths = 0, upgra
 
 -- ------------------------------------------------------------------ helpers
 local function D() return PlayerState.Data end
+getgenv().__SSPDBG = {e = e, st = st}   -- read-only peek for debugging from the executor
 local function hum() local c = plr.Character; return c and c:FindFirstChildOfClass("Humanoid") end
 local function hrp() local c = plr.Character; return c and c:FindFirstChild("HumanoidRootPart") end
 local function short(n)
@@ -387,6 +388,117 @@ local function fightBoss(b)
 	end
 end
 
+-- ------------------------------------------------------------------ mob farming (user 2026-11-22: in the later worlds the
+-- bench barely levels you, killing mobs does). Every zone = 3 camps of 4 mobs (respawn 8 s) and then its boss pad; a camp
+-- belongs to the first boss above it in level, and is reachable exactly when that boss is (gateOpen). Packs that drop
+-- ride on the character (Data.Carried, CarryCapacity attr) and are banked in the lobby safe zone -> TeleportHome when full.
+local CAMPS = {}   -- {padId, name, level, at, zone = boss}
+do
+	for _, cfg in ipairs(RS:WaitForChild("EnemyPads"):GetChildren()) do
+		local pcf = cfg:GetAttribute("PadCFrame")
+		local isBoss = false
+		for _, b in ipairs(BOSSES) do if b.padId == (tonumber(cfg.Name) or cfg.Name) then isBoss = true end end
+		if not isBoss and typeof(pcf) == "CFrame" and (cfg:GetAttribute("Count") or 1) > 1 then
+			local lvl = cfg:GetAttribute("Level") or 0
+			local zone
+			for _, b in ipairs(BOSSES) do if b.level >= lvl then zone = b; break end end
+			if zone then
+				CAMPS[#CAMPS + 1] = {padId = tonumber(cfg.Name) or cfg.Name, name = cfg:GetAttribute("Name") or cfg.Name, level = lvl, at = pcf.Position, zone = zone}
+			end
+		end
+	end
+	table.sort(CAMPS, function(a, b) return a.level < b.level end)
+end
+local function zoneKey(b) return tostring(b.gate or b.name) end
+local function campMobs(c)
+	local out = {}
+	local f = workspace:FindFirstChild("Enemies")
+	for _, m in ipairs(f and f:GetChildren() or {}) do
+		if m:GetAttribute("PadId") == c.padId and not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") then
+			local h = m:FindFirstChildOfClass("Humanoid")
+			if not h or h.Health > 0 then out[#out + 1] = m end
+		end
+	end
+	return out
+end
+local function farmZones()
+	if type(e.mobZones) ~= "table" or #e.mobZones == 0 then
+		-- nothing picked: the highest zone that is open
+		local best
+		for _, b in ipairs(BOSSES) do if gateOpen(b) then best = b end end
+		return best and {[zoneKey(best)] = true} or {}
+	end
+	local set = {}
+	for _, z in ipairs(e.mobZones) do set[z] = true end
+	return set
+end
+local farmCamp
+local function bankPacks()
+	local d = D()
+	local carried = d and type(d.Carried) == "table" and #d.Carried or 0
+	local cap = tonumber(plr:GetAttribute("CarryCapacity")) or 0
+	if cap <= 0 or carried < cap then return false end
+	st.status = ("พกแพ็คเต็ม (%d/%d) → กลับบ้านให้แพ็คเข้าบัญชี"):format(carried, cap)
+	pcall(function() Remotes.TeleportHome:FireServer() end)
+	local t0 = os.clock()
+	while alive() and os.clock() - t0 < 8 and #((D() or {}).Carried or {}) >= cap do task.wait(0.25) end
+	farmCamp = nil
+	return true
+end
+local function farmStep()
+	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
+	if bankPacks() then return end
+	ensureAutoAttack()
+	local zones = farmZones()
+	-- stay on the current camp while it still has mobs, otherwise the nearest camp (in a picked open zone) with mobs up
+	local r = hrp()
+	if farmCamp and padState(farmCamp) ~= "alive" then farmCamp = nil end
+	if not farmCamp then
+		local best, bd
+		for _, c in ipairs(CAMPS) do
+			if zones[zoneKey(c.zone)] and gateOpen(c.zone) and padState(c) == "alive" then
+				local dist = r and (r.Position - c.at).Magnitude or 0
+				if not bd or dist < bd then best, bd = c, dist end
+			end
+		end
+		farmCamp = best
+	end
+	if not farmCamp then st.status = "ฟาร์มมอน: รอมอนในโซนที่เลือกเกิด (เกิดใหม่ทุก 8 วิ)"; task.wait(0.5); return end
+	local c = farmCamp
+	if not r or (r.Position - c.at).Magnitude > 60 then warp(c.at + Vector3.new(0, 6, 14), c.at); task.wait(0.3) end
+	local mobs = campMobs(c)
+	local t0 = os.clock()
+	while #mobs == 0 and alive() and os.clock() - t0 < 3 do task.wait(0.1); mobs = campMobs(c) end
+	if #mobs == 0 then farmCamp = nil; return end
+	r = hrp()
+	local target, td
+	for _, m in ipairs(mobs) do
+		local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+		if root and r then
+			local dd = (root.Position - r.Position).Magnitude
+			if not td or dd < td then target, td = m, dd end
+		end
+	end
+	if not target then return end
+	local root = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
+	local t1 = os.clock()
+	while alive() and e.mobFarm and target.Parent and not target:GetAttribute("Dead") and not target:GetAttribute("DeadLocal") and os.clock() - t1 < 25 do
+		if busyHands() then return end
+		local me = hum()
+		if not me or me.Health <= 0 then farmCamp = nil; return end
+		r = hrp()
+		if root and r and (r.Position - root.Position).Magnitude > 10 then
+			local flat = (r.Position - root.Position) * Vector3.new(1, 0, 1)
+			local dir = flat.Magnitude > 1 and flat.Unit or Vector3.new(0, 0, 1)
+			warp(root.Position + dir * (root.Size.X / 2 + 4), root.Position)
+		end
+		if root then castSkills(root.Position) end
+		st.status = ("ฟาร์มมอน: %s · เหลือ %d ตัว"):format(c.name, #campMobs(c))
+		task.wait(0.15)
+	end
+	st.mobKills = (st.mobKills or 0) + ((not target.Parent or target:GetAttribute("Dead") or target:GetAttribute("DeadLocal")) and 1 or 0)
+end
+
 -- ------------------------------------------------------------------ main loop: boss when one is up, bench otherwise
 loopEvery("Boss/Train", 0.1, 150, function()
 	local why = busyHands()
@@ -409,6 +521,11 @@ loopEvery("Boss/Train", 0.1, 150, function()
 			end
 		end
 		st.sweeping = false
+	end
+	if e.mobFarm and #CAMPS > 0 then
+		farmStep()
+		if e.boss and st.ready then st.status ..= " · " .. st.ready end
+		return
 	end
 	if e.train then
 		-- packs on my back are claimed in the lobby safe zone, and the bench is inside it
@@ -702,6 +819,26 @@ L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้�
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
+L:Header({Text = "ฟาร์มมอน"})
+L:Toggle({Name = "Auto Farm มอน (ไม่มีบอส → ไปตีมอนแทนยกเวท)", Default = e.mobFarm, Callback = function(v) e.mobFarm = v; sv() end}, "SSPMob")
+local zoneOpts, zoneByLabel, zoneDef, seenZone = {}, {}, {}, {}
+for _, c in ipairs(CAMPS) do
+	local key = zoneKey(c.zone)
+	if not seenZone[key] then
+		seenZone[key] = true
+		local label = ("Lv %d+ · %s"):format(c.level, key)
+		zoneOpts[#zoneOpts + 1] = label
+		zoneByLabel[label] = key
+		if type(e.mobZones) == "table" and table.find(e.mobZones, key) then zoneDef[#zoneDef + 1] = label end
+	end
+end
+L:Dropdown({Name = "└ โซนที่จะฟาร์ม (ไม่เลือก = โซนสูงสุดที่เข้าได้)", Multi = true, Required = false, Options = zoneOpts, Default = zoneDef,
+	Callback = function(v)
+		local keys = {}
+		for _, label in ipairs(picked(v)) do if zoneByLabel[label] then keys[#keys + 1] = zoneByLabel[label] end end
+		e.mobZones = keys; sv()
+	end}, "SSPMobZones")
+L:Label({Text = "แต่ละโซนมีแคมป์มอน 3 แคมป์ (4 ตัว เกิดใหม่ทุก 8 วิ) · บอสที่เลือกเกิด → ไปตีบอสก่อน\nพกแพ็คเต็ม → วาร์ปกลับบ้านให้แพ็คเข้าบัญชีแล้วกลับมาฟาร์มต่อ · โซนที่ยังเข้าไม่ได้ข้ามเอง"})
 L:Header({Text = "การ์ด / อัปเกรด"})
 L:Toggle({Name = "Auto Open Packs (เปิดแพ็คทั้งหมด)", Default = e.openPacks, Callback = function(v) e.openPacks = v; sv() end}, "SSPOpen")
 L:Toggle({Name = "Auto Merge Card (รวมการ์ดซ้ำให้เลเวลขึ้น)", Default = e.merge, Callback = function(v) e.merge = v; sv() end}, "SSPMerge")
@@ -776,7 +913,7 @@ task.spawn(function()
 			local d = D() or {}
 			stLbl:UpdateName(table.concat({
 				st.status,
-				("ฆ่าบอส %d · ล่าสุด: %s"):format(st.kills, tostring(st.lastKill or "-")),
+				("ฆ่าบอส %d · ล่าสุด: %s · ฆ่ามอน %d"):format(st.kills, tostring(st.lastKill or "-"), st.mobKills or 0),
 				("เปิดแพ็ค %d (ล่าสุด %s) · วางการ์ดดีสุด %d ครั้ง · อัปเบนช์ %d · รีเบิร์ธ %d"):format(st.opened, tostring(st.lastOpen or "-"), st.placed, st.upgrades, st.rebirths),
 				("เงิน $%s · Rebirth %s · %s"):format(short(d.Cash), tostring(d.Rebirths), tostring(st.reb or "-")),
 				tostring(st.bench or "-") .. " · รวมการ์ด: " .. tostring(st.lastMerge or "-"),
