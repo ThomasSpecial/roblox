@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, godMode = false, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -238,6 +238,28 @@ local function ensureAutoAttack()
 	if ok and not on then pcall(SettingsCtl.Set, "AutoAttack", true) end
 end
 
+-- God Mode: enemies are simulated on this client and every hit on me is computed here (LocalEnemyAbilities.hurt /
+-- u112.Stun) and then REPORTED by the client: Remotes.EnemyHurtMe:FireServer(padId, "Hit", dmg, seq) / (padId, "Stun", s).
+-- Dropping those reports = the server never applies the damage or the stun (user 2026-11-22: Empyrean Boss Lv 450 kills
+-- the character). One __namecall hook per game session; getgenv().__SSPGOD (set from e.godMode while this build is
+-- alive) decides whether it drops, so unloading / switching off restores normal damage at once.
+local HurtMe = Remotes:WaitForChild("EnemyHurtMe")
+if not getgenv().__SSPGODHOOK and hookmetamethod and getnamecallmethod then
+	getgenv().__SSPGODHOOK = true
+	local old
+	old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		if getgenv().__SSPGOD and self == HurtMe and getnamecallmethod() == "FireServer" then
+			getgenv().__SSPGODN = (getgenv().__SSPGODN or 0) + 1
+			return nil
+		end
+		return old(self, ...)
+	end))
+end
+task.spawn(function()
+	while alive() do getgenv().__SSPGOD = e.godMode == true; task.wait(0.2) end
+	getgenv().__SSPGOD = false
+end)
+
 local function fightBoss(b)
 	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
 	ensureAutoAttack()
@@ -258,7 +280,8 @@ local function fightBoss(b)
 		tooStrong[b.name] = os.clock() + 900
 		st.status = ("%s ตีไม่ไหว (%s) → ข้ามตัวนี้ 15 นาที"):format(b.name, why)
 	end
-	while alive() and e.boss and m.Parent and not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") and os.clock() - t0 < 90 do
+	local limit = e.godMode and 600 or 90   -- nothing can hurt us in God Mode, so a slow kill is still a kill
+	while alive() and e.boss and m.Parent and not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") and os.clock() - t0 < limit do
 		local me = hum()
 		if not me or me.Health <= 0 then giveUp("ตัวละครตาย"); return end
 		if busyHands() then st.status = "พัก: " .. busyHands(); return end
@@ -266,7 +289,7 @@ local function fightBoss(b)
 		local hn = m:FindFirstChildOfClass("Humanoid")
 		if hp0 and hn and os.clock() - t0 > 15 then
 			local rate = (hp0 - hn.Health) / (os.clock() - t0)
-			if rate <= 0 or hn.Health / rate > 90 then giveUp("เลือดบอสลดช้าเกิน"); return end
+			if (rate <= 0 and os.clock() - t0 > (e.godMode and 40 or 15)) or (rate > 0 and hn.Health / rate > limit) then giveUp("เลือดบอสลดช้าเกิน"); return end
 		end
 		local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
 		if root then
@@ -507,6 +530,7 @@ L:Dropdown({Name = "└ บอสที่จะตี (เลือกได้
 		e.bosses = names; sv()
 	end}, "SSPBosses")
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
+L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
 L:Header({Text = "การ์ด / อัปเกรด"})
