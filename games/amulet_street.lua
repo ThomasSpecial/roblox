@@ -173,6 +173,7 @@ end
 -- ------------------------------------------------------------------ counter loop
 local lastAct, doneSince, doneFor = 0, nil, nil
 local sitAtCounter   -- set in the dig section (needs warp / lastMove); returns true when it just sat down
+local acted = {}   -- [customerId#i#stage] = clock: sent already, the state push that confirms it is still on its way
 local slowDown = 0   -- extra seconds per decision, raised when the server says "slow down", decays again
 -- Haggling (Act "haggle" {i, pct}): the game offers ShopConfig.Cases.Haggle (5/10/20 %) off the asking price while
 -- Cases.Unlocked; each customer has Patience hearts and a hidden floor (collector 88-95 % of the ask ... scammer 55-70 %).
@@ -228,6 +229,7 @@ local function haggleStep(C, row, gen, ask, cap)
 	return true
 end
 local function counterStep()
+	if next(acted) and math.random() < 0.02 then for k, t in pairs(acted) do if os.clock() - t > 30 then acted[k] = nil end end end
 	if not S then st.status = "รอข้อมูลร้านจากเกม (เกมส่งมาเมื่อมีลูกค้า / ของเปลี่ยน)"; return end
 	local C = S.Customer
 	if not C or not C.Id then st.status = "รอลูกค้าที่เคาน์เตอร์"; doneSince = nil; return end
@@ -240,6 +242,8 @@ local function counterStep()
 	for _, row in ipairs(itemsOf(C)) do
 		local it = row.it
 		if it.Stage ~= "done" then open += 1 end
+		local actKey = ("%s#%s#%s"):format(tostring(C.Id), tostring(row.i), tostring(it.Stage))
+		if acted[actKey] and os.clock() - acted[actKey] < 4 then continue end
 		local action, extra, why = decide(C, it)
 		if (action == "buy" or action == "buyPost" or action == "pass") and it.Stage ~= "return" then
 			local gen = isGenuine(it.Spec)
@@ -249,7 +253,7 @@ local function counterStep()
 		end
 		if action then
 			-- short look per item (user 2026-11-22: "ช้าจัด"); the server answers "slow down" when pushed too hard -> slowDown
-			local dt = 0.3 + math.random() * 0.3 + slowDown
+			local dt = 0.15 + math.random() * 0.15 + slowDown
 			st.status = ("ลูกค้า%s · องค์ที่ %s %s: %s"):format(C.Intent == "pickup" and "มารับคืน" or "", tostring(row.i), short(modelName(it.Model), 22), why)
 			local t0 = os.clock()
 			while alive() and e.counter and os.clock() - t0 < dt do task.wait(0.1) end
@@ -267,6 +271,7 @@ local function counterStep()
 			if #dbg.decisions > 60 then table.remove(dbg.decisions, 1) end
 			local ok, r1, r2 = pcall(Act.InvokeServer, Act, action, args)
 			lastAct = os.clock()
+			if ok and r1 then acted[actKey] = os.clock() end
 			if ok and r1 then
 				if action == "buy" or action == "buyPost" then
 					st.bought += 1; st.spent += tonumber(action == "buy" and it.Ask or it.PostAsk) or 0
@@ -283,7 +288,7 @@ local function counterStep()
 				if action == "self" then selfFailed[it.Model] = true end   -- next pass sends it to the machine instead
 				task.wait(1)
 			end
-			return   -- one decision per step; the next state push drives the next one
+			continue   -- straight on to the next piece; `acted` keeps this one from being sent twice before the push lands
 		end
 	end
 	if open == 0 and e.dismiss then
