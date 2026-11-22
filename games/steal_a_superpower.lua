@@ -436,6 +436,9 @@ local function farmZones()
 	return set
 end
 local farmCamp
+-- a camp just cleared still reads "alive" in the pad table for a moment; remember it as empty so the next pick goes
+-- straight to another camp instead of standing there (user 2026-11-23: warping between camps was too slow)
+local campEmptyUntil = {}   -- padId -> os.clock()
 -- "end the run" = go home: packs riding on the character are banked in the lobby safe zone. Done right after a boss
 -- sweep (st.needBank) and before the carry fills -- a pack that drops while the carry is full is lost (user 2026-11-22:
 -- "ตีบอสเสร็จ end run ก่อนแล้วค่อยมาฟามมอน ... การ์ดเต็ม = ไม่ได้การ์ด").
@@ -480,20 +483,22 @@ local function farmStep()
 	if not farmCamp then
 		local best, bd
 		for _, c in ipairs(CAMPS) do
-			if zones[zoneKey(c.zone)] and gateOpen(c.zone) and padState(c) == "alive" then
+			if zones[zoneKey(c.zone)] and gateOpen(c.zone) and padState(c) == "alive" and (campEmptyUntil[c.padId] or 0) < os.clock() then
 				local dist = r and (r.Position - c.at).Magnitude or 0
 				if not bd or dist < bd then best, bd = c, dist end
 			end
 		end
 		farmCamp = best
 	end
-	if not farmCamp then st.status = "ฟาร์มมอน: รอมอนในโซนที่เลือกเกิด (เกิดใหม่ทุก 8 วิ)"; task.wait(0.5); return end
+	if not farmCamp then st.status = "ฟาร์มมอน: รอมอนในโซนที่เลือกเกิด (เกิดใหม่ทุก 8 วิ)"; task.wait(0.15); return end
 	local c = farmCamp
-	if not r or (r.Position - c.at).Magnitude > 60 then warp(c.at + Vector3.new(0, 6, 14), c.at); task.wait(0.3) end
+	local fresh = not r or (r.Position - c.at).Magnitude > 60
+	if fresh then warp(c.at + Vector3.new(0, 6, 14), c.at); task.wait(0.05) end
 	local mobs = campMobs(c)
 	local t0 = os.clock()
-	while #mobs == 0 and alive() and os.clock() - t0 < 3 do task.wait(0.1); mobs = campMobs(c) end
-	if #mobs == 0 then farmCamp = nil; return end
+	-- only a camp we just warped to gets a moment for its mobs to spawn/stream in
+	while #mobs == 0 and fresh and alive() and os.clock() - t0 < 1 do task.wait(0.05); mobs = campMobs(c) end
+	if #mobs == 0 then campEmptyUntil[c.padId] = os.clock() + 3; farmCamp = nil; return end
 	r = hrp()
 	local target, td
 	for _, m in ipairs(mobs) do
@@ -518,7 +523,7 @@ local function farmStep()
 		end
 		if root then castSkills(root.Position) end
 		st.status = ("ฟาร์มมอน: %s · เหลือ %d ตัว"):format(c.name, #campMobs(c))
-		task.wait(0.15)
+		task.wait(0.08)
 	end
 	st.mobKills = (st.mobKills or 0) + ((not target.Parent or target:GetAttribute("Dead") or target:GetAttribute("DeadLocal")) and 1 or 0)
 end
