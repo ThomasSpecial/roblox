@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, mobFarm = false, mobZones = false, autoSacrifice = false, autoTree = false, autoAscend = false, godMode = false, autoSkill = true, pierce = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, instaKill = false, mobFarm = false, mobZones = false, autoSacrifice = false, autoTree = false, autoAscend = false, godMode = false, autoSkill = true, pierce = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -357,6 +357,21 @@ local function castSkills(target)
 	end
 end
 
+-- Instant Kill (user 2026-11-23): enemies are simulated here; LocalEnemies.Damage(model, amount) takes
+-- amount / HealthUnit off the local Humanoid and, at 0, the game's own die() fires Remotes.EnemyKill(padId, seq, golden,
+-- pos) -- the server only gets that kill report, no damage numbers. One Damage call worth the whole health bar kills it
+-- through the normal path (phases, rewards, packs). Verified: a Lv 1451 mob 249 studs away and Eerie Pumpkin Head
+-- (Lv 1640, untouchable by normal hits) both died at once and paid out (packs, EnemyReward, Gates.DeepSanctum).
+local LocalEnemiesMod = LocalEnemies
+local function instaKill(m)
+	local h = m and m:FindFirstChildOfClass("Humanoid")
+	if not h or h.Health <= 0 or m:GetAttribute("Dead") or m:GetAttribute("DeadLocal") then return false end
+	local unit = EnemyConfig.HealthUnit and EnemyConfig.HealthUnit(m) or 1
+	local ok = pcall(LocalEnemiesMod.Damage, m, h.Health * unit * 1.01 + 1)
+	if ok then st.instaKills = (st.instaKills or 0) + 1 end
+	return ok
+end
+
 local function fightBoss(b)
 	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
 	ensureAutoAttack()
@@ -398,6 +413,7 @@ local function fightBoss(b)
 			end
 			castSkills(root.Position)
 		end
+		if e.instaKill then instaKill(m) end
 		local h = m:FindFirstChildOfClass("Humanoid")
 		st.boss = ("%s · HP %s / %s"):format(b.display, h and short(h.Health) or "?", h and short(h.MaxHealth) or "?")
 		st.status = "กำลังตี " .. b.display .. " (Auto Attack ของเกม)"
@@ -448,7 +464,14 @@ local function campMobs(c)
 	return out
 end
 local function farmZones()
-	if type(e.mobZones) ~= "table" or #e.mobZones == 0 then
+	-- picks saved in another world (e.g. "DeepSanctum" from World 3 while in World 4) match nothing here -> fall back
+	local anyHere = false
+	if type(e.mobZones) == "table" then
+		for _, z in ipairs(e.mobZones) do
+			for _, b in ipairs(BOSSES) do if zoneKey(b) == z then anyHere = true end end
+		end
+	end
+	if not anyHere then
 		-- nothing picked: the highest zone that is open
 		local best
 		for _, b in ipairs(BOSSES) do if gateOpen(b) then best = b end end
@@ -532,6 +555,17 @@ local function farmStep()
 		end
 	end
 	if not target then return end
+	if e.instaKill then
+		-- the whole camp in one go; Damage works at range, the mobs only have to be spawned (we are at the camp)
+		local n = 0
+		for _, mob in ipairs(mobs) do if instaKill(mob) then n += 1 end end
+		st.mobKills = (st.mobKills or 0) + n
+		st.status = ("ฟาร์มมอน (Instant Kill): %s · ฆ่า %d ตัว"):format(c.name, n)
+		campEmptyUntil[c.padId] = os.clock() + 1.5
+		farmCamp = nil
+		task.wait(0.1)
+		return
+	end
 	local root = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
 	local t1 = os.clock()
 	while alive() and e.mobFarm and target.Parent and not target:GetAttribute("Dead") and not target:GetAttribute("DeadLocal") and os.clock() - t1 < 25 do
@@ -882,6 +916,7 @@ end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
 L:Toggle({Name = "└ Auto Skill (กดสกิล E / F ใส่บอสเมื่อพร้อม)", Default = e.autoSkill, Callback = function(v) e.autoSkill = v; sv() end}, "SSPSkill")
 L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้าง (ปิดก่อนซื้อของด้วย Robux)", Default = e.pierce, Callback = function(v) e.pierce = v; sv() end}, "SSPPierce")
+L:Toggle({Name = "Instant Kill (บอส / มอน ตายทีเดียว)", Default = e.instaKill, Callback = function(v) e.instaKill = v; sv() end}, "SSPInsta")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
