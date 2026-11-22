@@ -437,20 +437,24 @@ loopEvery("Rebirth", 5, 30, function()
 	local ok, r = pcall(function() return Remotes.Rebirth:InvokeServer() end)
 	if ok and r then st.rebirths += 1; st.lastReb = os.date("%H:%M:%S") end
 end)
-loopEvery("Upgrade Train", 4, 30, function()
+-- Remotes.BenchUpgrade:FireServer() = the cash upgrade the sign's UpgradePrompt does (BaseController.onUpgrade); the
+-- RobuxUpgradePrompt is never touched. Upgrades back to back while the cash covers the next level (user 2026-11-22:
+-- one prompt every ~5 s was far too slow), waiting only for Data.Base.Bench to tick before the next one.
+loopEvery("Upgrade Train", 1, 60, function()
 	if not e.upgradeTrain then return end
-	local d = D()
-	if not (d and d.Base) then return end
-	local lvl = d.Base.Bench or 1
-	if lvl >= BaseConfig.BenchMaxLevel then st.bench = "เบนช์เต็มแล้ว"; return end
-	local cost = BaseConfig.BenchCost(lvl)
-	st.bench = ("เบนช์ Lv %d · อัปต่อไป $%s"):format(lvl, short(cost))
-	if Big.lt(d.Cash, cost) then return end
-	local _, _, up = benchParts()
-	if not up then return end
-	if firePrompt(up) then
-		task.wait(1)
-		if D().Base.Bench > lvl then st.upgrades += 1 end
+	for _ = 1, 200 do
+		local d = D()
+		if not (d and d.Base and alive() and e.upgradeTrain) then return end
+		local lvl = d.Base.Bench or 1
+		if lvl >= BaseConfig.BenchMaxLevel then st.bench = "เบนช์เต็มแล้ว"; return end
+		local cost = BaseConfig.BenchCost(lvl)
+		st.bench = ("เบนช์ Lv %d · อัปต่อไป $%s"):format(lvl, short(cost))
+		if Big.lt(d.Cash, cost) then return end
+		Remotes.BenchUpgrade:FireServer()
+		local t0 = os.clock()
+		while alive() and os.clock() - t0 < 2 and ((D().Base and D().Base.Bench) or lvl) <= lvl do task.wait(0.05) end
+		if ((D().Base and D().Base.Bench) or lvl) <= lvl then return end   -- server said no: try again next round
+		st.upgrades += 1
 	end
 end)
 loopEvery("Place Best", 10, 30, function()
