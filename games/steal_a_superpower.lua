@@ -372,6 +372,25 @@ local function instaKill(m)
 	return ok
 end
 
+-- Kill Aura (part of Instant Kill, user 2026-11-23): every enemy the game has loaded around the character (it streams
+-- them within ~380 studs) dies the moment it exists -- while warping, farming, walking by hand. Allies (hacked enemies)
+-- are skipped by LocalEnemies.Damage itself. Tested limits: a kill report for a pad far from the character pays nothing
+-- (the server checks we are near that pad), and flagging a kill "Golden" doesn't triple it (the server decides golden).
+task.spawn(function()
+	while alive() do
+		if e.instaKill then
+			local f = workspace:FindFirstChild("Enemies")
+			for _, m in ipairs(f and f:GetChildren() or {}) do
+				if not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") and not m:GetAttribute("HackedBy") then
+					local h = m:FindFirstChildOfClass("Humanoid")
+					if h and h.Health > 0 and instaKill(m) and not m:GetAttribute("Boss") then st.mobKills = (st.mobKills or 0) + 1 end
+				end
+			end
+		end
+		task.wait(0.15)
+	end
+end)
+
 local function fightBoss(b)
 	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
 	ensureAutoAttack()
@@ -938,7 +957,7 @@ end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
 L:Toggle({Name = "└ Auto Skill (กดสกิล E / F ใส่บอสเมื่อพร้อม)", Default = e.autoSkill, Callback = function(v) e.autoSkill = v; sv() end}, "SSPSkill")
 L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้าง (ปิดก่อนซื้อของด้วย Robux)", Default = e.pierce, Callback = function(v) e.pierce = v; sv() end}, "SSPPierce")
-L:Toggle({Name = "Instant Kill (บอส / มอน ตายทีเดียว)", Default = e.instaKill, Callback = function(v) e.instaKill = v; sv() end}, "SSPInsta")
+L:Toggle({Name = "Instant Kill + Kill Aura (ศัตรูรอบตัวตายทันที)", Default = e.instaKill, Callback = function(v) e.instaKill = v; sv() end}, "SSPInsta")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
