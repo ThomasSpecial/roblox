@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, godMode = false, autoSkill = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, godMode = false, autoSkill = true, pierce = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -285,6 +285,40 @@ local function findAbilities()
 	end
 	return abilityUse ~= nil and abilitySlots ~= nil
 end
+-- Attacks through buildings: the hero combat code (Shared.Combat.BasicHeroCombat & co.) casts a ray from the character
+-- along the attack (RespectCanCollide, Exclude = {character, workspace.Enemies, ...}) and cuts the attack's reach at the
+-- first wall it meets (`Distance = hit.Distance`) -- so a boss behind a pillar / house never gets hit (user 2026-11-22).
+-- While getgenv().__SSPPIERCE is set, those sideways combat rays report "no wall". Recognised by the calling function's
+-- source (debug.info level 3 = a Shared.Combat.* module); up/down rays (floor, ceiling checks) are left alone.
+-- The __namecall hook is installed once per game session and only calls getgenv().__SSPPIERCEFN, so every reload of
+-- this script swaps in its current rule (a hook body can't be replaced). v1 of this hook used __SSPPIERCE; that flag is
+-- forced off so a session still carrying it stops piercing.
+getgenv().__SSPPIERCE = false
+getgenv().__SSPPIERCEFN = function(src, dir, params)
+	return type(src) == "string" and src:find("Shared.Combat.", 1, true) ~= nil
+		and typeof(dir) == "Vector3" and math.abs(dir.Y) < dir.Magnitude * 0.5
+		and typeof(params) == "RaycastParams" and params.RespectCanCollide and params.FilterType == Enum.RaycastFilterType.Exclude
+end
+if not getgenv().__SSPPIERCEHOOK2 and hookmetamethod and getnamecallmethod then
+	getgenv().__SSPPIERCEHOOK2 = true
+	local old
+	old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		if getgenv().__SSPPIERCE2 and self == workspace and not checkcaller() and getnamecallmethod() == "Raycast" then
+			local ok, src = pcall(debug.info, 3, "s")   -- 2 = this [C] call, 3 = the Lua function that cast the ray
+			local f = getgenv().__SSPPIERCEFN
+			local _, dir, params = ...
+			if ok and f and f(src, dir, params) then
+				getgenv().__SSPPIERCEN = (getgenv().__SSPPIERCEN or 0) + 1
+				return nil
+			end
+		end
+		return old(self, ...)
+	end))
+end
+task.spawn(function()
+	while alive() do getgenv().__SSPPIERCE2 = e.pierce == true; task.wait(0.2) end
+	getgenv().__SSPPIERCE2 = false
+end)
 local lastSkill = 0
 local function castSkills(target)
 	if not e.autoSkill or os.clock() - lastSkill < 0.25 or not findAbilities() then return end
@@ -608,6 +642,7 @@ task.spawn(function()
 end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
 L:Toggle({Name = "└ Auto Skill (กดสกิล E / F ใส่บอสเมื่อพร้อม)", Default = e.autoSkill, Callback = function(v) e.autoSkill = v; sv() end}, "SSPSkill")
+L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้าง (กำแพง / ตึก ไม่บังท่า)", Default = e.pierce, Callback = function(v) e.pierce = v; sv() end}, "SSPPierce")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
