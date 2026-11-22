@@ -377,7 +377,7 @@ local function fightBoss(b)
 		end
 		local h = m:FindFirstChildOfClass("Humanoid")
 		st.boss = ("%s · HP %s / %s"):format(b.display, h and short(h.Health) or "?", h and short(h.MaxHealth) or "?")
-		st.status = "กำลังตี " .. b.name .. " (Auto Attack ของเกม)"
+		st.status = "กำลังตี " .. b.display .. " (Auto Attack ของเกม)"
 		task.wait(0.3)
 	end
 	if not m.Parent or m:GetAttribute("Dead") or m:GetAttribute("DeadLocal") then
