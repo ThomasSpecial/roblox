@@ -516,19 +516,48 @@ end
 local L = Tabs.Main:Section({Side = "Left"})
 L:Header({Text = "บอส ↔ train"})
 L:Toggle({Name = "Auto Boss (บอสเกิด → ไปตี เก็บการ์ด)", Default = e.boss, Callback = function(v) e.boss = v; sv() end}, "SSPBoss")
-local bossOpts, bossByLabel, bossDef = {}, {}, {}
-for _, b in ipairs(BOSSES) do
-	local label = bossLabel(b)
-	bossOpts[#bossOpts + 1] = label
-	bossByLabel[label] = b
-	if table.find(e.bosses, b.name) then bossDef[#bossDef + 1] = label end
+-- The "(ล็อก)" suffix depends on PlayerState.Data.Gates, which may still be the default (empty) table when the script
+-- starts right after a join / world teleport (user 2026-11-22, World 2: every boss after the first showed locked).
+-- So labels are rebuilt whenever the lock picture changes, and lookups ignore the suffix.
+local function baseLabel(label) return (tostring(label):gsub(" %(ล็อก%)$", "")) end
+local bossByBase = {}
+for _, b in ipairs(BOSSES) do bossByBase[("Lv %d · %s"):format(b.level, b.name)] = b end
+local function bossOptions()
+	local opts, sel = {}, {}
+	for _, b in ipairs(BOSSES) do
+		local label = bossLabel(b)
+		opts[#opts + 1] = label
+		if table.find(e.bosses, b.name) then sel[#sel + 1] = label end
+	end
+	return opts, sel
 end
-L:Dropdown({Name = "└ บอสที่จะตี (เลือกได้หลายตัว)", Multi = true, Required = false, Options = bossOpts, Default = bossDef,
+local bossRebuilding = false
+local bossOpts, bossDef = bossOptions()
+local bossDD = L:Dropdown({Name = "└ บอสที่จะตี (เลือกได้หลายตัว)", Multi = true, Required = false, Options = bossOpts, Default = bossDef,
 	Callback = function(v)
+		if bossRebuilding then return end
 		local names = {}
-		for _, label in ipairs(picked(v)) do if bossByLabel[label] then names[#names + 1] = bossByLabel[label].name end end
+		for _, label in ipairs(picked(v)) do local b = bossByBase[baseLabel(label)]; if b then names[#names + 1] = b.name end end
 		e.bosses = names; sv()
 	end}, "SSPBosses")
+task.spawn(function()
+	local shown = table.concat(bossOpts, "|")
+	while alive() do
+		task.wait(2)
+		local opts, sel = bossOptions()
+		local sig = table.concat(opts, "|")
+		if sig ~= shown then
+			shown = sig
+			bossRebuilding = true
+			pcall(function()
+				bossDD:ClearOptions()
+				bossDD:InsertOptions(opts)
+				bossDD:UpdateSelection(sel)
+			end)
+			bossRebuilding = false
+		end
+	end
+end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
