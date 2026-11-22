@@ -184,12 +184,14 @@ local BOSSES = {}   -- ordered list {padId, name, gate, level, at}
 do
 	for _, cfg in ipairs(RS:WaitForChild("EnemyPads"):GetChildren()) do
 		local enemy = cfg:GetAttribute("Enemy")
-		local ec = EnemyConfig[enemy] or (EnemyConfig.Enemies and EnemyConfig.Enemies[enemy])
+		local ec = (EnemyConfig.Types and EnemyConfig.Types[enemy]) or EnemyConfig[enemy] or (EnemyConfig.Enemies and EnemyConfig.Enemies[enemy])
 		local isBoss = (cfg:GetAttribute("Count") == 1 and cfg:GetAttribute("Gate") ~= nil) or (ec and ec.Boss)
 		local pcf = cfg:GetAttribute("PadCFrame")
 		if isBoss and typeof(pcf) == "CFrame" then
 			BOSSES[#BOSSES + 1] = {padId = tonumber(cfg.Name) or cfg.Name, enemy = enemy, gate = cfg:GetAttribute("Gate"),
-				level = cfg:GetAttribute("Level") or 0, at = pcf.Position, name = cfg:GetAttribute("Name") or enemy}
+				level = cfg:GetAttribute("Level") or 0, at = pcf.Position, name = cfg:GetAttribute("Name") or enemy,
+				-- the in-game nameplate ("Doomsekkar", "The Grand Pumpkin"); the pad Name ("RuneVault Boss") stays the save key
+				display = (type(ec) == "table" and type(ec.Name) == "string" and ec.Name ~= "") and ec.Name or cfg:GetAttribute("Name") or enemy}
 		end
 	end
 	table.sort(BOSSES, function(a, b) return a.level < b.level end)
@@ -210,7 +212,7 @@ local tooStrong = {}   -- name -> os.clock() until which it is skipped
 local function skipped(b) return (tooStrong[b.name] or 0) > os.clock() end
 -- short on purpose: the dropdown cuts anything past ~28 characters, and the boss name already says the zone
 local function bossLabel(b)
-	return ("Lv %d · %s%s"):format(b.level, b.name, gateOpen(b) and "" or " (ล็อก)")
+	return ("Lv %d · %s%s"):format(b.level, b.display, gateOpen(b) and "" or " (ล็อก)")
 end
 local function padState(b)
 	local pads = padTable()
@@ -335,7 +337,7 @@ end
 local function fightBoss(b)
 	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
 	ensureAutoAttack()
-	st.status = "วาร์ปไปหา " .. b.name
+	st.status = "วาร์ปไปหา " .. b.display
 	warp(b.at + Vector3.new(0, 6, 25), b.at)
 	local t0 = os.clock()
 	local m
@@ -344,13 +346,13 @@ local function fightBoss(b)
 		if m then break end
 		task.wait(0.1)
 	end
-	if not m then st.status = b.name .. " ไม่โผล่ (มีคนตีไปแล้ว?)"; task.wait(0.2); return end
+	if not m then st.status = b.display .. " ไม่โผล่ (มีคนตีไปแล้ว?)"; task.wait(0.2); return end
 	t0 = os.clock()
 	local h0 = m:FindFirstChildOfClass("Humanoid")
 	local hp0 = h0 and h0.Health
 	local function giveUp(why)
 		tooStrong[b.name] = os.clock() + 900
-		st.status = ("%s ตีไม่ไหว (%s) → ข้ามตัวนี้ 15 นาที"):format(b.name, why)
+		st.status = ("%s ตีไม่ไหว (%s) → ข้ามตัวนี้ 15 นาที"):format(b.display, why)
 	end
 	local limit = e.godMode and 600 or 90   -- nothing can hurt us in God Mode, so a slow kill is still a kill
 	while alive() and e.boss and m.Parent and not m:GetAttribute("Dead") and not m:GetAttribute("DeadLocal") and os.clock() - t0 < limit do
@@ -374,17 +376,17 @@ local function fightBoss(b)
 			castSkills(root.Position)
 		end
 		local h = m:FindFirstChildOfClass("Humanoid")
-		st.boss = ("%s · HP %s / %s"):format(b.name, h and short(h.Health) or "?", h and short(h.MaxHealth) or "?")
+		st.boss = ("%s · HP %s / %s"):format(b.display, h and short(h.Health) or "?", h and short(h.MaxHealth) or "?")
 		st.status = "กำลังตี " .. b.name .. " (Auto Attack ของเกม)"
 		task.wait(0.3)
 	end
 	if not m.Parent or m:GetAttribute("Dead") or m:GetAttribute("DeadLocal") then
 		st.kills += 1
 		st.needBank = true
-		st.lastKill = b.name .. " · " .. os.date("%H:%M:%S")
+		st.lastKill = b.display .. " · " .. os.date("%H:%M:%S")
 		-- no standing around (user 2026-11-22): the packs fly to the character wherever it goes and are claimed in the
 		-- lobby safe zone anyway, so go straight on to the next boss / the bench
-		st.status = b.name .. " ตายแล้ว → ไปต่อเลย"
+		st.status = b.display .. " ตายแล้ว → ไปต่อเลย"
 		task.wait(0.15)
 	end
 end
@@ -798,7 +800,7 @@ L:Toggle({Name = "Auto Boss (บอสเกิด → ไปตี เก็บ
 -- So labels are rebuilt whenever the lock picture changes, and lookups ignore the suffix.
 local function baseLabel(label) return (tostring(label):gsub(" %(ล็อก%)$", "")) end
 local bossByBase = {}
-for _, b in ipairs(BOSSES) do bossByBase[("Lv %d · %s"):format(b.level, b.name)] = b end
+for _, b in ipairs(BOSSES) do bossByBase[("Lv %d · %s"):format(b.level, b.display)] = b end
 local function bossOptions()
 	local opts, sel = {}, {}
 	for _, b in ipairs(BOSSES) do
@@ -945,7 +947,7 @@ task.spawn(function()
 			local lines = {}
 			for _, b in ipairs(BOSSES) do
 				if table.find(e.bosses, b.name) then
-					lines[#lines + 1] = ("%s: %s"):format(b.name, not gateOpen(b) and "ยังล็อก" or skipped(b) and ("ตีไม่ไหว ข้ามอีก %d นาที"):format(math.ceil((tooStrong[b.name] - os.clock()) / 60))
+					lines[#lines + 1] = ("%s: %s"):format(b.display, not gateOpen(b) and "ยังล็อก" or skipped(b) and ("ตีไม่ไหว ข้ามอีก %d นาที"):format(math.ceil((tooStrong[b.name] - os.clock()) / 60))
 					or padState(b) == "alive" and "เกิดแล้ว" or "รอเกิด")
 				end
 			end
