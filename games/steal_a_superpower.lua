@@ -438,18 +438,31 @@ local farmCamp
 -- sweep (st.needBank) and before the carry fills -- a pack that drops while the carry is full is lost (user 2026-11-22:
 -- "ตีบอสเสร็จ end run ก่อนแล้วค่อยมาฟามมอน ... การ์ดเต็ม = ไม่ได้การ์ด").
 local CARRY_SPARE = 3
+-- what rides on the character is the player attribute CarriedPacks ("1294:Abyss;1309:Abyss;..."), NOT Data.Carried
+-- (that one stays empty -- the first version read it and never went home, user: "การ์ดเต็มยังไม่เห็น end run")
+local function carriedCount()
+	local raw = plr:GetAttribute("CarriedPacks")
+	if type(raw) ~= "string" or raw == "" then return 0 end
+	local n = 0
+	for _ in raw:gmatch("[^;]+") do n += 1 end
+	return n
+end
 local function bankPacks()
-	local d = D()
-	local carried = d and type(d.Carried) == "table" and #d.Carried or 0
+	local carried = carriedCount()
 	local cap = tonumber(plr:GetAttribute("CarryCapacity")) or 0
 	if carried == 0 then st.needBank = false; return false end
 	local full = cap > 0 and carried >= math.max(1, cap - CARRY_SPARE)
 	if not st.needBank and not full then return false end
 	st.status = st.needBank and ("ตีบอสเสร็จ → กลับบ้านจบรอบ ให้แพ็ค %d ใบเข้าบัญชีก่อน"):format(carried)
 		or ("แพ็คใกล้เต็ม (%d/%d) → กลับบ้านให้แพ็คเข้าบัญชี"):format(carried, cap)
-	pcall(function() Remotes.TeleportHome:FireServer() end)
+	-- Remotes.TeleportHome only works from a boss arena's home portal; out in the zones it does nothing, so warp to the
+	-- player's base spawn (attr BaseSpawn, inside the lobby safe zone) like the bench trip does
+	getUp()
+	local spawnCF = plr:GetAttribute("BaseSpawn")
+	if typeof(spawnCF) == "CFrame" then warp(spawnCF.Position + Vector3.new(0, 3, 0)) else pcall(function() Remotes.TeleportHome:FireServer() end) end
 	local t0 = os.clock()
-	while alive() and os.clock() - t0 < 8 and #((D() or {}).Carried or {}) > 0 do task.wait(0.25) end
+	while alive() and os.clock() - t0 < 10 and carriedCount() > 0 do task.wait(0.25) end
+	if carriedCount() == 0 then st.banked = (st.banked or 0) + 1; st.lastBank = os.date("%H:%M:%S") end
 	st.needBank = false
 	farmCamp = nil
 	return true
