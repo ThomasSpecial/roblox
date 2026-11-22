@@ -772,18 +772,39 @@ end)
 local Shrine = require(RS.Shared.Rules.Shrine)
 local CardStats = require(RS.Shared.Rules.CardStats)
 local CARD_MAX = CardStats.MaxLevel or 10
+-- the tree's "rebirth" node differs per world ("Ascend" in World 3, "W4Apex" in World 4): it is the node on the Ascend branch
+local function ascendId()
+	for id, node in pairs(Shrine.TreeById or {}) do if node.Branch == "Ascend" then return id end end
+	return "Ascend"
+end
+-- shards still needed to buy every node not owned yet (Ascension included). Sacrificing past that only piles up shards
+-- that have nothing left to buy and are gone after the rebirth (user 2026-11-23) -- so Auto Sacrifice stops there.
+local function shardsNeeded(d)
+	local need = 0
+	for id, node in pairs(Shrine.TreeById or {}) do
+		if not Shrine.Owns(d, id) then need += tonumber(node.Cost) or 0 end
+	end
+	return need
+end
 loopEvery("Sacrifice", 3, 60, function()
 	if not e.autoSacrifice then return end
 	local d = D()
 	if not d or not Shrine.Open(d) then st.shrine = "ยังเปิด Card Shrine ไม่ได้ (ต้องชนะบอสก่อน)"; return end
+	local missing = shardsNeeded(d) - (tonumber(d.Shards) or 0)
+	if missing <= 0 then
+		st.lastSacrifice = "ชาร์ดพอซื้อต้นไม้ที่เหลือทั้งหมดแล้ว → ไม่ย่อยเพิ่ม (เก็บการ์ดไว้)"
+		return
+	end
 	for id, card in pairs(d.Cards or {}) do
-		if not (alive() and e.autoSacrifice) then return end
+		if not (alive() and e.autoSacrifice) or missing <= 0 then return end
 		local spare = Shrine.Spare(D(), id)
 		if type(card) == "table" and (tonumber(card.Level) or 1) >= CARD_MAX and spare > 0 then
-			local n = math.min(spare, 1000)
+			local each = tonumber(Shrine.ShardsEach(D(), id)) or 0
+			local n = math.min(spare, 1000, each > 0 and math.ceil(missing / each) or spare)
 			local gain = Shrine.ShardsGained(D(), id, n)
 			local ok, r1, r2 = pcall(function() return Remotes.Sacrifice:InvokeServer(id, n) end)
 			if ok and r1 then
+				missing -= tonumber(gain) or 0
 				st.sacrificed = (st.sacrificed or 0) + n
 				st.lastSacrifice = ("%s x%d → +%s ชาร์ด · %s"):format(id, n, tostring(gain), os.date("%H:%M:%S"))
 			else
@@ -799,12 +820,13 @@ loopEvery("Skill Tree", 2, 60, function()
 		local d = D()
 		if not (d and alive()) then return end
 		local pick
-		if e.autoAscend and Shrine.TreeById.Ascend and not Shrine.CantBuy(d, "Ascend") then
-			pick = "Ascend"
+		local asc = ascendId()
+		if e.autoAscend and Shrine.TreeById[asc] and not Shrine.CantBuy(d, asc) then
+			pick = asc
 		elseif e.autoTree then
 			local best
 			for id, node in pairs(Shrine.TreeById) do
-				if id ~= "Ascend" and not Shrine.CantBuy(d, id) and (not best or (node.Cost or 0) < (Shrine.TreeById[best].Cost or 0)) then best = id end
+				if id ~= asc and not Shrine.CantBuy(d, id) and (not best or (node.Cost or 0) < (Shrine.TreeById[best].Cost or 0)) then best = id end
 			end
 			pick = best
 		end
@@ -985,7 +1007,7 @@ local potLbl = PR:Label({Text = "-"})
 local SHL = Tabs.Shrine:Section({Side = "Left"})
 SHL:Header({Text = "ย่อยการ์ด (Sacrifice Cards)"})
 SHL:Toggle({Name = ("Auto Sacrifice (ย่อยเฉพาะการ์ด Lv %d)"):format(CARD_MAX), Default = e.autoSacrifice, Callback = function(v) e.autoSacrifice = v; sv() end}, "SSPSacrifice")
-SHL:Label({Text = ("ย่อยใบซ้ำของการ์ดที่เลเวลเต็ม (%d) แล้วเท่านั้น → ได้ชาร์ด\nเกมเก็บไว้ให้ 1 ใบเสมอ · การ์ด Exclusive / Exotic ขึ้นไปย่อยไม่ได้\nการ์ดที่ยังไม่เต็มไม่แตะ (ยังต้องใช้ใบซ้ำรวมเลเวล)"):format(CARD_MAX)})
+SHL:Label({Text = ("ย่อยแค่พอให้ชาร์ดถึงยอดที่ต้องใช้ซื้อต้นไม้ที่เหลือทั้งหมด (รวม Ascension) แล้วหยุด\nย่อยใบซ้ำของการ์ดที่เลเวลเต็ม (%d) แล้วเท่านั้น → ได้ชาร์ด\nเกมเก็บไว้ให้ 1 ใบเสมอ · การ์ด Exclusive / Exotic ขึ้นไปย่อยไม่ได้\nการ์ดที่ยังไม่เต็มไม่แตะ (ยังต้องใช้ใบซ้ำรวมเลเวล)"):format(CARD_MAX)})
 SHL:Header({Text = "Skill Tree"})
 SHL:Toggle({Name = "Auto Skill Tree (ซื้อช่องที่ซื้อได้ ถูกสุดก่อน)", Default = e.autoTree, Callback = function(v) e.autoTree = v; sv() end}, "SSPTree")
 SHL:Toggle({Name = "Auto Ascension (Rebirth ของต้นไม้ · 2500 ชาร์ด)", Default = e.autoAscend, Callback = function(v) e.autoAscend = v; sv() end}, "SSPAscend")
@@ -1048,15 +1070,19 @@ task.spawn(function()
 				local nextId, nextCost
 				for id, node in pairs(Shrine.TreeById or {}) do
 					local why = Shrine.CantBuy(d, id)
-					if (not why or why == "Not enough shards") and id ~= "Ascend" and (not nextCost or (node.Cost or 0) < nextCost) then nextId, nextCost = id, node.Cost or 0 end
+					if (not why or why == "Not enough shards") and id ~= ascendId() and (not nextCost or (node.Cost or 0) < nextCost) then nextId, nextCost = id, node.Cost or 0 end
 				end
-				local asc = Shrine.CantBuy(d, "Ascend")
+				local ascId = ascendId()
+				local asc = Shrine.CantBuy(d, ascId)
+				local need = shardsNeeded(d)
 				shrineLbl:UpdateName(table.concat({
 					("ชาร์ด %s · Card Shrine %s"):format(tostring(d.Shards or 0), Shrine.Open(d) and "เปิดแล้ว" or "ยังไม่เปิด"),
 					("การ์ด Lv %d ที่มีใบซ้ำ: %d แบบ รวม %d ใบ"):format(CARD_MAX, spareCards, spareMax),
 					("ย่อยไปแล้ว %d ใบ · ล่าสุด: %s"):format(st.sacrificed or 0, tostring(st.lastSacrifice or "-")),
 					nextId and ("ช่องถัดไป: %s (%s ชาร์ด)"):format(nextId, tostring(nextCost)) or "ต้นไม้: ไม่มีช่องที่ซื้อได้ตอนนี้",
-					("Ascension: %s"):format(asc and tostring(asc) or "ซื้อได้แล้ว!"),
+					("Ascension (%s, %s ชาร์ด): %s"):format(ascId, short((Shrine.TreeById[ascId] or {}).Cost or 0), asc and tostring(asc) or "ซื้อได้แล้ว!"),
+					("ต้องใช้อีก %s ชาร์ดซื้อที่เหลือทั้งหมด · มี %s → %s"):format(short(need), short(tonumber(d.Shards) or 0),
+						(tonumber(d.Shards) or 0) >= need and "พอแล้ว ไม่ย่อยเพิ่ม" or ("ขาด " .. short(need - (tonumber(d.Shards) or 0)))),
 					("ซื้อช่องไปแล้ว %d · ล่าสุด: %s"):format(st.treeBought or 0, tostring(st.lastTree or "-")),
 					st.shrine or "",
 				}, "\n"))
