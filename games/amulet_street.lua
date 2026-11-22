@@ -37,7 +37,7 @@ local UIS = game:GetService("UserInputService")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("AmuletStreet/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {clerkToBot = true, haggle = true, dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
+local DEFAULTS = {clerkToBot = true, haggle = true, dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, overlayMin = false, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -579,7 +579,22 @@ box.Visible = false
 box.Parent = gui
 Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
 local pad = Instance.new("UIPadding", box)
-pad.PaddingLeft, pad.PaddingRight, pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 10), UDim.new(0, 10), UDim.new(0, 6), UDim.new(0, 6)
+pad.PaddingLeft, pad.PaddingRight, pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 10), UDim.new(0, 40), UDim.new(0, 6), UDim.new(0, 6)
+-- – folds the box to one summary line, + opens it again (user 2026-11-22: the full list covers the screen); remembered
+local foldBtn = Instance.new("TextButton")
+foldBtn.AnchorPoint = Vector2.new(1, 0)
+foldBtn.Position = UDim2.new(1, 34, 0, 0)
+foldBtn.Size = UDim2.fromOffset(28, 24)
+foldBtn.BackgroundColor3 = Color3.fromRGB(70, 60, 52)
+foldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+foldBtn.Font = Enum.Font.GothamBold
+foldBtn.TextSize = 20
+foldBtn.AutoButtonColor = true
+foldBtn.Parent = box
+Instance.new("UICorner", foldBtn).CornerRadius = UDim.new(0, 6)
+local function paintFold() foldBtn.Text = e.overlayMin and "+" or "–"; box.Size = UDim2.fromOffset(e.overlayMin and 360 or 640, 0) end
+paintFold()
+foldBtn.MouseButton1Click:Connect(function() e.overlayMin = not e.overlayMin; sv(); paintFold() end)
 
 local INTENT = {sell = "เอามาให้เช่า", cert = "ขอใบเซอร์", both = "ให้เช่าก็ได้ / ตรวจก่อน", pickup = "มารับพระคืน"}
 task.spawn(function()
@@ -587,7 +602,17 @@ task.spawn(function()
 		pcall(function()
 			local C = S and S.Customer
 			if not e.overlay or not C or not C.Id then box.Visible = false; return end
-			local lines = {("<b>ลูกค้า: %s</b>"):format(INTENT[C.Intent] or tostring(C.Intent))}
+			local lines = {}
+			local nReal, nFake, nOpen = 0, 0, 0
+			for _, row in ipairs(itemsOf(C)) do
+				local gen = isGenuine(row.it.Spec)
+				if gen == true then nReal += 1 elseif gen == false then nFake += 1 end
+				if row.it.Stage ~= "done" then nOpen += 1 end
+			end
+			local head = ("<b>ลูกค้า: %s</b> · <font color=\"#7CFF6E\">แท้ %d</font> · <font color=\"#FF6A5A\">เก๊ %d</font> · เหลือ %d"):format(
+				INTENT[C.Intent] or tostring(C.Intent), nReal, nFake, nOpen)
+			lines[1] = head
+			if e.overlayMin then box.Text = head; box.Visible = true; return end
 			for _, row in ipairs(itemsOf(C)) do
 				local it = row.it
 				local gen = isGenuine(it.Spec)
