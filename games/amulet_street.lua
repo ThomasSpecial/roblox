@@ -37,7 +37,7 @@ local UIS = game:GetService("UserInputService")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("AmuletStreet/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {haggle = true, dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
+local DEFAULTS = {clerkToBot = true, haggle = true, dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -299,6 +299,49 @@ local function counterStep()
 		st.status = ("ลูกค้า (%s) · เหลือ %d องค์ที่บอทไม่ตัดสิน (ไม่รู้จักรุ่น / รอเครื่องตรวจ)"):format(tostring(C.Intent), open)
 	end
 end
+
+-- Clerk (staff "clerk") sorts the tray BY EYE and, with Policy.normal = "auto", rents/certifies ordinary pieces itself --
+-- that is where fakes kept getting bought (user 2026-11-22: "ยังซื้อพระปลอม"; Stats.FakesBought never rose from the
+-- bot's own buys). While the bot sits at the counter the clerk passes every piece to the owner (normal + sell = "owner");
+-- when the bot leaves (Auto Dig / Auto Counter off) the user's own settings come back. Act("clerkPolicy", {Pile, Mode}),
+-- spaced out -- two calls back to back get "slow down".
+local CLERK_PILES = {"normal", "sell"}
+local lastPolicyCall = 0
+local function clerkJob()
+	local pol = S and S.Clerk and S.Clerk.Policy
+	if not pol or os.clock() - lastPolicyCall < 2 then return end
+	local want
+	if e.clerkToBot and e.counter and not e.dig then
+		want = {normal = "owner", sell = "owner"}
+		if not e.clerkSaved then
+			e.clerkSaved = {normal = pol.normal or "auto", sell = pol.sell or "pile"}
+			if e.clerkSaved.normal == "owner" then e.clerkSaved.normal = "auto" end
+			if e.clerkSaved.sell == "owner" then e.clerkSaved.sell = "pile" end
+			sv()
+		end
+	elseif e.clerkSaved then
+		want = e.clerkSaved
+	else
+		return
+	end
+	for _, pile in ipairs(CLERK_PILES) do
+		if want[pile] and pol[pile] ~= want[pile] then
+			lastPolicyCall = os.clock()
+			local ok, r1, r2 = pcall(Act.InvokeServer, Act, "clerkPolicy", {Pile = pile, Mode = want[pile]})
+			if ok and r1 then
+				note(("ลูกน้องหน้าร้าน: %s → %s"):format(pile == "normal" and "พระธรรมดา" or "ลูกค้ามาขาย", want[pile] == "owner" and "ส่งให้บอทดูทุกองค์" or "คืนค่าเดิมของคุณ"))
+			end
+			return
+		end
+	end
+	if want == e.clerkSaved then e.clerkSaved = nil; sv() end
+end
+task.spawn(function()
+	while alive() do
+		pcall(clerkJob)
+		task.wait(0.5)
+	end
+end)
 
 task.spawn(function()
 	while alive() do
@@ -606,6 +649,7 @@ L:Label({Text = "บอทรู้แท้ / เก๊แน่นอน (เ�
 L:Toggle({Name = "รับเช่าองค์แท้ที่ราคาคุ้ม", Default = e.buy, Callback = function(v) e.buy = v; sv() end}, "AMSBuy")
 L:Slider({Name = "└ รับเช่าเมื่อขอไม่เกิน % ของราคาตลาด", Minimum = 30, Maximum = 100, Default = tonumber(e.buyPct) or 80,
 	Precision = 0, DisplayMethod = "Round", Callback = function(v) e.buyPct = math.floor(v + 0.5); sv() end}, "AMSBuyPct")
+L:Toggle({Name = "ให้ลูกน้องหน้าร้านส่งทุกองค์ให้บอทดู (ลูกน้องดูด้วยตา ซื้อของปลอมได้)", Default = e.clerkToBot, Callback = function(v) e.clerkToBot = v; sv() end}, "AMSClerk")
 L:Toggle({Name = "ต่อราคาก่อนรับเช่า (เก็บความอดทนลูกค้าไว้ 1 ดวงเสมอ)", Default = e.haggle, Callback = function(v) e.haggle = v; sv() end}, "AMSHaggle")
 L:Toggle({Name = "ตรวจเองเมื่อมีสมุดรุ่นนั้น (ได้ค่าตรวจเต็ม แทนส่งเครื่องเสีย 70%)", Default = e.selfCert, Callback = function(v) e.selfCert = v; sv() end}, "AMSSelf")
 L:Toggle({Name = "ส่งลูกค้ากลับเมื่อทุกองค์เสร็จแล้ว", Default = e.dismiss, Callback = function(v) e.dismiss = v; sv() end}, "AMSDismiss")
