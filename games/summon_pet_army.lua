@@ -36,7 +36,7 @@ local ShroudRE = Remotes:WaitForChild("Shroud")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("PetArmy/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, equipBest = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true,
+local DEFAULTS = {farm = false, zones = {}, rars = {}, kinds = {}, minSize = 1, catchOthers = false, equipBest = false, autoDrum = false, autoBanner = false, drum = false, hboss = false, shroud = true, shroudPen = true, pauseOnMove = true, reconnect = true, antiAfk = true,
 	speedOn = false, speed = 100, jumpOn = false, jump = 80, infJump = false, noclip = false, fullbright = false, fovOn = false, fov = 70}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -48,7 +48,7 @@ local function sv()
 	end)
 end
 
-local st = {status = "ปิดอยู่", target = "-", shroud = "-", shroudKills = 0, placed = 0, opened = 0, kills = 0, caught = 0, missed = 0, lastCatch = "-", army = "-", equip = "-", equips = 0, wd = "-", err = "-"}
+local st = {status = "ปิดอยู่", target = "-", shroud = "-", shroudKills = 0, placed = 0, opened = 0, kills = 0, caught = 0, missed = 0, lastCatch = "-", army = "-", equip = "-", equips = 0, shop = "-", wd = "-", err = "-"}
 getgenv().__SPAST = st   -- read-only peek for debugging from the executor
 local caughtBy = {}
 
@@ -1205,6 +1205,51 @@ task.spawn(function()
 	end
 end)
 
+-- Auto Upgrade Drum / Auto Buy Banner: the plot sign "Upgrade <next drum>" and the Banner shop both go through
+-- Remotes.CampAction ("buyDrum" / "buyBanner", returns {ok, msg}). Prices: EconomyRules.nextDrum(Drum attr).Price and
+-- Config.Economy.BannerPrices[Banners attr + 1]; only sent when Coins cover it, a refusal backs off for a minute.
+local CampAction = Remotes:WaitForChild("CampAction")
+local EconomyRules = require(Shared:WaitForChild("EconomyRules"))
+local shopWait = {}
+local function coins() local c = plr:FindFirstChild("Coins"); return c and tonumber(c.Value) or 0 end
+local function nextBuys()
+	local out = {}
+	local ok, nd = pcall(EconomyRules.nextDrum, plr:GetAttribute("Drum") or 1)
+	out.drum = ok and type(nd) == "table" and {price = tonumber(nd.Price), name = tostring(nd.Name or "Drum")} or nil
+	local prices = Config.Economy and Config.Economy.BannerPrices or {}
+	local b = plr:GetAttribute("Banners") or 0
+	out.banner = prices[b + 1] and {price = tonumber(prices[b + 1]), name = ("Banner %d/%d"):format(b + 1, #prices)} or nil
+	return out
+end
+local function tryBuy(key, action, item)
+	if not item or not item.price or coins() < item.price or (shopWait[key] or 0) > os.clock() then return false end
+	local ok, r = pcall(CampAction.InvokeServer, CampAction, action)
+	if ok and type(r) == "table" and r.ok then
+		st.shop = ("ซื้อ %s (%s) แล้ว · %s"):format(item.name, fmt(item.price), os.date("%H:%M:%S"))
+		return true
+	end
+	shopWait[key] = os.clock() + 60
+	st.shop = ("ซื้อ %s ไม่ผ่าน: %s → ลองใหม่อีก 1 นาที"):format(item.name, tostring(type(r) == "table" and r.msg or r))
+	return false
+end
+task.spawn(function()
+	while alive() do
+		if e.autoDrum or e.autoBanner then
+			pcall(function()
+				local nb = nextBuys()
+				local bought = (e.autoDrum and tryBuy("drum", "buyDrum", nb.drum)) or (e.autoBanner and tryBuy("banner", "buyBanner", nb.banner))
+				if not bought and not st.shop:find("ไม่ผ่าน", 1, true) then
+					local parts = {}
+					if e.autoDrum then parts[#parts + 1] = nb.drum and ("กลองถัดไป %s %s"):format(nb.drum.name, fmt(nb.drum.price)) or "กลองสุดแล้ว" end
+					if e.autoBanner then parts[#parts + 1] = nb.banner and ("%s %s"):format(nb.banner.name, fmt(nb.banner.price)) or "Banner ครบแล้ว" end
+					st.shop = ("รอเงิน (มี %s) · %s"):format(fmt(coins()), table.concat(parts, " · "))
+				end
+			end)
+		end
+		task.wait(3)
+	end
+end)
+
 -- anti-AFK
 local VirtualUser = game:GetService("VirtualUser")
 local idleConn = plr.Idled:Connect(function()
@@ -1403,6 +1448,10 @@ L:Label({Text = "เกมประกาศเมื่อ Shrouded เกิ�
 L:Header({Text = "Army"})
 L:Toggle({Name = "Auto Equip Best (ใส่ตัวแรงสุดเข้า army)", Default = e.equipBest, Callback = function(v) e.equipBest = v; sv() end}, "SPAEquipBest")
 L:Label({Text = "เช็คทุก 10 วิ · กด EQUIP BEST ให้เฉพาะตอนในคลังมีตัวแรงกว่าตัวที่อ่อนสุดใน army"})
+L:Header({Text = "Upgrade"})
+L:Toggle({Name = "Auto Upgrade Drum (ป้าย Upgrade ที่พล็อต)", Default = e.autoDrum, Callback = function(v) e.autoDrum = v; sv() end}, "SPAAutoDrumUp")
+L:Toggle({Name = "Auto Buy Banner", Default = e.autoBanner, Callback = function(v) e.autoBanner = v; sv() end}, "SPAAutoBanner")
+L:Label({Text = "เงินพอเมื่อไหร่ซื้อให้ทันที (เช็คทุก 3 วิ) · กลองกับ Banner เพิ่ม Command ต่อวิ"})
 L:Toggle({Name = "จับ soul ตัวอื่นที่ตายด้วย (army ตีโดน)", Default = e.catchOthers, Callback = function(v) e.catchOthers = v; sv() end}, "SPAOthers")
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "SPAPause")
 -- Anti-AFK / Auto Reconnect live on the Settings tab only (user, 2026-11-21: duplicate on the main tab was noise)
@@ -1477,7 +1526,7 @@ task.spawn(function()
 				("Shrouded: %s · ฆ่า %d · Mystery Soul ถืออยู่ %d · วาง %d · เปิด %d"):format(st.shroud, st.shroudKills,
 					plr:GetAttribute("MysterySouls") or 0, st.placed, st.opened),
 				("ฆ่า %d · จับได้ %d · ล่าสุด: %s"):format(st.kills, st.caught, st.lastCatch),
-				st.army .. (e.equipBest and (" · " .. st.equip) or ""),
+				st.army .. (e.equipBest and (" · " .. st.equip) or "") .. ((e.autoDrum or e.autoBanner) and ("\nUpgrade: " .. st.shop) or ""),
 				"เกมประกาศล่าสุด: " .. tostring(st.lastAnn or "-"),
 				"ส่องเจอจากระยะไกลล่าสุด: " .. tostring(st.lastSight or "-"),
 				"แจ้งเตือนเกม: " .. tostring(st.lastNote or "-"),
