@@ -95,6 +95,7 @@ local PLACE_SCRIPTS = {
     [79496881832552]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/run_a_farm.lua",       -- [UPD] Run A Farm!
     [89695026030574]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/summon_pet_army.lua",  -- Summon a Pet Army
     [74183246285569]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/steal_a_superpower.lua", -- [⚡] Steal a Superpower!
+    [82739382053686]  = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/steal_a_superpower.lua", -- Steal a Superpower! World 2 (same universe, same script)
     [116750055341696] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/amulet_street.lua",      -- ถนนพระเครื่อง (Amulet Street)
     -- Battle Royale universe: the match server and the Killstreak mode share one script
     [108448382032231] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Battle Royale (chest + player ESP)
