@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, godMode = false, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, godMode = false, autoSkill = true, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -260,6 +260,43 @@ task.spawn(function()
 	getgenv().__SSPGOD = false
 end)
 
+-- Auto Skill: the game's own Auto Attack only fires the primary (M1). The E / F skills go through AbilityController's
+-- local use(slot, auto, auto, targetPos) -- the same function the key binds and Auto Attack call; it checks cooldowns
+-- itself and, with auto = true, stays quiet when a skill isn't ready. Slots = the `bind` closure's upvalue table
+-- {[1] = {Card, Id, Key}, [2] = ...} (index 1 = E, 2 = F; locked MERGE slots are simply absent).
+local abilityUse, abilitySlots
+local function findAbilities()
+	if abilityUse and abilitySlots then return true end
+	local bindF
+	for _, f in ipairs(getgc and getgc(false) or {}) do
+		if type(f) == "function" and islclosure(f) then
+			local ok, src = pcall(debug.info, f, "s")
+			if ok and src and src:find("AbilityController", 1, true) then
+				local n = debug.info(f, "n")
+				if n == "use" then abilityUse = f elseif n == "bind" then bindF = f end
+			end
+		end
+	end
+	for _, v in pairs(bindF and debug.getupvalues(bindF) or {}) do
+		if type(v) == "table" then
+			local _, first = next(v)
+			if type(first) == "table" and first.Id and first.Card then abilitySlots = v end
+		end
+	end
+	return abilityUse ~= nil and abilitySlots ~= nil
+end
+local lastSkill = 0
+local function castSkills(target)
+	if not e.autoSkill or os.clock() - lastSkill < 0.25 or not findAbilities() then return end
+	lastSkill = os.clock()
+	for _, slot in pairs(abilitySlots) do
+		if type(slot) == "table" and slot.Id then
+			local ok = pcall(abilityUse, slot, true, true, target)
+			if not ok then abilityUse, abilitySlots = nil, nil; return end   -- controller rebuilt: look it up again next time
+		end
+	end
+end
+
 local function fightBoss(b)
 	if not getUp() then st.status = "ลุกจากเบนช์ไม่ได้"; return end
 	ensureAutoAttack()
@@ -299,6 +336,7 @@ local function fightBoss(b)
 			if not r or (r.Position - root.Position).Magnitude > 14 then
 				warp(root.Position + dir * (root.Size.X / 2 + 6), root.Position)
 			end
+			castSkills(root.Position)
 		end
 		local h = m:FindFirstChildOfClass("Humanoid")
 		st.boss = ("%s · HP %s / %s"):format(b.name, h and short(h.Health) or "?", h and short(h.MaxHealth) or "?")
@@ -431,9 +469,15 @@ end)
 -- many are left. Buying is the green CASH button only: Remotes.BuyCosmetic:InvokeServer("Potion", typeId, tier) -- the
 -- purple Robux button (PurchasePrompt.PromptProduct) is never touched. Bought potions land in the Backpack.
 local CosmeticConfig = require(RS.Shared.Config.CosmeticConfig)
--- only tiers with shop Weight > 0 ever show up on the shelf (I and II); III+ come from codes / packs
+-- every buyable tier: the shelf is rolled per WORLD (PotionStock), World 1 only stocks I/II but World 2 also stocks III+
+-- (user 2026-11-22: Health III was skipped because the list only had the World 1 tiers)
 local SHOP_TIERS = {}
-for _, t in ipairs(CosmeticConfig.Potions.Tiers or {}) do if (t.Weight or 0) > 0 and (t.Price or 0) > 0 then SHOP_TIERS[#SHOP_TIERS + 1] = t end end
+for _, t in ipairs(CosmeticConfig.Potions.Tiers or {}) do if (t.Price or 0) > 0 then SHOP_TIERS[#SHOP_TIERS + 1] = t end end
+-- one-time upgrade of the old saved default {I, II} to every tier
+if type(e.potionTiers) == "table" and not e.potionTiersV2 then
+	for _, t in ipairs(SHOP_TIERS) do if not table.find(e.potionTiers, t.Tier) then table.insert(e.potionTiers, t.Tier) end end
+	e.potionTiersV2 = true
+end
 if type(e.potionTypes) ~= "table" then e.potionTypes = {}; for _, t in ipairs(CosmeticConfig.Potions.Types or {}) do table.insert(e.potionTypes, t.Id) end end
 if type(e.potionTiers) ~= "table" then e.potionTiers = {}; for _, t in ipairs(SHOP_TIERS) do table.insert(e.potionTiers, t.Tier) end end
 loopEvery("Buy Potion", 5, 60, function()
@@ -559,6 +603,7 @@ task.spawn(function()
 	end
 end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
+L:Toggle({Name = "└ Auto Skill (กดสกิล E / F ใส่บอสเมื่อพร้อม)", Default = e.autoSkill, Callback = function(v) e.autoSkill = v; sv() end}, "SSPSkill")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
@@ -597,7 +642,7 @@ PL:Dropdown({Name = "ระดับยา (เลือกได้หลาย
 	Callback = function(v)
 		local tiers = {}
 		for _, label in ipairs(picked(v)) do if tierByLabel[label] then tiers[#tiers + 1] = tierByLabel[label] end end
-		e.potionTiers = tiers; sv()
+		e.potionTiers = tiers; e.potionTiersV2 = true; sv()
 	end}, "SSPPotionTiers")
 PL:Label({Text = "ร้านเปลี่ยนของทุก 30 นาที · เช็กทุก 5 วิ ซื้อทุกขวดที่ตรงกับที่เลือกและเงินพอ\nกดแค่ปุ่มเขียว (เงินเกม) ไม่แตะปุ่ม Robux · ยาที่ซื้อเข้า Backpack"})
 local PR = Tabs.Potion:Section({Side = "Right"})
