@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, autoPotion = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -99,7 +99,7 @@ local function loopEvery(name, period, limit, body)
 				done = true
 			end)
 			local t0 = os.clock()
-			while not done and alive() and os.clock() - t0 < limit do task.wait(0.2) end
+			while not done and alive() and os.clock() - t0 < limit do task.wait(0.05) end
 			if not done then
 				pcall(task.cancel, th)
 				st.wd = ("%s ค้างเกิน %d วิ → ตัดแล้วเริ่มใหม่ · %s"):format(name, limit, os.date("%H:%M:%S"))
@@ -248,9 +248,9 @@ local function fightBoss(b)
 	while alive() and os.clock() - t0 < 8 do
 		m = bossModel(b)
 		if m then break end
-		task.wait(0.25)
+		task.wait(0.1)
 	end
-	if not m then st.status = b.name .. " ไม่โผล่ (มีคนตีไปแล้ว?)"; task.wait(1); return end
+	if not m then st.status = b.name .. " ไม่โผล่ (มีคนตีไปแล้ว?)"; task.wait(0.2); return end
 	t0 = os.clock()
 	local h0 = m:FindFirstChildOfClass("Humanoid")
 	local hp0 = h0 and h0.Health
@@ -285,13 +285,15 @@ local function fightBoss(b)
 	if not m.Parent or m:GetAttribute("Dead") or m:GetAttribute("DeadLocal") then
 		st.kills += 1
 		st.lastKill = b.name .. " · " .. os.date("%H:%M:%S")
-		st.status = b.name .. " ตายแล้ว → รอแพ็คบินเข้ากระเป๋า"
-		task.wait(3)
+		-- no standing around (user 2026-11-22): the packs fly to the character wherever it goes and are claimed in the
+		-- lobby safe zone anyway, so go straight on to the next boss / the bench
+		st.status = b.name .. " ตายแล้ว → ไปต่อเลย"
+		task.wait(0.15)
 	end
 end
 
 -- ------------------------------------------------------------------ main loop: boss when one is up, bench otherwise
-loopEvery("Boss/Train", 0.3, 150, function()
+loopEvery("Boss/Train", 0.1, 150, function()
 	local why = busyHands()
 	if why then st.status = "พัก: " .. why; return end
 	if e.boss and #e.bosses > 0 then
@@ -401,6 +403,38 @@ loopEvery("Place Best", 10, 30, function()
 	if p and firePrompt(p) then st.placed += 1; st.lastPlace = os.date("%H:%M:%S") end
 end)
 
+-- Auto Buy Potion: the Potion Shop restocks every Potions.RestockSeconds (1800 s); CosmeticConfig.PotionShelf(Data, now)
+-- = current slot, PotionStock(userId, slot) = the cards on the shelf ({Type, Tier}), PotionLeft(Data, potion, slot) = how
+-- many are left. Buying is the green CASH button only: Remotes.BuyCosmetic:InvokeServer("Potion", typeId, tier) -- the
+-- purple Robux button (PurchasePrompt.PromptProduct) is never touched. Bought potions land in the Backpack.
+local CosmeticConfig = require(RS.Shared.Config.CosmeticConfig)
+loopEvery("Buy Potion", 5, 60, function()
+	if not e.autoPotion then return end
+	local d = D()
+	if not d or not CosmeticConfig.Potions.Selling then return end
+	local slot = CosmeticConfig.PotionShelf(d, workspace:GetServerTimeNow())
+	local shelf = CosmeticConfig.PotionStock(plr.UserId, slot) or {}
+	for _, potion in pairs(shelf) do
+		if not (alive() and e.autoPotion) then return end
+		local tier = potion.Tier
+		local price = tier and tier.Price
+		if price and price > 0 and potion.Type then
+			local left = CosmeticConfig.PotionLeft(D(), potion, slot) or 0
+			while left > 0 and alive() and e.autoPotion and not Big.lt(D().Cash, price) do
+				local ok, r1, r2 = pcall(function() return Remotes.BuyCosmetic:InvokeServer("Potion", potion.Type.Id, tier.Tier) end)
+				if not (ok and r1) then
+					st.lastPotion = ("ซื้อ %s %s ไม่ได้: %s"):format(potion.Type.Name, tier.Numeral, tostring(ok and r2 or r1):sub(1, 40))
+					return
+				end
+				st.potions = (st.potions or 0) + 1
+				st.lastPotion = ("%s %s ($%s) · %s"):format(potion.Type.Name, tier.Numeral, short(price), os.date("%H:%M:%S"))
+				task.wait(0.6)
+				left = CosmeticConfig.PotionLeft(D(), potion, slot) or 0
+			end
+		end
+	end
+end)
+
 -- anti-AFK (the game rejoins idle players after 900 s) + auto reconnect
 local VirtualUser = game:GetService("VirtualUser")
 local idleConn = plr.Idled:Connect(function()
@@ -474,6 +508,7 @@ L:Toggle({Name = "Auto Open Packs (เปิดแพ็คทั้งหมด
 L:Toggle({Name = "Auto Merge Card (รวมการ์ดซ้ำให้เลเวลขึ้น)", Default = e.merge, Callback = function(v) e.merge = v; sv() end}, "SSPMerge")
 L:Toggle({Name = "Auto Equip Best Card in Base (วางการ์ดดีสุดในฐาน)", Default = e.placeBest, Callback = function(v) e.placeBest = v; sv() end}, "SSPBest")
 L:Toggle({Name = "Auto Upgrade Train (อัปเบนช์ด้วยเงิน)", Default = e.upgradeTrain, Callback = function(v) e.upgradeTrain = v; sv() end}, "SSPUpTrain")
+L:Toggle({Name = "Auto Buy Potion (ซื้อยาในร้านด้วยเงินเกม ไม่ใช้ Robux)", Default = e.autoPotion, Callback = function(v) e.autoPotion = v; sv() end}, "SSPPotion")
 L:Toggle({Name = "Auto Rebirth (ถึงเลเวลที่ต้องการ → รีเบิร์ธ)", Default = e.rebirth, Callback = function(v) e.rebirth = v; sv() end}, "SSPRebirth")
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "SSPPause")
 
@@ -501,6 +536,7 @@ task.spawn(function()
 				("เปิดแพ็ค %d (ล่าสุด %s) · วางการ์ดดีสุด %d ครั้ง · อัปเบนช์ %d · รีเบิร์ธ %d"):format(st.opened, tostring(st.lastOpen or "-"), st.placed, st.upgrades, st.rebirths),
 				("เงิน $%s · Rebirth %s · %s"):format(short(d.Cash), tostring(d.Rebirths), tostring(st.reb or "-")),
 				tostring(st.bench or "-") .. " · รวมการ์ด: " .. tostring(st.lastMerge or "-"),
+				("ซื้อยา %d ขวด · ล่าสุด: %s"):format(st.potions or 0, tostring(st.lastPotion or "-")),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
 			}, "\n"))
