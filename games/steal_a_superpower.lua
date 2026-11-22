@@ -545,11 +545,25 @@ loopEvery("Boss/Train", 0.1, 150, function()
 		if want > 0 and (not e.waitAll or up >= want or st.sweeping) then
 			local b = pickBoss()
 			if b then
+				-- bank before the next boss when the carry is (nearly) full, mob farm on or not -- the packs of every boss
+				-- after that point were simply lost (user 2026-11-23: "การ์ดเต็มไม่ endrun", 23/23 mid-sweep)
+				local cap = tonumber(plr:GetAttribute("CarryCapacity")) or 0
+				if cap > 0 and carriedCount() >= math.max(1, cap - CARRY_SPARE) then
+					local keep = st.needBank
+					st.needBank = false
+					bankPacks()
+					st.needBank = keep and carriedCount() > 0
+					return
+				end
 				st.sweeping = true
 				return fightBoss(b)
 			end
 		end
 		st.sweeping = false
+	end
+	if st.needBank and carriedCount() > 0 and not e.mobFarm then
+		-- sweep done and no mob farm: end the run (the bench is in the safe zone, but Auto Train may be off)
+		if bankPacks() then return end
 	end
 	if e.mobFarm and #CAMPS > 0 then
 		farmStep()
