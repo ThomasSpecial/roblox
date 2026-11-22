@@ -37,7 +37,7 @@ local UIS = game:GetService("UserInputService")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("AmuletStreet/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
+local DEFAULTS = {haggle = true, dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -65,7 +65,7 @@ local stateAt = 0
 -- (user 2026-11-22: a self check said fake, the server said genuine). Saved, so a combination is only ever wrong once.
 e.learned = type(e.learned) == "table" and e.learned or {}
 local lastSelf   -- {key, said, model, feat, t}
-local dbg = {decisions = {}, verdicts = {}}
+local dbg = {decisions = {}, verdicts = {}, haggles = {}}
 getgenv().__AMSDBG = dbg
 dbg.e, dbg.st = e, st   -- read-only peek for debugging from the executor
 local function specKey(spec)
@@ -172,19 +172,84 @@ end
 
 -- ------------------------------------------------------------------ counter loop
 local lastAct, doneSince, doneFor = 0, nil, nil
+local sitAtCounter   -- set in the dig section (needs warp / lastMove); returns true when it just sat down
+local slowDown = 0   -- extra seconds per decision, raised when the server says "slow down", decays again
+-- Haggling (Act "haggle" {i, pct}): the game offers ShopConfig.Cases.Haggle (5/10/20 %) off the asking price while
+-- Cases.Unlocked; each customer has Patience hearts and a hidden floor (collector 88-95 % of the ask ... scammer 55-70 %).
+-- What a refusal costs isn't visible client-side, so the bot keeps the last heart: haggle only while Patience >= 2,
+-- biggest cut first on a deal it would take anyway, smallest cut that gets under the cap on one it would pass.
+local haggled = {}   -- [customerId .. "#" .. i] = {tried = {pct = true}, done = bool}
+local function haggleStep(C, row, gen, ask, cap)
+	if not e.haggle or not gen or not ask then return false end
+	local cases = S.Cases
+	if not (cases and cases.Unlocked) or C.Intent == "cert" or C.Intent == "pickup" then return false end
+	local hearts = tonumber(C.Patience)
+	if hearts and hearts < 2 then return false end
+	local key = tostring(C.Id) .. "#" .. tostring(row.i)
+	local h = haggled[key] or {tried = {}}
+	haggled[key] = h
+	if h.done then return false end
+	if not hearts and next(h.tried) then return false end   -- walk-ins show no hearts: one try only
+	local cuts = {}
+	for _, pct in ipairs(cases.Haggle or {5, 10, 20}) do if not h.tried[pct] then cuts[#cuts + 1] = pct end end
+	if #cuts == 0 then return false end
+	local pick
+	if ask <= cap then
+		table.sort(cuts, function(a, b) return a > b end); pick = cuts[1]
+	else
+		table.sort(cuts)
+		for _, pct in ipairs(cuts) do if math.floor(ask * (1 - pct / 100) / 10 + 0.5) * 10 <= cap then pick = pct; break end end
+		if not pick then return false end
+	end
+	h.tried[pick] = true
+	local stageKey = row.it.Stage == "post" and "PostAsk" or "Ask"
+	st.status = ("ต่อราคาองค์ที่ %s -%d%% (ขอ %s · ความอดทน %s)"):format(tostring(row.i), pick, money(ask), tostring(hearts or "-"))
+	local t0 = os.clock()
+	while alive() and e.counter and os.clock() - t0 < 0.3 + slowDown do task.wait(0.05) end
+	local ok, r1, r2 = pcall(Act.InvokeServer, Act, "haggle", {i = row.i, pct = pick})
+	lastAct = os.clock()
+	local t1 = os.clock()
+	local newAsk, newHearts = ask, hearts or -1
+	while alive() and os.clock() - t1 < 3 do
+		local C2 = S and S.Customer
+		local it2 = C2 and C2.Id == C.Id and C2.Items and C2.Items[row.i]
+		if not it2 then break end
+		newAsk, newHearts = tonumber(it2[stageKey]) or ask, tonumber(C2.Patience) or -1
+		if newAsk ~= ask or newHearts ~= (hearts or -1) then break end
+		task.wait(0.1)
+	end
+	local won = newAsk < ask
+	if won then h.done = true end
+	st.haggles = (st.haggles or 0) + 1
+	if won then st.haggleWon = (st.haggleWon or 0) + 1; st.saved = (st.saved or 0) + (ask - newAsk) end
+	table.insert(dbg.haggles, {at = os.date("%H:%M:%S"), pct = pick, ask = ask, newAsk = newAsk, hearts = hearts, newHearts = newHearts, ok = ok and r1, msg = ok and r2 or r1})
+	note(won and ("ต่อราคา -%d%% สำเร็จ: %s → %s"):format(pick, money(ask), money(newAsk))
+		or ("ต่อราคา -%d%% ไม่ยอม (ความอดทน %s → %s)%s"):format(pick, tostring(hearts or "-"), tostring(newHearts), (ok and r2) and (" · " .. tostring(r2)) or ""))
+	return true
+end
 local function counterStep()
 	if not S then st.status = "รอข้อมูลร้านจากเกม (เกมส่งมาเมื่อมีลูกค้า / ของเปลี่ยน)"; return end
 	local C = S.Customer
 	if not C or not C.Id then st.status = "รอลูกค้าที่เคาน์เตอร์"; doneSince = nil; return end
-	if plr:GetAttribute("CounterSeated") ~= true then st.status = "ลูกค้ารออยู่ แต่ยังไม่ได้นั่งที่เคาน์เตอร์ → ไปนั่งก่อน"; return end
+	if plr:GetAttribute("CounterSeated") ~= true then
+		if not e.dig and sitAtCounter and sitAtCounter() then st.status = "ลูกค้ารออยู่ → วาร์ปกลับไปนั่งเคาน์เตอร์"; return end
+		st.status = e.dig and "อยู่โหมดขุด → ลูกน้องหน้าร้านรับลูกค้าแทน" or "ลูกค้ารออยู่ แต่ยังไม่ได้นั่งที่เคาน์เตอร์ (คุณกำลังเดินเอง)"
+		return
+	end
 	local open = 0
 	for _, row in ipairs(itemsOf(C)) do
 		local it = row.it
 		if it.Stage ~= "done" then open += 1 end
 		local action, extra, why = decide(C, it)
+		if (action == "buy" or action == "buyPost" or action == "pass") and it.Stage ~= "return" then
+			local gen = isGenuine(it.Spec)
+			local ask = tonumber(it.Stage == "post" and it.PostAsk or it.Ask)
+			local cap = math.min(marketValue(it) * (tonumber(e.buyPct) or 80) / 100, tonumber(S.Cash) or 0)
+			if haggleStep(C, row, gen, ask, cap) then return end
+		end
 		if action then
-			-- look at it like a person would: 1.6-3.2 s per item, never faster than the game's "slow down" guard
-			local dt = 1.6 + math.random() * 1.6
+			-- short look per item (user 2026-11-22: "ช้าจัด"); the server answers "slow down" when pushed too hard -> slowDown
+			local dt = 0.3 + math.random() * 0.3 + slowDown
 			st.status = ("ลูกค้า%s · องค์ที่ %s %s: %s"):format(C.Intent == "pickup" and "มารับคืน" or "", tostring(row.i), short(modelName(it.Model), 22), why)
 			local t0 = os.clock()
 			while alive() and e.counter and os.clock() - t0 < dt do task.wait(0.1) end
@@ -193,7 +258,7 @@ local function counterStep()
 			local C2 = S and S.Customer
 			local it2 = C2 and C2.Id == C.Id and C2.Items and C2.Items[row.i]
 			if not it2 or it2.Stage ~= it.Stage then return end
-			local args = {i = row.i, dt = os.clock() - t0 + 0.4}
+			local args = {i = row.i, dt = os.clock() - t0 + 0.6}
 			for k, v in pairs(extra or {}) do args[k] = v end
 			if action == "self" then
 				lastSelf = {key = specKey(it.Spec), said = args.v, t = os.clock(), feat = HS:JSONEncode(it.Spec.Features or {})}
@@ -211,7 +276,9 @@ local function counterStep()
 				elseif action == "machine" then st.machine += 1
 				elseif action == "handBack" then st.handed += 1 end
 				note(("#%s %s · %s"):format(tostring(row.i), short(modelName(it.Model), 18), why))
+				slowDown = math.max(0, slowDown - 0.05)
 			else
+				if tostring(ok and r2 or r1) == "slow down" then slowDown = math.min(2, slowDown + 0.3) end
 				note(("#%s %s ไม่ผ่าน: %s"):format(tostring(row.i), action, tostring(ok and r2 or r1)))
 				if action == "self" then selfFailed[it.Model] = true end   -- next pass sends it to the machine instead
 				task.wait(1)
@@ -221,7 +288,7 @@ local function counterStep()
 	end
 	if open == 0 and e.dismiss then
 		if doneFor ~= C.Id then doneFor, doneSince = C.Id, os.clock() end
-		if os.clock() - doneSince > 6 and os.clock() - lastAct > 3 then
+		if os.clock() - doneSince > 2 and os.clock() - lastAct > 1 then
 			local ok, r1 = pcall(Act.InvokeServer, Act, "dismiss")
 			lastAct = os.clock()
 			if ok and r1 then note("ทุกองค์เสร็จแล้ว → ส่งลูกค้ากลับ") end
@@ -241,7 +308,7 @@ task.spawn(function()
 		else
 			st.status = "Auto Counter ปิดอยู่"
 		end
-		task.wait(0.4)
+		task.wait(0.1)
 	end
 end)
 
@@ -359,6 +426,23 @@ local function shovelJob()
 	repairWait = os.clock() + 60
 	return true
 end
+local lastSitTry = 0
+function sitAtCounter()
+	if os.clock() - lastMove < 3 or os.clock() - lastSitTry < 4 then return false end
+	lastSitTry = os.clock()
+	local plot = workspace.Plots:FindFirstChild("Plot" .. tostring(plr:GetAttribute("Plot")))
+	local chair = plot and plot:FindFirstChild("ShopScene") and plot.ShopScene:FindFirstChild("Counter") and plot.ShopScene.Counter:FindFirstChild("Chair")
+	local seat = chair and chair:FindFirstChild("Seat")
+	local sp = seat and seat:FindFirstChild("SitPrompt")
+	if not sp then return false end
+	standUp()
+	warp(seat.Position + Vector3.new(0, 3, 0))
+	task.wait(0.3)
+	pcall(fireproximityprompt, sp, 1, true)
+	local t0 = os.clock()
+	while os.clock() - t0 < 2 and plr:GetAttribute("CounterSeated") ~= true do task.wait(0.1) end
+	return true
+end
 local digSeat   -- true while dig mode moved us off the chair
 local function digStep()
 	local h, r = hum(), hrp()
@@ -380,7 +464,7 @@ local function digStep()
 	local away = (r.Position - mp) * Vector3.new(1, 0, 1)
 	away = away.Magnitude > 0.5 and away.Unit or Vector3.new(1, 0, 0)
 	local stand = mp + away * 3.5
-	if (r.Position - stand).Magnitude > 2 then warp(Vector3.new(stand.X, mp.Y + 3, stand.Z), mp); task.wait(0.35) end
+	if (r.Position - stand).Magnitude > 2 then warp(Vector3.new(stand.X, mp.Y + 3, stand.Z), mp); task.wait(0.15) end
 	local p = m:FindFirstChild("DigPrompt", true)
 	if not p or not p.Enabled then return end
 	local key, cfg, dur = shovel()
@@ -389,11 +473,11 @@ local function digStep()
 	local ok = pcall(function()
 		p:InputHoldBegin()
 		local t0 = os.clock()
-		while alive() and e.dig and os.clock() - t0 < p.HoldDuration + 0.25 do task.wait(0.05) end
+		while alive() and e.dig and os.clock() - t0 < p.HoldDuration + 0.1 do task.wait(0.03) end
 		p:InputHoldEnd()
 	end)
 	local t1 = os.clock()
-	while alive() and os.clock() - t1 < 3 and (S.Dig.Stats and S.Dig.Stats.Digs or 0) == digs0 do task.wait(0.1) end
+	while alive() and os.clock() - t1 < 1.5 and (S.Dig.Stats and S.Dig.Stats.Digs or 0) == digs0 do task.wait(0.05) end
 	if ok and (S.Dig.Stats and S.Dig.Stats.Digs or 0) > digs0 then st.digs = (st.digs or 0) + 1 end
 end
 local digFound = {}
@@ -412,15 +496,8 @@ task.spawn(function()
 		elseif digSeat then
 			-- dig switched off: go back and sit at the counter so Auto Counter can work again
 			digSeat = nil
-			pcall(function()
-				local plot = workspace.Plots:FindFirstChild("Plot" .. tostring(plr:GetAttribute("Plot")))
-				local seat = plot and plot:FindFirstChild("Seat", true)
-				local sp = seat and seat:FindFirstChild("SitPrompt")
-				if seat and sp then
-					warp(seat.Position + Vector3.new(0, 3, 0)); task.wait(0.6)
-					pcall(fireproximityprompt, sp, 1, true)
-				end
-			end)
+			lastSitTry = 0
+			pcall(sitAtCounter)
 			st.dig = "ปิดอยู่ (กลับไปนั่งเคาน์เตอร์แล้ว)"
 		else
 			st.dig = "ปิดอยู่"
@@ -529,6 +606,7 @@ L:Label({Text = "บอทรู้แท้ / เก๊แน่นอน (เ�
 L:Toggle({Name = "รับเช่าองค์แท้ที่ราคาคุ้ม", Default = e.buy, Callback = function(v) e.buy = v; sv() end}, "AMSBuy")
 L:Slider({Name = "└ รับเช่าเมื่อขอไม่เกิน % ของราคาตลาด", Minimum = 30, Maximum = 100, Default = tonumber(e.buyPct) or 80,
 	Precision = 0, DisplayMethod = "Round", Callback = function(v) e.buyPct = math.floor(v + 0.5); sv() end}, "AMSBuyPct")
+L:Toggle({Name = "ต่อราคาก่อนรับเช่า (เก็บความอดทนลูกค้าไว้ 1 ดวงเสมอ)", Default = e.haggle, Callback = function(v) e.haggle = v; sv() end}, "AMSHaggle")
 L:Toggle({Name = "ตรวจเองเมื่อมีสมุดรุ่นนั้น (ได้ค่าตรวจเต็ม แทนส่งเครื่องเสีย 70%)", Default = e.selfCert, Callback = function(v) e.selfCert = v; sv() end}, "AMSSelf")
 L:Toggle({Name = "ส่งลูกค้ากลับเมื่อทุกองค์เสร็จแล้ว", Default = e.dismiss, Callback = function(v) e.dismiss = v; sv() end}, "AMSDismiss")
 L:Header({Text = "ตัวช่วยดู"})
@@ -562,7 +640,7 @@ task.spawn(function()
 		pcall(function()
 			stLbl:UpdateName(table.concat({
 				st.status,
-				("รับเช่า %d องค์ (จ่าย %s) · ไม่เอา %d (เก๊ %d) · ตรวจเอง %d (พลาด %d) · ส่งเครื่อง %d · ส่งคืน %d"):format(st.bought, money(st.spent), st.passed,
+				("ต่อราคา %d ครั้ง สำเร็จ %d (ประหยัด %s)\n"):format(st.haggles or 0, st.haggleWon or 0, money(st.saved or 0)) .. ("รับเช่า %d องค์ (จ่าย %s) · ไม่เอา %d (เก๊ %d) · ตรวจเอง %d (พลาด %d) · ส่งเครื่อง %d · ส่งคืน %d"):format(st.bought, money(st.spent), st.passed,
 					st.fakesRejected, st.selfCerts, st.wrong or 0, st.machine, st.handed),
 				("เงินร้าน %s · ร้าน %s · ข้อมูลล่าสุด %s"):format(money(S and S.Cash or 0), tostring(S and S.StageName or "-"),
 					S and ("%d วิก่อน"):format(math.floor(os.clock() - stateAt)) or "ยังไม่มี"),
