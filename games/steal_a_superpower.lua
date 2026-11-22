@@ -40,7 +40,7 @@ local Big = require(RS.Shared.Util:WaitForChild("Big"))
 -- ------------------------------------------------------------------ settings
 local SF = ("StealSuperpower/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {boss = false, bosses = {}, waitAll = true, train = true, openPacks = false, rebirth = false, upgradeTrain = false, merge = false,
-	placeBest = false, autoPotion = false, pauseOnMove = true, antiAfk = true, reconnect = true}
+	placeBest = false, autoPotion = false, potionTypes = false, potionTiers = false, pauseOnMove = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -408,6 +408,11 @@ end)
 -- many are left. Buying is the green CASH button only: Remotes.BuyCosmetic:InvokeServer("Potion", typeId, tier) -- the
 -- purple Robux button (PurchasePrompt.PromptProduct) is never touched. Bought potions land in the Backpack.
 local CosmeticConfig = require(RS.Shared.Config.CosmeticConfig)
+-- only tiers with shop Weight > 0 ever show up on the shelf (I and II); III+ come from codes / packs
+local SHOP_TIERS = {}
+for _, t in ipairs(CosmeticConfig.Potions.Tiers or {}) do if (t.Weight or 0) > 0 and (t.Price or 0) > 0 then SHOP_TIERS[#SHOP_TIERS + 1] = t end end
+if type(e.potionTypes) ~= "table" then e.potionTypes = {}; for _, t in ipairs(CosmeticConfig.Potions.Types or {}) do table.insert(e.potionTypes, t.Id) end end
+if type(e.potionTiers) ~= "table" then e.potionTiers = {}; for _, t in ipairs(SHOP_TIERS) do table.insert(e.potionTiers, t.Tier) end end
 loopEvery("Buy Potion", 5, 60, function()
 	if not e.autoPotion then return end
 	local d = D()
@@ -418,7 +423,7 @@ loopEvery("Buy Potion", 5, 60, function()
 		if not (alive() and e.autoPotion) then return end
 		local tier = potion.Tier
 		local price = tier and tier.Price
-		if price and price > 0 and potion.Type then
+		if price and price > 0 and potion.Type and table.find(e.potionTypes, potion.Type.Id) and table.find(e.potionTiers, tier.Tier) then
 			local left = CosmeticConfig.PotionLeft(D(), potion, slot) or 0
 			while left > 0 and alive() and e.autoPotion and not Big.lt(D().Cash, price) do
 				local ok, r1, r2 = pcall(function() return Remotes.BuyCosmetic:InvokeServer("Potion", potion.Type.Id, tier.Tier) end)
@@ -473,6 +478,7 @@ getgenv().__SSPW = Win
 local TG = Win:TabGroup()
 local Tabs = {
 	Main = TG:Tab({Name = "Auto Farm", Image = "rbxassetid://10723346959"}),
+	Potion = TG:Tab({Name = "Potion", Image = "rbxassetid://10709769841"}),
 	Settings = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"}),
 }
 local function picked(v)
@@ -508,9 +514,42 @@ L:Toggle({Name = "Auto Open Packs (เปิดแพ็คทั้งหมด
 L:Toggle({Name = "Auto Merge Card (รวมการ์ดซ้ำให้เลเวลขึ้น)", Default = e.merge, Callback = function(v) e.merge = v; sv() end}, "SSPMerge")
 L:Toggle({Name = "Auto Equip Best Card in Base (วางการ์ดดีสุดในฐาน)", Default = e.placeBest, Callback = function(v) e.placeBest = v; sv() end}, "SSPBest")
 L:Toggle({Name = "Auto Upgrade Train (อัปเบนช์ด้วยเงิน)", Default = e.upgradeTrain, Callback = function(v) e.upgradeTrain = v; sv() end}, "SSPUpTrain")
-L:Toggle({Name = "Auto Buy Potion (ซื้อยาในร้านด้วยเงินเกม ไม่ใช้ Robux)", Default = e.autoPotion, Callback = function(v) e.autoPotion = v; sv() end}, "SSPPotion")
 L:Toggle({Name = "Auto Rebirth (ถึงเลเวลที่ต้องการ → รีเบิร์ธ)", Default = e.rebirth, Callback = function(v) e.rebirth = v; sv() end}, "SSPRebirth")
 L:Toggle({Name = "หยุดบอทตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "SSPPause")
+
+local PL = Tabs.Potion:Section({Side = "Left"})
+PL:Header({Text = "ร้านยา"})
+PL:Toggle({Name = "Auto Buy Potion (ซื้อด้วยเงินเกม ไม่ใช้ Robux)", Default = e.autoPotion, Callback = function(v) e.autoPotion = v; sv() end}, "SSPPotion")
+local typeOpts, typeByLabel, typeDef = {}, {}, {}
+for _, t in ipairs(CosmeticConfig.Potions.Types or {}) do
+	local label = tostring(t.Name)
+	typeOpts[#typeOpts + 1] = label
+	typeByLabel[label] = t.Id
+	if table.find(e.potionTypes, t.Id) then typeDef[#typeDef + 1] = label end
+end
+PL:Dropdown({Name = "ยาที่จะซื้อ (เลือกได้หลายอย่าง)", Multi = true, Required = false, Options = typeOpts, Default = typeDef,
+	Callback = function(v)
+		local ids = {}
+		for _, label in ipairs(picked(v)) do if typeByLabel[label] then ids[#ids + 1] = typeByLabel[label] end end
+		e.potionTypes = ids; sv()
+	end}, "SSPPotionTypes")
+local tierOpts, tierByLabel, tierDef = {}, {}, {}
+for _, t in ipairs(SHOP_TIERS) do
+	local label = ("%s · x%s · %d นาที · $%s"):format(t.Numeral, tostring(t.Multiplier), math.floor((t.Seconds or 0) / 60), short(t.Price))
+	tierOpts[#tierOpts + 1] = label
+	tierByLabel[label] = t.Tier
+	if table.find(e.potionTiers, t.Tier) then tierDef[#tierDef + 1] = label end
+end
+PL:Dropdown({Name = "ระดับยา (เลือกได้หลายระดับ)", Multi = true, Required = false, Options = tierOpts, Default = tierDef,
+	Callback = function(v)
+		local tiers = {}
+		for _, label in ipairs(picked(v)) do if tierByLabel[label] then tiers[#tiers + 1] = tierByLabel[label] end end
+		e.potionTiers = tiers; sv()
+	end}, "SSPPotionTiers")
+PL:Label({Text = "ร้านเปลี่ยนของทุก 30 นาที · เช็กทุก 5 วิ ซื้อทุกขวดที่ตรงกับที่เลือกและเงินพอ\nกดแค่ปุ่มเขียว (เงินเกม) ไม่แตะปุ่ม Robux · ยาที่ซื้อเข้า Backpack"})
+local PR = Tabs.Potion:Section({Side = "Right"})
+PR:Header({Text = "ในร้านตอนนี้"})
+local potLbl = PR:Label({Text = "-"})
 
 local R = Tabs.Main:Section({Side = "Right"})
 R:Header({Text = "สถานะ"})
@@ -536,7 +575,6 @@ task.spawn(function()
 				("เปิดแพ็ค %d (ล่าสุด %s) · วางการ์ดดีสุด %d ครั้ง · อัปเบนช์ %d · รีเบิร์ธ %d"):format(st.opened, tostring(st.lastOpen or "-"), st.placed, st.upgrades, st.rebirths),
 				("เงิน $%s · Rebirth %s · %s"):format(short(d.Cash), tostring(d.Rebirths), tostring(st.reb or "-")),
 				tostring(st.bench or "-") .. " · รวมการ์ด: " .. tostring(st.lastMerge or "-"),
-				("ซื้อยา %d ขวด · ล่าสุด: %s"):format(st.potions or 0, tostring(st.lastPotion or "-")),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
 			}, "\n"))
@@ -547,6 +585,17 @@ task.spawn(function()
 					or padState(b) == "alive" and "เกิดแล้ว" or "รอเกิด")
 				end
 			end
+			pcall(function()
+				local slot, ends = CosmeticConfig.PotionShelf(d, workspace:GetServerTimeNow())
+				local left = math.floor(math.max(0, (ends or 0) - workspace:GetServerTimeNow()))
+				local lines = {("ของใหม่ในอีก %d:%02d"):format(left // 60, left % 60)}
+				for _, p in pairs(CosmeticConfig.PotionStock(plr.UserId, slot) or {}) do
+					local want = table.find(e.potionTypes, p.Type.Id) and table.find(e.potionTiers, p.Tier.Tier)
+					lines[#lines + 1] = ("%s %s · เหลือ %d · $%s%s"):format(p.Type.Name, p.Tier.Numeral, CosmeticConfig.PotionLeft(d, p, slot) or 0, short(p.Tier.Price), want and "" or " (ไม่ได้เลือก)")
+				end
+				lines[#lines + 1] = ("ซื้อแล้ว %d ขวด · ล่าสุด: %s"):format(st.potions or 0, tostring(st.lastPotion or "-"))
+				potLbl:UpdateName(table.concat(lines, "\n"))
+			end)
 			bossLbl:UpdateName(st.boss .. "\n" .. (#lines > 0 and table.concat(lines, "\n") or "ยังไม่ได้เลือกบอส"))
 		end)
 		task.wait(0.5)
