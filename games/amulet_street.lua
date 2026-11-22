@@ -32,10 +32,12 @@ local Push = Remotes:WaitForChild("Push")
 local Lab = require(RS:WaitForChild("AmuletLab"))
 local SC = require(RS:WaitForChild("ShopConfig"))
 local Market = require(RS:WaitForChild("ShopMarket"))
+local DigConfig = require(RS:WaitForChild("DigConfig"))
+local UIS = game:GetService("UserInputService")
 
 -- ------------------------------------------------------------------ settings
 local SF = ("AmuletStreet/state_%d.json"):format(plr.UserId)
-local DEFAULTS = {counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
+local DEFAULTS = {dig = false, repair = true, woodFallback = true, pauseOnMove = true, counter = false, buyPct = 80, buy = true, selfCert = true, dismiss = true, overlay = true, antiAfk = true, reconnect = true}
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
 for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
@@ -59,10 +61,42 @@ end
 
 local S   -- latest pushed shop state
 local stateAt = 0
+-- learned[model|variant|proc] = genuine? -- the server's own verdict, kept when it disagreed with the feature rule
+-- (user 2026-11-22: a self check said fake, the server said genuine). Saved, so a combination is only ever wrong once.
+e.learned = type(e.learned) == "table" and e.learned or {}
+local lastSelf   -- {key, said, model, feat, t}
+local dbg = {decisions = {}, verdicts = {}}
+getgenv().__AMSDBG = dbg
+dbg.e, dbg.st = e, st   -- read-only peek for debugging from the executor
+local function specKey(spec)
+	local f = spec and spec.Features or {}
+	return ("%s|%s|%s"):format(tostring(spec and spec.Model), tostring(f.Variant), tostring(f.Proc))
+end
 local pushConn = Push.OnClientEvent:Connect(function(kind, data)
-	if kind == "state" and type(data) == "table" then S = data; stateAt = os.clock() end
+	if kind == "state" and type(data) == "table" then S = data; stateAt = os.clock(); return end
+	if kind == "verdict" and type(data) == "table" and lastSelf and os.clock() - lastSelf.t < 15 then
+		local rec = {key = lastSelf.key, said = lastSelf.said, right = data.Right, genuine = data.Genuine, feat = lastSelf.feat, at = os.date("%H:%M:%S")}
+		table.insert(dbg.verdicts, rec)
+		if data.Right == false and type(data.Genuine) == "boolean" then
+			e.learned[lastSelf.key] = data.Genuine
+			sv()
+			st.wrong = (st.wrong or 0) + 1
+			note(("ตรวจพลาด %s → จำไว้แล้ว ครั้งหน้าตอบ %s"):format(lastSelf.key, data.Genuine and "แท้" or "เก๊"))
+		end
+		lastSelf = nil
+	end
 end)
 
+-- fake meshes per model: Check.Fake ids ("G3_F2"); FakeDisabled ones (retired fakes) count as "unsure".
+-- Every model also ships a genuine alternate mesh "<Mesh>_F0" that is NOT a fake (user 2026-11-22: V3_F0 was certified
+-- as fake by the first rule, server said genuine) -- so only a listed fake id means fake, never "anything but the base mesh".
+local FAKE_MESH = {}
+for id, m in pairs(Lab.Models) do
+	FAKE_MESH[id] = {}
+	for _, c in ipairs(m.Checks or {}) do
+		if c.Fake then FAKE_MESH[id][c.Fake] = c.FakeDisabled and "retired" or "fake" end
+	end
+end
 local genuineCache = {}
 local function genuineFeatures(model)
 	if genuineCache[model] == nil then
@@ -74,12 +108,17 @@ end
 -- true / false, or nil when the model is unknown to this build
 local function isGenuine(spec)
 	if type(spec) ~= "table" then return nil end
+	local learnedVal = e.learned[specKey(spec)]
+	if learnedVal ~= nil then return learnedVal end
 	local g = genuineFeatures(spec.Model)
 	if not g then return nil end
 	local f = spec.Features or {}
 	if f.Proc ~= nil then return false end
-	for k, v in pairs(g) do if f[k] ~= nil and f[k] ~= v then return false end end
-	for k in pairs(f) do if g[k] == nil then return false end end
+	local mark = f.Variant ~= nil and FAKE_MESH[spec.Model] and FAKE_MESH[spec.Model][f.Variant]
+	if mark == "fake" then return false end
+	if mark == "retired" then return nil end
+	for k, v in pairs(g) do if k ~= "Variant" and f[k] ~= nil and f[k] ~= v then return false end end
+	for k in pairs(f) do if g[k] == nil then return nil end end
 	return true
 end
 local function marketValue(item)
@@ -117,7 +156,7 @@ local function decide(C, it)
 	local ask = tonumber(it.Ask)
 	if gen and e.buy and ask and ask <= cap then return "buy", nil, ("แท้ · ขอ %s ≤ %d%% ของตลาด %s → รับเช่า"):format(money(ask), e.buyPct, money(mv)) end
 	if C.Intent == "both" then return certify() end
-	if gen == nil then return nil, nil, "ไม่รู้จักรุ่นนี้ → ปล่อยให้เจ้าของตัดสิน" end
+	if gen == nil then return "pass", nil, "ไม่แน่ใจแท้ / เก๊ → ไม่เอา (ไม่เสี่ยง)" end
 	return "pass", nil, gen == false and "เก๊ → ไม่เอา" or (ask or 0) > cash and ("ขอ %s เงินไม่พอ → ไม่เอา"):format(money(ask or 0))
 		or ("ขอ %s แพงกว่า %d%% ของตลาด %s → ไม่เอา"):format(money(ask or 0), e.buyPct, money(mv))
 end
@@ -156,6 +195,11 @@ local function counterStep()
 			if not it2 or it2.Stage ~= it.Stage then return end
 			local args = {i = row.i, dt = os.clock() - t0 + 0.4}
 			for k, v in pairs(extra or {}) do args[k] = v end
+			if action == "self" then
+				lastSelf = {key = specKey(it.Spec), said = args.v, t = os.clock(), feat = HS:JSONEncode(it.Spec.Features or {})}
+			end
+			table.insert(dbg.decisions, {at = os.date("%H:%M:%S"), action = action, key = specKey(it.Spec), v = args.v, feat = HS:JSONEncode(it.Spec.Features or {})})
+			if #dbg.decisions > 60 then table.remove(dbg.decisions, 1) end
 			local ok, r1, r2 = pcall(Act.InvokeServer, Act, action, args)
 			lastAct = os.clock()
 			if ok and r1 then
@@ -198,6 +242,190 @@ task.spawn(function()
 			st.status = "Auto Counter ปิดอยู่"
 		end
 		task.wait(0.4)
+	end
+end)
+
+-- ------------------------------------------------------------------ auto dig + shovel repair
+-- Digging is a ProximityPrompt (Mound > DigPrompt, HoldDuration = shovel DigTime) that has to be HELD: InputHoldBegin,
+-- wait, InputHoldEnd -> the server rolls the find and pushes "digChest" (finds go to the safe by themselves), Dur - 1.
+-- fireproximityprompt does not count. Repair = Act("digRepair", shovelKey) within ~10 studs of DigUncle (server refuses
+-- from afar), price prorated by wear. User 2026-11-22: warping OK, dig nonstop (the clerk serves customers meanwhile).
+local FIELD_MIN, FIELD_MAX = DigConfig.Field.Min, DigConfig.Field.Max
+local UNCLE_AT = DigConfig.Uncle.Position
+local function hum() local c = plr.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+local function hrp() local c = plr.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local lastMove = 0
+local MOVE_KEYS = {}
+for _, k in ipairs({"W", "A", "S", "D", "Up", "Down", "Left", "Right", "Space"}) do MOVE_KEYS[Enum.KeyCode[k]] = true end
+task.spawn(function()
+	while alive() do
+		if not UIS:GetFocusedTextBox() then
+			for k in pairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then lastMove = os.clock() break end end
+		end
+		task.wait(0.1)
+	end
+end)
+local function standUp()
+	local h = hum()
+	if h and h.Sit then h.Sit = false; h.Jump = true; task.wait(0.5) end
+end
+local function warp(pos, lookAt)
+	local r = hrp()
+	if not r then return false end
+	r.AssemblyLinearVelocity = Vector3.zero
+	r.CFrame = lookAt and CFrame.lookAt(pos, Vector3.new(lookAt.X, pos.Y, lookAt.Z)) or CFrame.new(pos)
+	return true
+end
+local function inField(pos)
+	return pos.X >= FIELD_MIN.X - 2 and pos.X <= FIELD_MAX.X + 2 and pos.Z >= FIELD_MIN.Z - 2 and pos.Z <= FIELD_MAX.Z + 2 and pos.Y > -3 and pos.Y < 8
+end
+local function nearestMound()
+	local r = hrp()
+	local f = workspace:FindFirstChild("DigMounds")
+	if not r or not f then return nil end
+	local best, bd
+	for _, m in ipairs(f:GetChildren()) do
+		local p = m:FindFirstChild("DigPrompt", true)
+		local ok, pos = pcall(function() return m:GetPivot().Position end)
+		if ok and p and p.Enabled and inField(pos) then
+			local d = (pos - r.Position).Magnitude
+			if not bd or d < bd then best, bd = m, d end
+		end
+	end
+	return best
+end
+local function shovel()
+	local d = S and S.Dig or {}
+	local key = d.Equip or "wood"
+	local cfg = DigConfig.ByKey[key] or {}
+	local dur = d.Dur and d.Dur[key]
+	return key, cfg, tonumber(dur), d
+end
+local function repairCost(key, dur)
+	local cfg = DigConfig.ByKey[key]
+	if not cfg or not cfg.Dur or not cfg.Repair or cfg.Repair <= 0 then return 0 end
+	return math.ceil(cfg.Repair * (1 - math.clamp((dur or 0) / cfg.Dur, 0, 1)) / 10) * 10
+end
+local function atUncle(action, arg)
+	standUp()
+	warp(UNCLE_AT + Vector3.new(-5, 3, 0), UNCLE_AT)
+	task.wait(0.6)
+	local ok, r1, r2 = pcall(Act.InvokeServer, Act, action, arg)
+	return ok and r1 == true, ok and r2 or r1
+end
+local repairWait = 0
+local function shovelJob()
+	local key, cfg, dur, d = shovel()
+	-- back from the wooden stand-in once the real shovel can be paid for
+	if key == "wood" and e.mainShovel and e.mainShovel ~= "wood" and d.Own and d.Own[e.mainShovel] and os.clock() > repairWait then
+		local mdur = d.Dur and tonumber(d.Dur[e.mainShovel]) or 0
+		local cost = repairCost(e.mainShovel, mdur)
+		if (tonumber(S.Cash) or 0) >= cost then
+			if cost > 0 then
+				local ok, msg = atUncle("digRepair", e.mainShovel)
+				if not ok then repairWait = os.clock() + 60; st.dig = "ซ่อม " .. e.mainShovel .. " ไม่ผ่าน: " .. tostring(msg); return true end
+				st.repairs = (st.repairs or 0) + 1
+			end
+			local ok, msg = atUncle("digEquip", e.mainShovel)
+			note(ok and ("ซ่อม + ใส่%s คืนแล้ว (%s)"):format(DigConfig.ByKey[e.mainShovel].Name, money(cost)) or ("ใส่พลั่วคืนไม่ผ่าน: " .. tostring(msg)))
+			if ok then e.mainShovel = nil; sv() else repairWait = os.clock() + 60 end
+			return true
+		end
+	end
+	if not dur or dur < 0 or dur > 0 then return false end   -- wood = -1 (never wears), or still has uses
+	if not e.repair then st.dig = "พลั่วพัง (ปิดซ่อมอัตโนมัติไว้)"; return true end
+	if os.clock() < repairWait then st.dig = ("พลั่วพัง · ซ่อมไม่ผ่าน รอลองใหม่ %d วิ"):format(math.ceil(repairWait - os.clock())); return true end
+	local cost = repairCost(key, dur)
+	st.dig = ("%s พัง → ไปหาลุงซ่อม (%s)"):format(tostring(cfg.Name or key), money(cost))
+	if (tonumber(S.Cash) or 0) >= cost then
+		local ok, msg = atUncle("digRepair", key)
+		if ok then
+			st.repairs = (st.repairs or 0) + 1
+			note(("ซ่อม%s แล้ว (%s)"):format(tostring(cfg.Name or key), money(cost)))
+			return true
+		end
+		st.dig = "ซ่อมไม่ผ่าน: " .. tostring(msg)
+	else
+		st.dig = ("พลั่วพัง · เงินไม่พอซ่อม (ต้องใช้ %s)"):format(money(cost))
+	end
+	if e.woodFallback and d.Own and d.Own.wood then
+		local ok = atUncle("digEquip", "wood")
+		if ok then
+			e.mainShovel = key; sv()
+			note("เงินไม่พอซ่อม → ใช้พลั่วไม้ขุดไปก่อน (ไม่มีวันพัง) เงินพอแล้วจะกลับมาซ่อม")
+			return true
+		end
+	end
+	repairWait = os.clock() + 60
+	return true
+end
+local digSeat   -- true while dig mode moved us off the chair
+local function digStep()
+	local h, r = hum(), hrp()
+	if not h or not r or h.Health <= 0 then st.dig = "รอตัวละครเกิด"; return end
+	if e.pauseOnMove and os.clock() - lastMove < 3 then st.dig = "พัก: คุณกำลังเดินเอง"; return end
+	if not S or not S.Dig then st.dig = "รอข้อมูลร้านจากเกม"; return end
+	if shovelJob() then return end
+	local m = nearestMound()
+	if not m then
+		standUp()
+		if not inField(r.Position) then warp(Vector3.new((FIELD_MIN.X + FIELD_MAX.X) / 2, 4, (FIELD_MIN.Z + FIELD_MAX.Z) / 2)) end
+		st.dig = "ไม่มีเนินดินในลาน รอเกิด (ต้นชั่วโมงเกิดเยอะ)"
+		task.wait(1)
+		return
+	end
+	standUp()
+	digSeat = true
+	local mp = m:GetPivot().Position
+	local away = (r.Position - mp) * Vector3.new(1, 0, 1)
+	away = away.Magnitude > 0.5 and away.Unit or Vector3.new(1, 0, 0)
+	local stand = mp + away * 3.5
+	if (r.Position - stand).Magnitude > 2 then warp(Vector3.new(stand.X, mp.Y + 3, stand.Z), mp); task.wait(0.35) end
+	local p = m:FindFirstChild("DigPrompt", true)
+	if not p or not p.Enabled then return end
+	local key, cfg, dur = shovel()
+	local digs0 = S.Dig.Stats and S.Dig.Stats.Digs or 0
+	st.dig = ("ขุดเนินดิน · %s %s"):format(tostring(cfg.Name or key), dur and dur >= 0 and ("(เหลือ %d/%d)"):format(dur, cfg.Dur or 0) or "")
+	local ok = pcall(function()
+		p:InputHoldBegin()
+		local t0 = os.clock()
+		while alive() and e.dig and os.clock() - t0 < p.HoldDuration + 0.25 do task.wait(0.05) end
+		p:InputHoldEnd()
+	end)
+	local t1 = os.clock()
+	while alive() and os.clock() - t1 < 3 and (S.Dig.Stats and S.Dig.Stats.Digs or 0) == digs0 do task.wait(0.1) end
+	if ok and (S.Dig.Stats and S.Dig.Stats.Digs or 0) > digs0 then st.digs = (st.digs or 0) + 1 end
+end
+local digFound = {}
+local digConn = Push.OnClientEvent:Connect(function(kind, data)
+	if kind == "digChest" and type(data) == "table" and e.dig then
+		local what = data.Kind == "broken" and "เศษพระชำรุด" or data.Kind == "dirt" and "พระดินชาวบ้าน" or tostring(data.Name or "?")
+		table.insert(digFound, 1, os.date("%H:%M ") .. short(what, 26) .. (data.Raw and (" · สภาพ " .. tostring(data.Condition)) or ""))
+		if #digFound > 5 then table.remove(digFound) end
+	end
+end)
+task.spawn(function()
+	while alive() do
+		if e.dig then
+			local ok, err = pcall(digStep)
+			if not ok then st.err = os.date("%H:%M:%S ") .. tostring(err) end
+		elseif digSeat then
+			-- dig switched off: go back and sit at the counter so Auto Counter can work again
+			digSeat = nil
+			pcall(function()
+				local plot = workspace.Plots:FindFirstChild("Plot" .. tostring(plr:GetAttribute("Plot")))
+				local seat = plot and plot:FindFirstChild("Seat", true)
+				local sp = seat and seat:FindFirstChild("SitPrompt")
+				if seat and sp then
+					warp(seat.Position + Vector3.new(0, 3, 0)); task.wait(0.6)
+					pcall(fireproximityprompt, sp, 1, true)
+				end
+			end)
+			st.dig = "ปิดอยู่ (กลับไปนั่งเคาน์เตอร์แล้ว)"
+		else
+			st.dig = "ปิดอยู่"
+		end
+		task.wait(0.15)
 	end
 end)
 
@@ -306,9 +534,18 @@ L:Toggle({Name = "ส่งลูกค้ากลับเมื่อทุ�
 L:Header({Text = "ตัวช่วยดู"})
 L:Toggle({Name = "ป้ายบอก แท้ / เก๊ + ราคาตลาด บนจอ", Default = e.overlay, Callback = function(v) e.overlay = v; sv() end}, "AMSOverlay")
 
+L:Header({Text = "ขุดพระ"})
+L:Toggle({Name = "Auto Dig (วาร์ปไปลานขุด ขุดเนินดินไม่หยุด)", Default = e.dig, Callback = function(v) e.dig = v; sv() end}, "AMSDig")
+L:Toggle({Name = "└ พลั่วพัง → วาร์ปไปหาลุงซ่อมให้", Default = e.repair, Callback = function(v) e.repair = v; sv() end}, "AMSRepair")
+L:Toggle({Name = "└ เงินไม่พอซ่อม → ใช้พลั่วไม้ขุดไปก่อน", Default = e.woodFallback, Callback = function(v) e.woodFallback = v; sv() end}, "AMSWood")
+L:Toggle({Name = "หยุดบอทขุดตอนฉันกดเดินเอง", Default = e.pauseOnMove, Callback = function(v) e.pauseOnMove = v; sv() end}, "AMSPause")
+L:Label({Text = "ระหว่างขุด ลูกน้องหน้าร้านรับลูกค้าแทน · ของที่ขุดได้เข้าตู้เซฟเอง\nปิด Auto Dig → วาร์ปกลับไปนั่งเคาน์เตอร์ให้"})
+
 local R = Tabs.Main:Section({Side = "Right"})
 R:Header({Text = "สถานะ"})
 local stLbl = R:Label({Text = "-"})
+R:Header({Text = "ขุดพระ"})
+local digLbl = R:Label({Text = "-"})
 R:Header({Text = "ล่าสุด"})
 local logLbl = R:Label({Text = "-"})
 
@@ -325,14 +562,21 @@ task.spawn(function()
 		pcall(function()
 			stLbl:UpdateName(table.concat({
 				st.status,
-				("รับเช่า %d องค์ (จ่าย %s) · ไม่เอา %d (เก๊ %d) · ตรวจเอง %d · ส่งเครื่อง %d · ส่งคืน %d"):format(st.bought, money(st.spent), st.passed,
-					st.fakesRejected, st.selfCerts, st.machine, st.handed),
+				("รับเช่า %d องค์ (จ่าย %s) · ไม่เอา %d (เก๊ %d) · ตรวจเอง %d (พลาด %d) · ส่งเครื่อง %d · ส่งคืน %d"):format(st.bought, money(st.spent), st.passed,
+					st.fakesRejected, st.selfCerts, st.wrong or 0, st.machine, st.handed),
 				("เงินร้าน %s · ร้าน %s · ข้อมูลล่าสุด %s"):format(money(S and S.Cash or 0), tostring(S and S.StageName or "-"),
 					S and ("%d วิก่อน"):format(math.floor(os.clock() - stateAt)) or "ยังไม่มี"),
 				"Watchdog: " .. st.wd,
 				"Error: " .. st.err,
 			}, "\n"))
 			logLbl:UpdateName(#st.log > 0 and table.concat(st.log, "\n") or "-")
+			local key, cfg, dur, d = shovel()
+			digLbl:UpdateName(table.concat({
+				tostring(st.dig or "-"),
+				("ขุดรอบนี้ %d · ซ่อม %d ครั้ง · %s %s · ขุดทั้งหมด %s"):format(st.digs or 0, st.repairs or 0, tostring(cfg.Name or key),
+					dur and dur >= 0 and ("%d/%d"):format(dur, cfg.Dur or 0) or "ไม่พัง", tostring(d.Stats and d.Stats.Digs or "-")),
+				#digFound > 0 and ("เจอล่าสุด: " .. table.concat(digFound, " · ")) or "เจอล่าสุด: -",
+			}, "\n"))
 		end)
 		task.wait(0.5)
 	end
@@ -340,7 +584,7 @@ end)
 
 task.spawn(function()
 	while alive() do task.wait(1) end
-	for _, c in ipairs({pushConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs({pushConn, digConn, idleConn, errConn}) do pcall(function() c:Disconnect() end) end
 	pcall(function() gui:Destroy() end)
 end)
 pcall(function()
