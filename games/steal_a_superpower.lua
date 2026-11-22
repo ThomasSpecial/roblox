@@ -241,26 +241,41 @@ local function ensureAutoAttack()
 	if ok and not on then pcall(SettingsCtl.Set, "AutoAttack", true) end
 end
 
--- God Mode: enemies are simulated on this client and every hit on me is computed here (LocalEnemyAbilities.hurt /
--- u112.Stun) and then REPORTED by the client: Remotes.EnemyHurtMe:FireServer(padId, "Hit", dmg, seq) / (padId, "Stun", s).
--- Dropping those reports = the server never applies the damage or the stun (user 2026-11-22: Empyrean Boss Lv 450 kills
--- the character). One __namecall hook per game session; getgenv().__SSPGOD (set from e.godMode while this build is
--- alive) decides whether it drops, so unloading / switching off restores normal damage at once.
-local HurtMe = Remotes:WaitForChild("EnemyHurtMe")
-if not getgenv().__SSPGODHOOK and hookmetamethod and getnamecallmethod then
-	getgenv().__SSPGODHOOK = true
-	local old
-	old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-		if getgenv().__SSPGOD and self == HurtMe and getnamecallmethod() == "FireServer" then
-			getgenv().__SSPGODN = (getgenv().__SSPGODN or 0) + 1
-			return nil
+-- God Mode: enemies are simulated on this client and every hit on me is computed here and then REPORTED by the client
+-- (LocalEnemyAbilities' local hurt() -> Remotes.EnemyHurtMe "Hit", stunMe() -> "Stun"). Those two Lua functions are
+-- hooked directly (hookfunction), NOT through a game-wide __namecall hook: a namecall hook routes every method call the
+-- game makes through executor code, and the executor then blacklists the game's own Robux purchase prompts ("This
+-- function has been disabled/blacklisted for security reasons" -- user 2026-11-23 couldn't buy with Robux).
+-- Installed once per session; getgenv().__SSPGOD3 (mirrors e.godMode) decides whether a hit is swallowed.
+if not getgenv().__SSPGODHOOK3 and hookfunction and getgc then
+	local hurtF, stunF
+	for _, f in ipairs(getgc(false)) do
+		if type(f) == "function" and islclosure(f) then
+			local ok, src = pcall(debug.info, f, "s")
+			-- compare the tail: a plain string.find on this source returned nothing in this executor
+			if ok and type(src) == "string" and src:sub(-19) == "LocalEnemyAbilities" then
+				local n = debug.info(f, "n")
+				if n == "hurt" then hurtF = f elseif n == "stunMe" then stunF = f end
+			end
 		end
-		return old(self, ...)
-	end))
+	end
+	if hurtF and stunF then
+		getgenv().__SSPGODHOOK3 = true
+		local oldHurt, oldStun
+		oldHurt = hookfunction(hurtF, function(...)
+			if getgenv().__SSPGOD3 then getgenv().__SSPGODN = (getgenv().__SSPGODN or 0) + 1; return end
+			return oldHurt(...)
+		end)
+		oldStun = hookfunction(stunF, function(...)
+			if getgenv().__SSPGOD3 then return false, 0 end
+			return oldStun(...)
+		end)
+	end
 end
+getgenv().__SSPGOD = false   -- the old namecall version's flag (sessions that still carry it stop dropping reports)
 task.spawn(function()
-	while alive() do getgenv().__SSPGOD = e.godMode == true; task.wait(0.2) end
-	getgenv().__SSPGOD = false
+	while alive() do getgenv().__SSPGOD3 = e.godMode == true; task.wait(0.2) end
+	getgenv().__SSPGOD3 = false
 end)
 
 -- Auto Skill: the game's own Auto Attack only fires the primary (M1). The E / F skills go through AbilityController's
@@ -291,36 +306,44 @@ end
 -- Attacks through buildings: the hero combat code (Shared.Combat.BasicHeroCombat & co.) casts a ray from the character
 -- along the attack (RespectCanCollide, Exclude = {character, workspace.Enemies, ...}) and cuts the attack's reach at the
 -- first wall it meets (`Distance = hit.Distance`) -- so a boss behind a pillar / house never gets hit (user 2026-11-22).
--- While getgenv().__SSPPIERCE is set, those sideways combat rays report "no wall". Recognised by the calling function's
--- source (debug.info level 3 = a Shared.Combat.* module); up/down rays (floor, ceiling checks) are left alone.
--- The __namecall hook is installed once per game session and only calls getgenv().__SSPPIERCEFN, so every reload of
--- this script swaps in its current rule (a hook body can't be replaced). v1 of this hook used __SSPPIERCE; that flag is
--- forced off so a session still carrying it stops piercing.
-getgenv().__SSPPIERCE = false
-getgenv().__SSPPIERCEFN = function(src, dir, params)
-	return type(src) == "string" and src:find("Shared.Combat.", 1, true) ~= nil
-		and typeof(dir) == "Vector3" and math.abs(dir.Y) < dir.Magnitude * 0.5
-		and typeof(params) == "RaycastParams" and params.RespectCanCollide and params.FilterType == Enum.RaycastFilterType.Exclude
-end
-if not getgenv().__SSPPIERCEHOOK2 and hookmetamethod and getnamecallmethod then
-	getgenv().__SSPPIERCEHOOK2 = true
-	local old
-	old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-		if getgenv().__SSPPIERCE2 and self == workspace and not checkcaller() and getnamecallmethod() == "Raycast" then
-			local ok, src = pcall(debug.info, 3, "s")   -- 2 = this [C] call, 3 = the Lua function that cast the ray
-			local f = getgenv().__SSPPIERCEFN
+-- Those sideways combat rays (caller source = a Shared.Combat.* module, debug.info level 3) report "no wall".
+-- workspace:Raycast is a method call, so this one needs a __namecall hook -- which also makes the executor block the
+-- game's Robux purchase prompts. So the hook exists ONLY while the toggle is on: switching it off (or unloading the
+-- script) restores the previous __namecall, and Robux purchases work again.
+getgenv().__SSPPIERCE, getgenv().__SSPPIERCE2 = false, false   -- older builds' flags (their hooks pass everything through)
+local function pierceInstall()
+	local G = getgenv()
+	if G.__SSPPIERCE3 or not (hookmetamethod and getnamecallmethod) then return end
+	local orig
+	orig = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		if self == workspace and not checkcaller() and getnamecallmethod() == "Raycast" then
 			local _, dir, params = ...
-			if ok and f and f(src, dir, params) then
-				getgenv().__SSPPIERCEN = (getgenv().__SSPPIERCEN or 0) + 1
-				return nil
+			if typeof(dir) == "Vector3" and math.abs(dir.Y) < dir.Magnitude * 0.5 and typeof(params) == "RaycastParams"
+				and params.RespectCanCollide and params.FilterType == Enum.RaycastFilterType.Exclude then
+				local ok, src = pcall(debug.info, 3, "s")   -- 2 = this [C] call, 3 = the Lua function that cast the ray
+				if ok and type(src) == "string" and src:find("Shared.Combat.", 1, true) then
+					G.__SSPPIERCEN = (G.__SSPPIERCEN or 0) + 1
+					return nil
+				end
 			end
 		end
-		return old(self, ...)
+		return orig(self, ...)
 	end))
+	G.__SSPPIERCE3 = orig
+end
+local function pierceRemove()
+	local G = getgenv()
+	local orig = G.__SSPPIERCE3
+	if not orig then return end
+	G.__SSPPIERCE3 = nil
+	pcall(hookmetamethod, game, "__namecall", orig)
 end
 task.spawn(function()
-	while alive() do getgenv().__SSPPIERCE2 = e.pierce == true; task.wait(0.2) end
-	getgenv().__SSPPIERCE2 = false
+	while alive() do
+		if e.pierce then pierceInstall() else pierceRemove() end
+		task.wait(0.3)
+	end
+	pierceRemove()
 end)
 local lastSkill = 0
 local function castSkills(target)
@@ -858,7 +881,7 @@ task.spawn(function()
 end)
 L:Toggle({Name = "└ รอบอสที่เลือกเกิดครบทุกตัวก่อน แล้วไล่ตีรวดเดียว", Default = e.waitAll, Callback = function(v) e.waitAll = v; sv() end}, "SSPWaitAll")
 L:Toggle({Name = "└ Auto Skill (กดสกิล E / F ใส่บอสเมื่อพร้อม)", Default = e.autoSkill, Callback = function(v) e.autoSkill = v; sv() end}, "SSPSkill")
-L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้าง (กำแพง / ตึก ไม่บังท่า)", Default = e.pierce, Callback = function(v) e.pierce = v; sv() end}, "SSPPierce")
+L:Toggle({Name = "└ โจมตีทะลุสิ่งก่อสร้าง (ปิดก่อนซื้อของด้วย Robux)", Default = e.pierce, Callback = function(v) e.pierce = v; sv() end}, "SSPPierce")
 L:Toggle({Name = "God Mode (ศัตรู / บอสตีไม่เข้า ไม่โดนสตัน)", Default = e.godMode, Callback = function(v) e.godMode = v; sv() end}, "SSPGod")
 L:Toggle({Name = "Auto Train (ไม่มีบอส → กลับไปยกเวทที่เบนช์)", Default = e.train, Callback = function(v) e.train = v; sv() end}, "SSPTrain")
 L:Label({Text = "บอสที่เลือกตัวไหนเกิด (ตัวแรงสุดก่อน) → ลุกจากเบนช์ วาร์ปไปตี (ใช้ Auto Attack ของเกม)\nตายแล้วแพ็คบินเข้ากระเป๋า → กลับเบนช์ (อยู่ในโซนปลอดภัย แพ็คเข้าบัญชีเอง) → บอสเกิดใหม่ไปตีอีก"})
