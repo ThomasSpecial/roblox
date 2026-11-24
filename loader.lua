@@ -100,6 +100,7 @@ local PLACE_SCRIPTS = {
     [138764196978213] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/steal_a_superpower.lua", -- Steal a Superpower! World 4
     [116750055341696] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/amulet_street.lua",      -- ถนนพระเครื่อง (Amulet Street)
     [119101118479978] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/depth_incremental.lua",  -- [CLANS] Depth Incremental
+    [124032631078772] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/poly_loot.lua",          -- [DRAGON] Poly Loot
     -- Battle Royale universe: the match server and the Killstreak mode share one script
     [108448382032231] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Battle Royale (chest + player ESP)
     [104856666707760] = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/games/battle_royale.lua",   -- Killstreak Battle Royale
