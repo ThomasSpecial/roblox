@@ -13,7 +13,7 @@
 --   Mob attacks show "AttackBoxTelegraph" parts (CollectionService tag) before they land -> leave the box.
 --   Anti-cheat: Movement_Client.MovementPathReporter streams the root position to the server every 0.2 s.
 --     Short hops (< ~45 studs) passed; tweening 28-45 studs/s through town was snapped back 110-160 studs and
---     then reset to spawn; 60 studs/s killed the character. Walk (Humanoid:MoveTo + Pathfinding) is the default.
+--     then reset to spawn; 60 studs/s killed the character. Walk (Humanoid:Move every frame + Pathfinding) is the default.
 
 getgenv().__PLOOT = (getgenv().__PLOOT or 0) + 1
 local G = getgenv().__PLOOT
@@ -46,7 +46,8 @@ local DEFAULTS = {
 	skill = true, skillMode = "ใช้ทันทีที่คูลดาวน์หมด", healAt = 60,
 	retreat = true, retreatAt = 35, resumeAt = 80, antiAfk = true, equip = true,
 	loot = true, lootAlways = false, lootRadius = 80,
-	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20,
+	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 10,
+	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 }
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -54,6 +55,7 @@ for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
 if type(e.mobs) ~= "table" then e.mobs = {} end
 if type(e.sellRar) ~= "table" then e.sellRar = {} end
 if type(e.disRar) ~= "table" then e.disRar = {} end
+if type(e.statW) ~= "table" then e.statW = {Damage = 0, Health = 0, Defense = 0} end
 local function sv()
 	pcall(function()
 		if makefolder and not isfolder("PolyLoot") then makefolder("PolyLoot") end
@@ -140,7 +142,19 @@ local function pickTarget(hrp)
 end
 
 -- ------------------------------------------------------------------ movement
-local mover = {goal = nil, mode = nil}   -- tween/teleport goals are applied on Heartbeat; walk uses MoveTo
+-- tween/teleport goals are applied on Heartbeat; walk = Humanoid:Move(dir) every frame, like holding W: the game's
+-- Movement_Client.Animate reads Humanoid.MoveDirection, which MoveTo() leaves at zero (legs slid without stepping)
+local mover = {goal = nil, mode = nil, walk = nil}
+-- the PlayerModule's ControlModule calls Humanoid:Move(zero) every frame while no key is held -> switch it off while
+-- the script walks, give it back when farming stops
+local Controls
+pcall(function() Controls = require(plr.PlayerScripts:WaitForChild("PlayerModule", 5)):GetControls() end)
+local controlsOff = false
+local function setControls(on)
+	if not Controls or controlsOff == not on then return end
+	controlsOff = not on
+	pcall(function() if on then Controls:Enable() else Controls:Disable() end end)
+end
 local path = {goal = nil, wps = nil, i = 0, at = 0}
 local lastPosSkip = false   -- our own unstuck hop: don't count it as a server snap-back
 
@@ -148,11 +162,20 @@ local lastPosSkip = false   -- our own unstuck hop: don't count it as a server s
 local stuck = {at = 0, pos = nil, n = 0}
 local wallParams = RaycastParams.new()
 wallParams.FilterType = Enum.RaycastFilterType.Exclude
+-- a fat sweep at knee, waist and head height: a single thin ray slipped between fence rails and walked us into them
 local function blocked(c, from, to)
 	wallParams.FilterDescendantsInstances = {c, AnimalLive}
 	local dir = flat(to - from)
 	if dir.Magnitude < 1 then return false end
-	return workspace:Raycast(from, dir, wallParams) ~= nil
+	local hum = c:FindFirstChildOfClass("Humanoid")
+	local hrp = c:FindFirstChild("HumanoidRootPart")
+	local feetY = from.Y - (hrp and hrp.Size.Y / 2 or 1) - (hum and hum.HipHeight or 2)
+	for _, y in ipairs({feetY + 1.3, from.Y, from.Y + 1.5}) do
+		local o = Vector3.new(from.X, y, from.Z)
+		local ok, hit = pcall(function() return workspace:Spherecast(o, 1.1, dir, wallParams) end)
+		if ok and hit and hit.Normal.Y < 0.7 then return true end
+	end
+	return false
 end
 local function computePath(hrp, goal)
 	path.goal, path.at, path.wps, path.i = goal, os.clock(), nil, 2
@@ -168,8 +191,9 @@ local function computePath(hrp, goal)
 end
 local function walkTo(hrp, hum, goal)
 	local c = hrp.Parent
-	-- straight line when nothing is in the way, else Pathfinding (recomputed only when the goal moves or we get stuck)
-	local direct = flat(goal - hrp.Position).Magnitude < 30 and not blocked(c, hrp.Position, goal)
+	-- straight line when nothing is in the way, else Pathfinding (recomputed only when the goal moves or we get stuck);
+	-- after getting stuck the straight line is not trusted for a few seconds
+	local direct = os.clock() > (stuck.pathOnly or 0) and flat(goal - hrp.Position).Magnitude < 30 and not blocked(c, hrp.Position, goal)
 	if direct then
 		path.wps = nil
 	elseif not path.wps or (path.goal - goal).Magnitude > 8 then
@@ -189,28 +213,33 @@ local function walkTo(hrp, hum, goal)
 			path.wps = nil
 		end
 	end
-	hum:MoveTo(target)
+	mover.walk = target
 
-	-- unstuck: jump -> new path -> short hop (hops under ~10 studs pass the server's position check)
+	-- unstuck, judged by progress toward the goal (sliding along a fence moves us but gets us nowhere):
+	-- 1) jump + Pathfinding only  2) path with a thinner agent  3+) short hop toward the next waypoint
+	-- (hops under ~10 studs pass the server's position check)
 	local now = os.clock()
-	if not stuck.pos or now - stuck.at > 0.8 then
-		if stuck.pos and flat(hrp.Position - stuck.pos).Magnitude < 1.2 and flat(target - hrp.Position).Magnitude > 2 then
+	local gd = flat(goal - hrp.Position).Magnitude
+	if not stuck.gd or now - stuck.at > 1 then
+		if stuck.gd and gd > 4 and stuck.gd - gd < 1.5 and (stuck.goal and (stuck.goal - goal).Magnitude < 6) then
 			stuck.n += 1
 			st.stuck = (st.stuck or 0) + 1
 			hum.Jump = true
-			if stuck.n == 2 or stuck.n == 4 then computePath(hrp, goal) end
-			if stuck.n >= 3 then
+			stuck.pathOnly = now + 5
+			if stuck.n <= 2 then
+				computePath(hrp, goal)
+			else
 				local dir = flat(target - hrp.Position)
 				dir = dir.Magnitude > 0.1 and dir.Unit or hrp.CFrame.LookVector
-				local hop = hrp.Position + dir * math.min(6, flat(target - hrp.Position).Magnitude) + Vector3.new(0, 3, 0)
+				local hop = hrp.Position + dir * math.min(6, flat(target - hrp.Position).Magnitude + 1) + Vector3.new(0, 3, 0)
 				hrp.CFrame = CFrame.new(hop) * (hrp.CFrame - hrp.Position)
 				lastPosSkip = true
+				if stuck.n >= 5 then stuck.n = 0; computePath(hrp, goal) end
 			end
-			if stuck.n >= 6 then stuck.n = 0 end
-		else
+		elseif stuck.gd and stuck.gd - gd >= 1.5 then
 			stuck.n = 0
 		end
-		stuck.pos, stuck.at = hrp.Position, now
+		stuck.gd, stuck.goal, stuck.at = gd, goal, now
 	end
 end
 
@@ -220,19 +249,20 @@ local function moveTo(goal)
 	if not hrp then return end
 	if e.moveMode == "Walk" then
 		mover.goal = nil
+		setControls(false)
 		walkTo(hrp, hum, goal)
 	elseif e.moveMode == "Teleport" and (goal - hrp.Position).Magnitude <= e.tpMax then
-		mover.goal, mover.mode = goal, "tp"
+		mover.goal, mover.mode, mover.walk = goal, "tp", nil
 	else
 		-- Tween, or Teleport beyond tpMax (glides at the tween speed instead of one long jump)
-		mover.goal, mover.mode = goal, "tween"
+		mover.goal, mover.mode, mover.walk = goal, "tween", nil
 	end
 end
 local function stopMove()
-	mover.goal = nil
+	mover.goal, mover.walk = nil, nil
 	path.wps = nil
-	local _, hrp, hum = char()
-	if hum and hrp then hum:MoveTo(hrp.Position) end
+	local _, _, hum = char()
+	if hum then hum:Move(Vector3.zero) end
 end
 
 local lookAt = nil   -- position the character keeps facing while farming
@@ -248,6 +278,25 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 		st.snaps += 1
 	end
 	lastPosSkip = false
+	if mover.walk then
+		local d = flat(mover.walk - hrp.Position)
+		if d.Magnitude > 0.8 then
+			local dir = d.Unit
+			hum:Move(dir)
+			-- a ledge / rock in front that is lower than the head -> jump it
+			if hum.FloorMaterial ~= Enum.Material.Air and os.clock() - (mover.jumpAt or 0) > 0.45 then
+				rp.FilterDescendantsInstances = {c, AnimalLive}
+				local feet = hrp.Position - Vector3.new(0, hrp.Size.Y / 2 + hum.HipHeight - 0.8, 0)
+				local low = workspace:Raycast(feet, dir * 3, rp)
+				if low and low.Normal.Y < 0.6 then
+					local high = workspace:Raycast(hrp.Position + Vector3.new(0, 2.5, 0), dir * 3.5, rp)
+					if not high then hum.Jump = true; mover.jumpAt = os.clock() end
+				end
+			end
+		else
+			hum:Move(Vector3.zero)
+		end
+	end
 	if mover.goal then
 		local goal = mover.goal
 		if mover.mode == "tp" then
@@ -384,6 +433,167 @@ local function lootStep(hrp)
 	return true
 end
 
+-- ------------------------------------------------------------------ auto sell / dismantle by rarity
+-- Inventory lives in PlayerData.Data.Inventory.{Weapons, Armors}[serial] = {Id, Count, Locked, Favorited, Source};
+-- rarity = ItemRegistry[Id].Rarity. SellRequest:FireServer({[serial] = count}); DismantleRequest:FireServer({serials})
+-- (one rarity per batch, max 50 -- the game's own dismantle deck refuses mixed rarities).
+local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Godly", "Secret", "Unknown"}
+local ItemRegistry, PlayerDataMod
+pcall(function() ItemRegistry = require(RS.Inventory_Engine.Modules.ItemRegistry) end)
+local SecretSource
+pcall(function() SecretSource = require(RS.Inventory_Engine.Modules.SecretSource) end)
+pcall(function() PlayerDataMod = require(plr.PlayerScripts:WaitForChild("Data_Client"):WaitForChild("PlayerData")) end)
+local SellRequest = RS:WaitForChild("Inventory_Engine"):WaitForChild("Remotes"):WaitForChild("SellRequest")
+local DismantleRequest = RS:WaitForChild("Crafting_Engine"):WaitForChild("Remotes"):WaitForChild("DismantleRequest")
+SellRequest.OnClientEvent:Connect(function(ok, n, msg)
+	if ok then st.sold = (st.sold or 0) + (tonumber(n) or 0); log(("ขายแล้ว %s"):format(tostring(n)))
+	else log("ขายไม่ได้: " .. tostring(msg or n)) end
+end)
+DismantleRequest.OnClientEvent:Connect(function(ok, info, msg)
+	if ok and type(info) == "table" then st.dismantled = (st.dismantled or 0) + (tonumber(info.Items) or 1); log(("ย่อยแล้ว %s ชิ้น"):format(tostring(info.Items or 1)))
+	else log("ย่อยไม่ได้: " .. tostring(msg or info)) end
+end)
+
+local function invData()
+	local ok, d = pcall(function() return PlayerDataMod:WaitFor().Data end)
+	return ok and d or nil
+end
+-- every serial we may touch: unlocked, not favourite, not worn / held, not a starter weapon
+local function candidates()
+	local d = invData()
+	if not d or not ItemRegistry then return {} end
+	local worn = {}
+	for _, serial in pairs(d.Equipped or {}) do worn[serial] = true end
+	local out = {}
+	-- Secret (scaling) gear copies the best plain item of the same kind / armor slot in the bag; removing that
+	-- source zeroes the Secret item (that's how the Lightning Dragon helmet + chestplate lost their stats).
+	-- SecretSource.Check(data, serial, alreadyRemoved) is the game's own guard -> skip every source.
+	local removing = {}
+	local function isSource(serial)
+		if not SecretSource then return true end   -- can't tell -> don't touch anything
+		local ok, r = pcall(SecretSource.Check, d, serial, removing)
+		return not ok or r ~= nil
+	end
+	for _, cat in ipairs({"Weapons", "Armors"}) do
+		for serial, it in pairs((d.Inventory or {})[cat] or {}) do
+			local reg = ItemRegistry[it.Id]
+			local upgraded = type(it.Meta) == "table" and (tonumber(it.Meta.UpgradeLevel) or 0) > 0
+			if type(it) == "table" and reg and not it.Locked and not it.Favorited and not upgraded and not worn[serial]
+				and it.Source ~= "Starter" and not isSource(serial) then
+				removing[serial] = true
+				out[#out + 1] = {serial = serial, id = it.Id, count = it.Count or 1, rarity = reg.Rarity or "Unknown"}
+			end
+		end
+	end
+	return out
+end
+-- dismantling is refused away from a crafting table ("Head back to the crafting bench to do that."): tables are
+-- models tagged CraftingStation, the game's UI opens within 11 studs
+local trip = {active = false, at = 0}
+local function nearestStation(pos)
+	local best, bd
+	for _, m in ipairs(CS:GetTagged("CraftingStation")) do
+		local ok, p = pcall(function() return m:GetPivot().Position end)
+		if ok then
+			local d = (p - pos).Magnitude
+			if not bd or d < bd then best, bd = p, d end
+		end
+	end
+	return best, bd
+end
+local function toDismantle()
+	local byR, n = {}, 0
+	for _, c in ipairs(candidates()) do
+		if e.disRar[c.rarity] then byR[c.rarity] = byR[c.rarity] or {}; table.insert(byR[c.rarity], c.serial); n += 1 end
+	end
+	return byR, n
+end
+local function dismantleNow()
+	local byR = toDismantle()
+	for _, serials in pairs(byR) do
+		for i = 1, #serials, 50 do
+			local batch = {}
+			for j = i, math.min(i + 49, #serials) do batch[#batch + 1] = serials[j] end
+			pcall(function() DismantleRequest:FireServer(batch) end)
+			task.wait(1.5)
+		end
+	end
+end
+local function invPass(manual)
+	local list = candidates()
+	-- dismantle wins when a rarity is ticked in both lists
+	if e.dismantle or manual then
+		local _, n = toDismantle()
+		if n > 0 then
+			local _, hrp = char()
+			local _, d = nearestStation(hrp and hrp.Position or Vector3.zero)
+			if d and d <= 10 then
+				dismantleNow()
+			elseif (manual or n >= e.disMin) and not trip.active then
+				trip.active, trip.at = true, os.clock()
+				log(("ของรอย่อย %d ชิ้น → ไปโต๊ะคราฟ"):format(n))
+			end
+		end
+	end
+	if e.sell then
+		local sell, n = {}, 0
+		for _, c in ipairs(list) do
+			if e.sellRar[c.rarity] and not (e.dismantle and e.disRar[c.rarity]) then sell[c.serial] = c.count; n += 1 end
+		end
+		if n > 0 then pcall(function() SellRequest:FireServer(sell) end) end
+	end
+end
+task.spawn(function()
+	while alive() do
+		if e.sell or e.dismantle then pcall(invPass) end
+		for _ = 1, math.max(5, e.invEvery) do if not alive() then break end task.wait(1) end
+	end
+end)
+
+-- ------------------------------------------------------------------ auto stats
+-- Free points = Data.StatPoints + Data.BankedPoints (Upgrades_Client); spent with
+-- Stats_Engine.Remotes.AllocateUpgrade:FireServer(stat, amount), stat = "Damage" | "Health" | "Defense";
+-- current levels in Data.Upgrades. A re-stat costs money, so nothing is spent unless the user gave the stat a weight.
+local STATS = {"Damage", "Health", "Defense"}
+local AllocateUpgrade = RS:WaitForChild("Stats_Engine"):WaitForChild("Remotes"):WaitForChild("AllocateUpgrade")
+local function freePoints(d) return (tonumber(d.StatPoints) or 0) + (tonumber(d.BankedPoints) or 0) end
+-- the stat furthest below its share of the weights gets the next point
+local function nextStat(d)
+	local total = 0
+	for _, s in ipairs(STATS) do total += e.statW[s] or 0 end
+	if total <= 0 then return nil end
+	local best, bestGap
+	for _, s in ipairs(STATS) do
+		local w = e.statW[s] or 0
+		if w > 0 then
+			local have = tonumber((d.Upgrades or {})[s]) or 0
+			local gap = have / w
+			if not bestGap or gap < bestGap then best, bestGap = s, gap end
+		end
+	end
+	return best
+end
+task.spawn(function()
+	while alive() do
+		if e.autoStats then
+			pcall(function()
+				local d = invData()
+				if not d then return end
+				local pts = freePoints(d)
+				if pts > 0 then
+					local s = nextStat(d)
+					if s then
+						AllocateUpgrade:FireServer(s, 1)
+						st.statsSpent = (st.statsSpent or 0) + 1
+						log(("อัป %s +1 (เหลือ %d แต้ม)"):format(s, pts - 1))
+					end
+				end
+			end)
+		end
+		task.wait(e.autoStats and 0.6 or 2)
+	end
+end)
+
 -- ------------------------------------------------------------------ farm loop
 local combo, swingAt, swinging = 0, 0, false
 local function endCombo()
@@ -407,8 +617,29 @@ task.spawn(function()
 	while alive() do
 		local dt = 0.1
 		local ok, err = pcall(function()
+			if trip.active then
+				local _, hrp = char()
+				if not hrp then return end
+				local pos, d = nearestStation(hrp.Position)
+				if not pos or os.clock() - trip.at > 120 then
+					trip.active = false
+					log("ไปโต๊ะคราฟไม่ถึง (หมดเวลา)")
+				elseif d > 8 then
+					endCombo(); lookAt = nil
+					moveTo(pos)
+					st.status = ("เดินไปโต๊ะคราฟเพื่อย่อย · %.0f stud"):format(d)
+					return
+				else
+					stopMove()
+					st.status = "ย่อยของที่โต๊ะคราฟ"
+					dismantleNow()
+					trip.active = false
+					return
+				end
+			end
 			if not e.farm then
 				if st.target then st.target = nil; lookAt = nil; endCombo(); stopMove() end
+				if controlsOff and not (e.lootAlways and mover.walk) then mover.walk = nil; setControls(true) end
 				local _, hrp, hum = char()
 				if hum and not hum.AutoRotate then hum.AutoRotate = true end
 				st.status = "ปิดอยู่"
@@ -433,7 +664,7 @@ task.spawn(function()
 			end
 			st.target = t
 			if not t then
-				endCombo(); lookAt = nil
+				endCombo(); lookAt = nil; stopMove()
 				st.status = ("ไม่มีมอนที่เลือกในระยะ %d"):format(e.radius)
 				return
 			end
@@ -520,79 +751,6 @@ task.spawn(function()
 	endCombo()
 	mover.goal = nil
 	pcall(function() local _, _, hum = char(); if hum then hum.AutoRotate = true end end)
-end)
-
--- ------------------------------------------------------------------ auto sell / dismantle by rarity
--- Inventory lives in PlayerData.Data.Inventory.{Weapons, Armors}[serial] = {Id, Count, Locked, Favorited, Source};
--- rarity = ItemRegistry[Id].Rarity. SellRequest:FireServer({[serial] = count}); DismantleRequest:FireServer({serials})
--- (one rarity per batch, max 50 -- the game's own dismantle deck refuses mixed rarities).
-local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Godly", "Secret", "Unknown"}
-local ItemRegistry, PlayerDataMod
-pcall(function() ItemRegistry = require(RS.Inventory_Engine.Modules.ItemRegistry) end)
-pcall(function() PlayerDataMod = require(plr.PlayerScripts:WaitForChild("Data_Client"):WaitForChild("PlayerData")) end)
-local SellRequest = RS:WaitForChild("Inventory_Engine"):WaitForChild("Remotes"):WaitForChild("SellRequest")
-local DismantleRequest = RS:WaitForChild("Crafting_Engine"):WaitForChild("Remotes"):WaitForChild("DismantleRequest")
-SellRequest.OnClientEvent:Connect(function(ok, n, msg)
-	if ok then st.sold = (st.sold or 0) + (tonumber(n) or 0); log(("ขายแล้ว %s"):format(tostring(n)))
-	else log("ขายไม่ได้: " .. tostring(msg or n)) end
-end)
-DismantleRequest.OnClientEvent:Connect(function(ok, info, msg)
-	if ok and type(info) == "table" then st.dismantled = (st.dismantled or 0) + (tonumber(info.Items) or 1); log(("ย่อยแล้ว %s ชิ้น"):format(tostring(info.Items or 1)))
-	else log("ย่อยไม่ได้: " .. tostring(msg or info)) end
-end)
-
-local function invData()
-	local ok, d = pcall(function() return PlayerDataMod:WaitFor().Data end)
-	return ok and d or nil
-end
--- every serial we may touch: unlocked, not favourite, not worn / held, not a starter weapon
-local function candidates()
-	local d = invData()
-	if not d or not ItemRegistry then return {} end
-	local worn = {}
-	for _, serial in pairs(d.Equipped or {}) do worn[serial] = true end
-	local out = {}
-	for _, cat in ipairs({"Weapons", "Armors"}) do
-		for serial, it in pairs((d.Inventory or {})[cat] or {}) do
-			local reg = ItemRegistry[it.Id]
-			if type(it) == "table" and reg and not it.Locked and not it.Favorited and not worn[serial]
-				and it.Source ~= "Starter" and (not st.weapon or it.Id ~= st.weapon or not worn[serial]) then
-				out[#out + 1] = {serial = serial, id = it.Id, count = it.Count or 1, rarity = reg.Rarity or "Unknown"}
-			end
-		end
-	end
-	return out
-end
-local function invPass()
-	local list = candidates()
-	-- dismantle wins when a rarity is ticked in both lists
-	if e.dismantle then
-		local byR = {}
-		for _, c in ipairs(list) do
-			if e.disRar[c.rarity] then byR[c.rarity] = byR[c.rarity] or {}; table.insert(byR[c.rarity], c.serial) end
-		end
-		for _, serials in pairs(byR) do
-			for i = 1, #serials, 50 do
-				local batch = {}
-				for j = i, math.min(i + 49, #serials) do batch[#batch + 1] = serials[j] end
-				pcall(function() DismantleRequest:FireServer(batch) end)
-				task.wait(1.5)
-			end
-		end
-	end
-	if e.sell then
-		local sell, n = {}, 0
-		for _, c in ipairs(list) do
-			if e.sellRar[c.rarity] and not (e.dismantle and e.disRar[c.rarity]) then sell[c.serial] = c.count; n += 1 end
-		end
-		if n > 0 then pcall(function() SellRequest:FireServer(sell) end) end
-	end
-end
-task.spawn(function()
-	while alive() do
-		if e.sell or e.dismantle then pcall(invPass) end
-		for _ = 1, math.max(5, e.invEvery) do if not alive() then break end task.wait(1) end
-	end
 end)
 
 -- anti-AFK
@@ -732,11 +890,26 @@ IL:Dropdown({Name = "Rarity ที่จะย่อย", Multi = true, Required
 	Callback = function(v) e.disRar = multiSet(v); sv() end}, "PLDisRar")
 IL:Slider({Name = "เช็กกระเป๋าทุก (วินาที)", Default = e.invEvery, Minimum = 5, Maximum = 120, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.invEvery = v; sv() end}, "PLInvEvery")
-IL:Button({Name = "ขาย / ย่อยตอนนี้เลย (ตามที่ติ๊ก)", Callback = function() task.spawn(function() pcall(invPass) end) end})
-IL:Label({Text = "เฉพาะอาวุธ + เกราะ · ไม่แตะของ Locked / Favorite / ที่ใส่อยู่ / อาวุธเริ่มต้น\nติ๊ก Rarity เดียวกันทั้ง 2 ฝั่ง = ย่อย (ไม่ขาย)"})
+IL:Slider({Name = "└ ย่อยเมื่อของรอย่อย ≥ (ชิ้น)", Default = e.disMin, Minimum = 1, Maximum = 50, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.disMin = v; sv() end}, "PLDisMin")
+IL:Button({Name = "ขาย / ย่อยตอนนี้เลย (ตามที่ติ๊ก)", Callback = function() task.spawn(function() pcall(invPass, true) end) end})
+IL:Label({Text = "เฉพาะอาวุธ + เกราะ · ไม่แตะของ Locked / ติดดาว (Favorite) / อัปเกรดแล้ว / ที่ใส่อยู่ / อาวุธเริ่มต้น\nย่อยได้เฉพาะที่โต๊ะคราฟ: ของครบจำนวนแล้วเดินไปโต๊ะใกล้สุดเอง ย่อยเสร็จกลับมาฟาร์ม\nติ๊ก Rarity เดียวกันทั้ง 2 ฝั่ง = ย่อย (ไม่ขาย)"})
 local IR2 = InvTab:Section({Side = "Right"})
 IR2:Header({Text = "กระเป๋า (ของที่ขาย/ย่อยได้)"})
 local invLbl = IR2:Label({Text = "-"})
+
+local StTab = TG:Tab({Name = "Stats", Image = "rbxassetid://10723346959"})
+local SL = StTab:Section({Side = "Left"})
+SL:Header({Text = "Auto Stats (ปิดไว้ก่อน)"})
+SL:Toggle({Name = "Auto Stats (ลงแต้มที่ว่างอยู่)", Default = e.autoStats, Callback = function(v) e.autoStats = v; sv() end}, "PLStats")
+SL:Label({Text = "ตั้งสัดส่วนของแต่ละสเตตัส · 0 = ไม่ลงเลย\nเช่น Damage 2 / Health 1 = ลง Damage 2 แต้มต่อ Health 1 แต้ม\nทั้งหมดเป็น 0 = ไม่ลงอะไร (รีสเตตัสเสียเงิน)"})
+for _, s in ipairs(STATS) do
+	SL:Slider({Name = s, Default = e.statW[s] or 0, Minimum = 0, Maximum = 10, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.statW[s] = v; sv() end}, "PLStatW_" .. s)
+end
+local SR = StTab:Section({Side = "Right"})
+SR:Header({Text = "สเตตัสตอนนี้"})
+local statLbl = SR:Label({Text = "-"})
 
 local SetTab = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"})
 local SS = SetTab:Section({Side = "Left"})
@@ -763,6 +936,12 @@ task.spawn(function()
 				sk[#sk + 1] = ("%s · %s"):format(name, left > 0 and ("คูลดาวน์ %.0f วิ"):format(left) or "พร้อม")
 			end
 			skLbl:UpdateName(#sk > 0 and table.concat(sk, "\n") or "ไม่มีสกิลในช่อง")
+			local d = invData()
+			if d then
+				local up = d.Upgrades or {}
+				statLbl:UpdateName(("Damage %d · Health %d · Defense %d\nแต้มว่าง %d · เลเวล %s\nลงไปรอบนี้ %d แต้ม"):format(tonumber(up.Damage) or 0,
+					tonumber(up.Health) or 0, tonumber(up.Defense) or 0, freePoints(d), tostring(d.Level), st.statsSpent or 0))
+			end
 			if os.clock() % 3 < 0.5 then
 				local cnt = {}
 				for _, c in ipairs(candidates()) do cnt[c.rarity] = (cnt[c.rarity] or 0) + 1 end
@@ -784,7 +963,9 @@ task.spawn(function()
 	while alive() do task.wait(1) end
 	pcall(function() hbConn:Disconnect() end)
 	pcall(function() idleConn:Disconnect() end)
-	pcall(function() local _, hrp, hum = char(); if hum then hum.AutoRotate = true; hum:MoveTo(hrp.Position) end end)
+	mover.walk = nil
+	setControls(true)
+	pcall(function() local _, _, hum = char(); if hum then hum.AutoRotate = true; hum:Move(Vector3.zero) end end)
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__PLOOT == G then getgenv().__PLOOT = G + 1 end end)
