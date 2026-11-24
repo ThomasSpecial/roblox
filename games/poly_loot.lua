@@ -46,7 +46,7 @@ local DEFAULTS = {
 	skill = true, skillMode = "ใช้ทันทีที่คูลดาวน์หมด", healAt = 60,
 	retreat = true, retreatAt = 35, resumeAt = 80, antiAfk = true, equip = true,
 	loot = true, lootAlways = false, lootRadius = 80,
-	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 10,
+	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 3,
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
 	stayInHeal = true, healMargin = 4,
@@ -580,6 +580,7 @@ local function invPass(manual)
 		if n > 0 then pcall(function() SellRequest:FireServer(sell) end) end
 	end
 end
+st.invPass = invPass   -- debug handle
 task.spawn(function()
 	while alive() do
 		if e.sell or e.dismantle then pcall(invPass) end
