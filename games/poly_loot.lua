@@ -46,7 +46,7 @@ local DEFAULTS = {
 	skill = true, skillMode = "ใช้ทันทีที่คูลดาวน์หมด", healAt = 60,
 	retreat = true, retreatAt = 35, resumeAt = 80, antiAfk = true, equip = true,
 	loot = true, lootAlways = false, lootRadius = 80,
-	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 3,
+	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 3, disWhenFull = true, bagFree = 3,
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
 	stayInHeal = true, healMargin = 4,
@@ -478,6 +478,15 @@ local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Godly", "Secret", "Unk
 local ItemRegistry, PlayerDataMod
 pcall(function() ItemRegistry = require(RS.Inventory_Engine.Modules.ItemRegistry) end)
 local SecretSource
+-- bag = Weapons + Armors slots; cap = InvLimits.GetCap(data) (50 + boosts)
+local InvLimits
+pcall(function() InvLimits = require(RS.Inventory_Engine.Modules.InvLimits) end)
+local function bagState(d)
+	if not (InvLimits and d) then return 0, 50 end
+	local okU, used = pcall(InvLimits.CountSlots, d)
+	local okC, cap = pcall(InvLimits.GetCap, d)
+	return okU and used or 0, okC and cap or 50
+end
 pcall(function() SecretSource = require(RS.Inventory_Engine.Modules.SecretSource) end)
 pcall(function() PlayerDataMod = require(plr.PlayerScripts:WaitForChild("Data_Client"):WaitForChild("PlayerData")) end)
 local SellRequest = RS:WaitForChild("Inventory_Engine"):WaitForChild("Remotes"):WaitForChild("SellRequest")
@@ -566,7 +575,10 @@ local function invPass(manual)
 			local _, d = nearestStation(hrp and hrp.Position or Vector3.zero)
 			if d and d <= 10 then
 				dismantleNow()
-			elseif (manual or n >= e.disMin) and not trip.active then
+			elseif not trip.active and (manual or n >= e.disMin or (e.disWhenFull and (function()
+				local used, cap = bagState(invData())
+				return used >= cap - e.bagFree
+			end)())) then
 				trip.active, trip.at = true, os.clock()
 				log(("ของรอย่อย %d ชิ้น → ไปโต๊ะคราฟ"):format(n))
 			end
@@ -1202,6 +1214,9 @@ IL:Slider({Name = "เช็กกระเป๋าทุก (วินาท�
 	Callback = function(v) e.invEvery = v; sv() end}, "PLInvEvery")
 IL:Slider({Name = "└ ย่อยเมื่อของรอย่อย ≥ (ชิ้น)", Default = e.disMin, Minimum = 1, Maximum = 50, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.disMin = v; sv() end}, "PLDisMin")
+IL:Toggle({Name = "└ หรือไปย่อยเมื่อกระเป๋าใกล้เต็ม", Default = e.disWhenFull, Callback = function(v) e.disWhenFull = v; sv() end}, "PLDisFull")
+IL:Slider({Name = "    ใกล้เต็ม = เหลือช่องว่าง ≤", Default = e.bagFree, Minimum = 0, Maximum = 20, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.bagFree = v; sv() end}, "PLBagFree")
 IL:Button({Name = "ขาย / ย่อยตอนนี้เลย (ตามที่ติ๊ก)", Callback = function() task.spawn(function() pcall(invPass, true) end) end})
 IL:Label({Text = "เฉพาะอาวุธ + เกราะ · ไม่แตะของ Locked / ติดดาว (Favorite) / อัปเกรดแล้ว / ที่ใส่อยู่ / อาวุธเริ่มต้น\nย่อยได้เฉพาะที่โต๊ะคราฟ: ของครบจำนวนแล้วเดินไปโต๊ะใกล้สุดเอง ย่อยเสร็จกลับมาฟาร์ม\nติ๊ก Rarity เดียวกันทั้ง 2 ฝั่ง = ย่อย (ไม่ขาย)"})
 local IR2 = InvTab:Section({Side = "Right"})
@@ -1282,6 +1297,8 @@ task.spawn(function()
 						lines[#lines + 1] = ("%s: %d%s"):format(r, cnt[r], (e.dismantle and e.disRar[r]) and " → ย่อย" or (e.sell and e.sellRar[r]) and " → ขาย" or "")
 					end
 				end
+				local used, cap = bagState(d)
+				lines[#lines + 1] = ("กระเป๋า %d/%d ช่อง"):format(used, cap)
 				lines[#lines + 1] = ("รอบนี้ ขาย %d · ย่อย %d"):format(st.sold or 0, st.dismantled or 0)
 				invLbl:UpdateName(table.concat(lines, "\n"))
 			end
