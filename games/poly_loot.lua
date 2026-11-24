@@ -40,7 +40,7 @@ local AnimalLive = workspace:WaitForChild("Animal_Live")
 local SF = ("PolyLoot/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {
 	farm = false, mobs = {}, bossOnly = false, passives = false, radius = 400,
-	targetMode = "ใกล้สุด", pattern = "วนรอบตัว (Orbit)", moveMode = "Walk",
+	targetMode = "คุ้มที่สุด (ฟาร์มไวสุด)", pattern = "วนรอบตัว (Orbit)", moveMode = "Walk",
 	tweenSpeed = 22, tpMax = 40, standDist = 5, orbitRadius = 7, orbitSpeed = 1.6,
 	attack = true, swing = 0.55, attackMode = "ท่าฟันของเกม (Tool:Activate)", reach = 11, dodge = true, dodgeMargin = 3,
 	skill = true, skillMode = "ใช้ทันทีที่คูลดาวน์หมด", healAt = 60,
@@ -138,9 +138,17 @@ local function setAnchor(pos)
 	e.anchor = pos and {math.floor(pos.X * 10) / 10, math.floor(pos.Y * 10) / 10, math.floor(pos.Z * 10) / 10} or nil
 	sv()
 end
-local function pickTarget(hrp)
-	local best, bestScore
+-- "fastest farm" targeting: value of going for mob X = kills per second of the short route X -> nearest neighbour
+-- -> ... (up to 4 mobs, hops < 45 studs), time = run time (distance / run speed) + kill time (HP / our measured DPS).
+-- One lone mob far away loses to two mobs standing together in the other direction.
+local SMART_TARGET = "คุ้มที่สุด (ฟาร์มไวสุด)"
+local dpsStat = {dmg = 0, time = 0, t = nil, h = 0, at = 0}
+local function myDps() return (dpsStat.dmg + 1200 * 8) / (dpsStat.time + 8) end   -- 1200/s prior, ~8 s weight
+local function runSpeed() return 20 * ((e.speedOn and e.speedMult) or 1) * 0.85 end  -- 0.85: paths aren't straight
+local function mobHp(m) return tonumber(m:GetAttribute("Health")) or 0 end
+local function candidates_(hrp)
 	local anchor = anchorPos()
+	local list = {}
 	local folders = {AnimalLive:FindFirstChild("Aggressors")}
 	if e.passives then folders[#folders + 1] = AnimalLive:FindFirstChild("Passives") end
 	for _, folder in ipairs(folders) do
@@ -149,12 +157,53 @@ local function pickTarget(hrp)
 				local mp = mobPos(m)
 				local d = (mp - hrp.Position).Magnitude
 				if (anchor and flat(mp - anchor).Magnitude <= e.anchorR) or (not anchor and d <= e.radius) then
-					local hp = tonumber(m:GetAttribute("Health")) or 0
-					local score = (e.targetMode == "เลือดน้อยสุด" and hp) or (e.targetMode == "เลือดมากสุด" and -hp) or d
-					if not bestScore or score < bestScore then best, bestScore = m, score end
+					list[#list + 1] = {m = m, p = mp, d = d}
 				end
 			end
 		end
+	end
+	return list
+end
+local function routeValue(fromPos, first, pool)
+	local speed, dps = runSpeed(), myDps()
+	local used = {[first.m] = true}
+	local pos = first.p
+	local time = flat(pos - fromPos).Magnitude / speed + mobHp(first.m) / dps
+	local n = 1
+	for _ = 1, 3 do
+		local nb, nd
+		for _, c in ipairs(pool) do
+			if not used[c.m] then
+				local d = flat(c.p - pos).Magnitude
+				if d < 45 and (not nd or d < nd) then nb, nd = c, d end
+			end
+		end
+		if not nb then break end
+		used[nb.m] = true
+		time += nd / speed + mobHp(nb.m) / dps
+		n += 1
+		pos = nb.p
+	end
+	return n / math.max(time, 0.1)
+end
+local function pickTarget(hrp)
+	local list = candidates_(hrp)
+	if e.targetMode == SMART_TARGET then
+		table.sort(list, function(a, b) return a.d < b.d end)
+		local pool = {}
+		for i = 1, math.min(#list, 25) do pool[i] = list[i] end
+		local best, bestV
+		for _, c in ipairs(pool) do
+			local v = routeValue(hrp.Position, c, pool)
+			if not bestV or v > bestV then best, bestV = c.m, v end
+		end
+		return best, bestV, pool
+	end
+	local best, bestScore
+	for _, c in ipairs(list) do
+		local hp = mobHp(c.m)
+		local score = (e.targetMode == "เลือดน้อยสุด" and hp) or (e.targetMode == "เลือดมากสุด" and -hp) or c.d
+		if not bestScore or score < bestScore then best, bestScore = c.m, score end
 	end
 	return best
 end
@@ -967,10 +1016,17 @@ task.spawn(function()
 			-- with a margin so two similar mobs don't flip-flop
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
 				st.reevalAt = os.clock()
-				local cand = pickTarget(hrp)
+				local cand, candV, pool = pickTarget(hrp)
 				if cand and cand ~= t then
 					local better
-					if e.targetMode == "เลือดน้อยสุด" then
+					if e.targetMode == SMART_TARGET then
+						-- don't drop the mob we're already hitting; otherwise switch when the new route is clearly better
+						local dt = flat(mobPos(t) - hrp.Position).Magnitude
+						if dt > e.reach + 2 then
+							local curV = routeValue(hrp.Position, {m = t, p = mobPos(t)}, pool or {})
+							better = candV and candV > curV * 1.3
+						end
+					elseif e.targetMode == "เลือดน้อยสุด" then
 						better = (tonumber(cand:GetAttribute("Health")) or 0) < (tonumber(t:GetAttribute("Health")) or 0) * 0.8
 					elseif e.targetMode == "เลือดมากสุด" then
 						better = (tonumber(cand:GetAttribute("Health")) or 0) > (tonumber(t:GetAttribute("Health")) or 0) * 1.25
@@ -1006,6 +1062,19 @@ task.spawn(function()
 			end
 			local tp = mobPos(t)
 			local dist = flat(tp - hrp.Position).Magnitude
+			do
+				local now, h = os.clock(), mobHp(t)
+				if dpsStat.t == t then
+					if dist <= e.reach + 1 then
+						dpsStat.time += math.min(now - dpsStat.at, 0.5)
+						if h < dpsStat.h then dpsStat.dmg += dpsStat.h - h end
+					end
+				else
+					dpsStat.t = t
+				end
+				dpsStat.h, dpsStat.at = h, now
+				st.dps = myDps()
+			end
 
 			-- low HP: back off and let AreaHeal / regen work
 			if e.retreat then
@@ -1114,7 +1183,7 @@ if not alive() then return end
 local Win = Lib:Window({Title = "Poly Loot", Subtitle = "Auto Farm", DragStyle = 1, ShowUserInfo = true, AcrylicBlur = false})
 getgenv().__PLOOTW = Win
 local TG = Win:TabGroup()
-local TARGET_OPTS = {"ใกล้สุด", "เลือดน้อยสุด", "เลือดมากสุด", "ล็อกตัวเดิมจนตาย"}
+local TARGET_OPTS = {SMART_TARGET, "ใกล้สุด", "เลือดน้อยสุด", "เลือดมากสุด", "ล็อกตัวเดิมจนตาย"}
 local MOVE_OPTS = {"Walk", "Tween", "Teleport"}
 local PATTERN_OPTS = {"วนรอบตัว (Orbit)", "ยืนหลังมอน (Behind)", "ตีแล้วถอย (Hit & Run)"}
 local SKILL_OPTS = {"ใช้ทันทีที่คูลดาวน์หมด", "สกิลฮีลใช้ตอนเลือดต่ำ"}
@@ -1319,6 +1388,7 @@ task.spawn(function()
 					local _, hrp = char()
 					return a and ("จุดฟาร์ม %.0f,%.0f,%.0f · ห่าง %.0f stud"):format(a.X, a.Y, a.Z, hrp and flat(a - hrp.Position).Magnitude or 0) or "จุดฟาร์ม: ไม่ได้ตั้ง (ใช้ระยะค้นหารอบตัว)"
 				end)(),
+				("ดาเมจเรา ~%d/วิ (วัดจากที่ตีจริง)"):format(st.dps or 1200),
 				("เลือดเรา %s · โหมด %s · %s"):format(hum and ("%d/%d"):format(hum.Health, hum.MaxHealth) or "-", e.moveMode, e.pattern),
 				("ฆ่า %d · เก็บของ %d · สกิล %d · หลบ %d · ถอย Smart %d · โดนดึงกลับ %d"):format(st.kills, st.loots, st.skills, st.dodges, st.evades or 0, st.snaps),
 				"อาวุธ: " .. tostring(st.weapon or "-"),
