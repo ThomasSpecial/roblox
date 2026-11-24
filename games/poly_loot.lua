@@ -755,6 +755,29 @@ task.spawn(function()
 			end
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) then t = nil end
+			-- non-lock modes re-check twice a second: a mob that (re)spawned closer / weaker takes over,
+			-- with a margin so two similar mobs don't flip-flop
+			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
+				st.reevalAt = os.clock()
+				local cand = pickTarget(hrp)
+				if cand and cand ~= t then
+					local better
+					if e.targetMode == "เลือดน้อยสุด" then
+						better = (tonumber(cand:GetAttribute("Health")) or 0) < (tonumber(t:GetAttribute("Health")) or 0) * 0.8
+					elseif e.targetMode == "เลือดมากสุด" then
+						better = (tonumber(cand:GetAttribute("Health")) or 0) > (tonumber(t:GetAttribute("Health")) or 0) * 1.25
+					else
+						local dt = flat(mobPos(t) - hrp.Position).Magnitude
+						local dc = flat(mobPos(cand) - hrp.Position).Magnitude
+						better = dc + 6 < dt and dc < dt * 0.8
+					end
+					if better then
+						t = cand
+						lockStart = os.clock()
+						log(("สลับไป %s (ใกล้/ดีกว่า)"):format(tostring(cand:GetAttribute("Animal"))))
+					end
+				end
+			end
 			if not t then
 				t = pickTarget(hrp)
 				if t then lockStart = os.clock(); log(("ล็อก %s/%s HP %s"):format(tostring(t:GetAttribute("Animal")), tostring(t:GetAttribute("Tier")), tostring(t:GetAttribute("Health")))) end
