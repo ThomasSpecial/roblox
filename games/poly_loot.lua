@@ -49,6 +49,8 @@ local DEFAULTS = {
 	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 10,
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
+	stayInHeal = true, healMargin = 4,
+	smart = true, smartDanger = 15, smartRange = 14, aura = true, learn = {},
 }
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -56,6 +58,7 @@ for k, v in pairs(DEFAULTS) do if e[k] == nil then e[k] = v end end
 if type(e.mobs) ~= "table" then e.mobs = {} end
 if type(e.sellRar) ~= "table" then e.sellRar = {} end
 if type(e.disRar) ~= "table" then e.disRar = {} end
+if type(e.learn) ~= "table" then e.learn = {} end
 if type(e.statW) ~= "table" then e.statW = {Damage = 0, Health = 0, Defense = 0} end
 local function sv()
 	pcall(function()
@@ -65,6 +68,7 @@ local function sv()
 end
 
 local st = {status = "ปิดอยู่", target = nil, kills = 0, skills = 0, dodges = 0, snaps = 0, loots = 0, last = {}, weapon = nil}
+getgenv().__PLDBG = st   -- debug handle (status / current target)
 local function log(s)
 	table.insert(st.last, 1, os.date("%H:%M:%S") .. " " .. s)
 	while #st.last > 8 do table.remove(st.last) end
@@ -252,9 +256,22 @@ local function walkTo(hrp, hum, goal)
 end
 
 -- one call per tick: send the character toward goal with the selected mode
-local function moveTo(goal)
+-- AreaHeal drops a field where you stand when it's cast (Radius 18, 7.5 s, heals only inside) -> while it lasts,
+-- every move except a dodge is pulled back inside it
+local healZone = nil   -- {c = Vector3, untilT = os.clock(), r = studs}
+local function inHealZone() return healZone and os.clock() < healZone.untilT and e.stayInHeal end
+local function clampHeal(goal)
+	if not inHealZone() then return goal end
+	local off = flat(goal - healZone.c)
+	local r = math.max(healZone.r - e.healMargin, 2)
+	if off.Magnitude <= r then return goal end
+	local p = healZone.c + off.Unit * r
+	return Vector3.new(p.X, goal.Y, p.Z)
+end
+local function moveTo(goal, free)
 	local _, hrp, hum = char()
 	if not hrp then return end
+	if not free then goal = clampHeal(goal) end
 	if e.moveMode == "Walk" then
 		mover.goal = nil
 		setControls(false)
@@ -356,11 +373,21 @@ end
 -- ------------------------------------------------------------------ skills
 local skillCd = {}   -- name -> os.clock() when ready
 local seq = math.random(100000, 900000)
+local AbilityData
+pcall(function() AbilityData = require(RS.Ability_Engine.Data.AbilityData) end)
+local castPos = {}   -- name -> where we stood when we fired it (the heal field's centre)
 AbilityCastResult.OnClientEvent:Connect(function(_, name, ok, reason, cd)
 	if type(name) ~= "string" then return end
 	local left = tonumber(cd) or 0
 	skillCd[name] = os.clock() + math.max(left, ok and 1 or 2)
-	if ok then st.skills += 1; log("ใช้สกิล " .. name) end
+	if ok then
+		st.skills += 1
+		log("ใช้สกิล " .. name)
+		local def = AbilityData and AbilityData[name]
+		if name == "AreaHeal" and castPos[name] then
+			healZone = {c = castPos[name], untilT = os.clock() + (def and def.Duration or 7.5) - 0.2, r = def and def.Radius or 18}
+		end
+	end
 end)
 local function equippedSkills()
 	local list = {}
@@ -383,7 +410,9 @@ local function useSkills(targetPos)
 			if go then
 				seq = seq % 2147483647 + 1
 				skillCd[name] = os.clock() + 2   -- until the server answers
-				pcall(function() AbilityFired:FireServer(seq, name, isHeal and hrp.Position or (targetPos or hrp.Position)) end)
+				castPos[name] = hrp.Position
+				-- heals go without a position, exactly like the game's own button (AreaHeal.GetTargetPosition = nil)
+				pcall(function() AbilityFired:FireServer(seq, name, (not isHeal) and (targetPos or hrp.Position) or nil) end)
 			end
 		end
 	end
@@ -691,6 +720,121 @@ task.spawn(function()
 	end
 end)
 
+-- ------------------------------------------------------------------ smart combat
+-- Each mob runs _State IDLE -> CHASE -> ATTACK (telegraph appears, the hit lands ~0.8 s later) -> ...; our swings put
+-- it in KNOCKBACK, which cancels the attack. So light hitters are simply out-traded, heavy ones are side-stepped:
+-- every attack start near us is timed, every HP loss is pinned on the attack that caused it, and per mob type we keep
+-- {attacks, hits, damage, windup}. When a mob that hits "too hard" (>= smartDanger % of current HP) starts an
+-- attack within smartRange, we step out until its windup is over, then go back in.
+local learn = e.learn
+local mobState = {}    -- model -> {state, attackAt}
+local recent = {}      -- attacks of the last 2 s: {name, at}
+local function L(name)
+	learn[name] = learn[name] or {att = 0, hits = 0, dmg = 0, wind = 0, windN = 0}
+	return learn[name]
+end
+local function windupOf(name)
+	local l = learn[name]
+	if l and l.windN >= 2 then return math.clamp(l.wind / l.windN, 0.3, 2.5) end
+	return 0.85
+end
+local function hitOf(m)
+	local l = learn[m:GetAttribute("Animal") or "?"]
+	if l and l.hits >= 2 then return l.dmg / l.hits end
+	return tonumber(m:GetAttribute("Damage")) or 0
+end
+task.spawn(function()
+	local lastSave = os.clock()
+	while alive() do
+		local _, hrp = char()
+		local folder = AnimalLive:FindFirstChild("Aggressors")
+		if hrp and folder then
+			local now = os.clock()
+			for _, m in ipairs(folder:GetChildren()) do
+				local stt = m:GetAttribute("_State")
+				local rec = mobState[m]
+				if stt == "ATTACK" or rec then
+					local ok, pos = pcall(function() return m:GetPivot().Position end)
+					if ok and (pos - hrp.Position).Magnitude < 45 then
+						if not rec then rec = {}; mobState[m] = rec end
+						if stt ~= rec.state then
+							if stt == "ATTACK" then
+								rec.attackAt = now
+								local name = m:GetAttribute("Animal") or "?"
+								L(name).att += 1
+								table.insert(recent, {name = name, at = now})
+							end
+							rec.state = stt
+						end
+					end
+				end
+			end
+			for m in pairs(mobState) do if not m.Parent then mobState[m] = nil end end
+			while recent[1] and now - recent[1].at > 2 do table.remove(recent, 1) end
+		end
+		if os.clock() - lastSave > 30 then lastSave = os.clock(); sv() end
+		task.wait(0.05)
+	end
+end)
+-- HP loss -> the most recent attack that started 0.2-1.8 s before it
+local function bindHurt(c)
+	local hum = c:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h)
+		if h < last and alive() then
+			local now, best = os.clock(), nil
+			for i = #recent, 1, -1 do
+				local a = recent[i]
+				if now - a.at >= 0.2 and now - a.at <= 1.8 then best = a break end
+			end
+			if best then
+				local l = L(best.name)
+				l.hits += 1
+				l.dmg += last - h
+				l.wind += now - best.at
+				l.windN += 1
+				best.at = -1e9   -- one hit per attack
+			end
+		end
+		last = h
+	end)
+end
+if plr.Character then task.spawn(bindHurt, plr.Character) end
+plr.CharacterAdded:Connect(bindHurt)
+-- point to step to while a dangerous attack winds up, or nil
+local function smartEvade(hrp, hum)
+	if not e.smart then return nil end
+	local now = os.clock()
+	for m, rec in pairs(mobState) do
+		if rec.state == "ATTACK" and rec.attackAt and m.Parent then
+			local name = m:GetAttribute("Animal") or "?"
+			if now - rec.attackAt < windupOf(name) + 0.12 then
+				local mp = mobPos(m)
+				local d = flat(mp - hrp.Position).Magnitude
+				local dmg = hitOf(m)
+				if d < e.smartRange and dmg >= hum.Health * e.smartDanger / 100 then
+					local away = flat(hrp.Position - mp)
+					away = away.Magnitude > 0.1 and away.Unit or -hrp.CFrame.LookVector
+					return hrp.Position + away * (e.smartRange - d + 3), name, dmg
+				end
+			end
+		end
+	end
+end
+local function learnText()
+	local rows = {}
+	for name, l in pairs(learn) do
+		if l.att > 0 then
+			rows[#rows + 1] = ("%s: ตี %d · โดน %d%s%s"):format(name, l.att, l.hits,
+				l.hits > 0 and (" · เฉลี่ย %d"):format(l.dmg / l.hits) or "",
+				l.windN > 0 and (" · ง้าง %.2fs"):format(l.wind / l.windN) or "")
+		end
+	end
+	table.sort(rows)
+	return #rows > 0 and table.concat(rows, "\n") or "ยังไม่มีข้อมูล (เรียนรู้ระหว่างฟาร์ม)"
+end
+
 -- ------------------------------------------------------------------ farm loop
 local combo, swingAt, swinging = 0, 0, false
 local function endCombo()
@@ -699,12 +843,40 @@ local function endCombo()
 	swinging, combo = false, 0
 end
 -- turn toward the target only when we're clearly off (rotating every frame froze the walk animation)
+local function swingNow(c)
+	if e.attackMode == ATTACK_GAME then
+		local tool = c:FindFirstChildOfClass("Tool")
+		if tool then pcall(function() tool:Activate() end) end
+		swinging = true
+	elseif os.clock() >= swingAt then
+		combo = combo % 3 + 1
+		swinging = true
+		swingAt = os.clock() + e.swing
+		pcall(function() WeaponAttack:FireServer(combo) end)
+	end
+end
 local function face(hrp, pos)
 	local dir = flat(pos - hrp.Position)
 	if dir.Magnitude < 0.5 then return end
 	if hrp.CFrame.LookVector:Dot(dir.Unit) < 0.94 then
 		hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
 	end
+end
+-- Kill Aura: any aggressor inside weapon reach gets swung at (the server's hitbox needs us next to it, so a real
+-- long-range aura is impossible)
+local function aura(c, hrp)
+	if not (e.aura and e.attack) then return false end
+	local folder = AnimalLive:FindFirstChild("Aggressors")
+	for _, m in ipairs(folder and folder:GetChildren() or {}) do
+		if mobAlive(m) then
+			local ok, pos = pcall(function() return m:GetPivot().Position end)
+			if ok and flat(pos - hrp.Position).Magnitude <= e.reach and math.abs(pos.Y - hrp.Position.Y) < 12 then
+				if ensureWeapon() then face(hrp, pos); swingNow(c) end
+				return true
+			end
+		end
+	end
+	return false
 end
 local orbitAng = 0
 local retreating = false
@@ -803,24 +975,37 @@ task.spawn(function()
 				endCombo(); lookAt = nil
 				local away = flat(hrp.Position - tp)
 				away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
-				moveTo(tp + away * 45)
+				if inHealZone() then
+					moveTo(healZone.c)
+				else
+					moveTo(tp + away * 45)
+				end
 				st.status = ("ถอยเลือดต่ำ %d%% → รอ %d%%"):format(hpPct(), e.resumeAt)
 				return
 			end
 
-			-- dodge first, then pick up drops, then fight
+			-- smart evade (heavy hitter winding up) > telegraph dodge > drops > fight
+			local ev, evName, evDmg = smartEvade(hrp, hum)
+			if ev then
+				st.evades = (st.evades or 0) + 1
+				moveTo(ev, true)
+				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
+				return
+			end
 			local dp = e.dodge and dodgePoint(hrp)
 			if not dp and lootStep(hrp) then
-				endCombo(); lookAt = nil
+				lookAt = nil
+				if not aura(c, hrp) then endCombo() end
 				return
 			end
 			if dp then
 				st.dodges += 1
-				moveTo(dp)
+				moveTo(dp, true)
 				lookAt = tp
 				st.status = "หลบท่า"
 			elseif dist > math.max(e.standDist, e.orbitRadius) + 8 then
-				endCombo(); lookAt = nil
+				lookAt = nil
+				if not aura(c, hrp) then endCombo() end
 				moveTo(Vector3.new(tp.X, hrp.Position.Y, tp.Z))
 				st.status = ("เดินทางไปหา %s · %.0f stud (%s)"):format(tostring(t:GetAttribute("Animal")), dist, e.moveMode)
 				return
@@ -849,18 +1034,11 @@ task.spawn(function()
 
 			-- attack when in reach (the hitbox is the server's; reach ~ stand distance + a few studs)
 			if e.attack and dist <= e.reach and ensureWeapon() then
+				-- Tool:Activate() runs the game's own swing: animation, combo 1-2-3 and its timing
 				face(hrp, tp)
-				if e.attackMode == ATTACK_GAME then
-					-- Tool:Activate() runs the game's own swing: animation, combo 1-2-3 and its timing
-					local tool = c:FindFirstChildOfClass("Tool")
-					if tool then pcall(function() tool:Activate() end) end
-					swinging = true
-				elseif os.clock() >= swingAt then
-					combo = combo % 3 + 1
-					swinging = true
-					swingAt = os.clock() + e.swing
-					pcall(function() WeaponAttack:FireServer(combo) end)
-				end
+				swingNow(c)
+			elseif aura(c, hrp) then
+				-- something else is in reach while we close in on the target
 			elseif swinging and os.clock() >= swingAt then
 				endCombo()
 			end
@@ -903,6 +1081,7 @@ local L = FarmTab:Section({Side = "Left"})
 L:Header({Text = "Auto Farm"})
 L:Toggle({Name = "Auto Farm (ล็อกมอน · เดินไปตี)", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "PLFarm")
 L:Toggle({Name = "Auto Attack", Default = e.attack, Callback = function(v) e.attack = v; sv() end}, "PLAttack")
+L:Toggle({Name = "Kill Aura (ฟันทุกตัวที่อยู่ในระยะ แม้ตอนเดิน/เก็บของ)", Default = e.aura, Callback = function(v) e.aura = v; sv() end}, "PLAura")
 L:Dropdown({Name = "วิธีโจมตี", Multi = false, Required = true, Options = {ATTACK_GAME, ATTACK_REMOTE},
 	Default = e.attackMode == ATTACK_REMOTE and 2 or 1, Callback = function(v) e.attackMode = v; sv() end}, "PLAtkMode")
 L:Slider({Name = "ระยะเริ่มฟัน (stud)", Default = e.reach, Minimum = 4, Maximum = 20, DisplayMethod = "Round", Precision = 0,
@@ -941,6 +1120,8 @@ L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required 
 local Rt = FarmTab:Section({Side = "Right"})
 Rt:Header({Text = "สถานะ"})
 local stLbl = Rt:Label({Text = "-"})
+Rt:Header({Text = "Smart: มอนที่เรียนรู้แล้ว"})
+local learnLbl = Rt:Label({Text = "-"})
 Rt:Header({Text = "ล่าสุด"})
 local logLbl = Rt:Label({Text = "-"})
 
@@ -966,6 +1147,11 @@ P:Slider({Name = "รัศมีวนรอบ (stud)", Default = e.orbitRadiu
 P:Slider({Name = "ความเร็ววนรอบ", Default = e.orbitSpeed, Minimum = 0.3, Maximum = 4, DisplayMethod = "Round", Precision = 1,
 	Callback = function(v) e.orbitSpeed = v; sv() end}, "PLOrbitS")
 P:Header({Text = "หลบดาเมจ"})
+P:Toggle({Name = "Smart: ถอยเฉพาะมอนที่ตีแรง (เรียนรู้จังหวะแต่ละตัว)", Default = e.smart, Callback = function(v) e.smart = v; sv() end}, "PLSmart")
+P:Slider({Name = "└ ตีแรง = โดนทีละ ≥ % ของเลือดตอนนั้น", Default = e.smartDanger, Minimum = 3, Maximum = 60, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.smartDanger = v; sv() end}, "PLSmartDanger")
+P:Slider({Name = "└ ระยะถอยออกจากมอน (stud)", Default = e.smartRange, Minimum = 8, Maximum = 30, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.smartRange = v; sv() end}, "PLSmartRange")
 P:Toggle({Name = "หลบวงเตือนท่ามอน (AttackBoxTelegraph)", Default = e.dodge, Callback = function(v) e.dodge = v; sv() end}, "PLDodge")
 P:Slider({Name = "ระยะเผื่อตอนหลบ (stud)", Default = e.dodgeMargin, Minimum = 0, Maximum = 10, DisplayMethod = "Round", Precision = 1,
 	Callback = function(v) e.dodgeMargin = v; sv() end}, "PLDodgeM")
@@ -984,6 +1170,9 @@ K:Dropdown({Name = "โหมดสกิล", Multi = false, Required = true, O
 K:Slider({Name = "└ ฮีลเมื่อเลือด ≤ %", Default = e.healAt, Minimum = 10, Maximum = 95, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.healAt = v; sv() end}, "PLHealAt")
 K:Label({Text = "เซิร์ฟเวอร์ยอมเฉพาะสกิลที่ใส่ในช่อง + คูลดาวน์หมด\nเปลี่ยนสกิลในเกมแล้วสคริปต์ใช้ตามเอง"})
+K:Toggle({Name = "อยู่ในวง AreaHeal จนวงหมด (7.5 วิ)", Default = e.stayInHeal, Callback = function(v) e.stayInHeal = v; sv() end}, "PLStayHeal")
+K:Slider({Name = "└ เว้นจากขอบวง (stud)", Default = e.healMargin, Minimum = 0, Maximum = 12, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.healMargin = v; sv() end}, "PLHealMargin")
 local K2 = SkTab:Section({Side = "Right"})
 K2:Header({Text = "สกิลที่ใส่อยู่"})
 local skLbl = K2:Label({Text = "-"})
@@ -1058,10 +1247,11 @@ task.spawn(function()
 			stLbl:UpdateName(table.concat({
 				st.status,
 				("เลือดเรา %s · โหมด %s · %s"):format(hum and ("%d/%d"):format(hum.Health, hum.MaxHealth) or "-", e.moveMode, e.pattern),
-				("ฆ่า %d · เก็บของ %d · สกิล %d · หลบ %d · โดนดึงกลับ %d"):format(st.kills, st.loots, st.skills, st.dodges, st.snaps),
+				("ฆ่า %d · เก็บของ %d · สกิล %d · หลบ %d · ถอย Smart %d · โดนดึงกลับ %d"):format(st.kills, st.loots, st.skills, st.dodges, st.evades or 0, st.snaps),
 				"อาวุธ: " .. tostring(st.weapon or "-"),
 			}, "\n"))
 			logLbl:UpdateName(#st.last > 0 and table.concat(st.last, "\n") or "-")
+			learnLbl:UpdateName(learnText())
 			local sk = {}
 			for _, name in ipairs(equippedSkills()) do
 				local left = (skillCd[name] or 0) - os.clock()
