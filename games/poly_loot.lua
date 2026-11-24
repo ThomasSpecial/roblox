@@ -49,6 +49,8 @@ local DEFAULTS = {
 	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 3, disWhenFull = true, bagFree = 3,
 	useAnchor = true, anchor = nil, anchorR = 150,
 	speedOn = false, speedMult = 1.2,
+	watchdog = true, wdTravel = 60, wdKill = 240, autoRejoin = true, wdReset = true,
+	usePotion = true, useFood = true, healItemAt = 45, healItemGap = 6, deathLog = {},
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
 	stayInHeal = true, healMargin = 4,
@@ -232,6 +234,7 @@ local lastPosSkip = false   -- our own unstuck hop: don't count it as a server s
 
 -- stuck watch: progress is sampled every 0.8 s while walking
 local stuck = {at = 0, pos = nil, n = 0}
+local unstick   -- defined below (forward-declared for walkTo / followRoute)
 local wallParams = RaycastParams.new()
 wallParams.FilterType = Enum.RaycastFilterType.Exclude
 -- a fat sweep at knee, waist and head height: a single thin ray slipped between fence rails and walked us into them
@@ -261,6 +264,36 @@ local function computePath(hrp, goal)
 	end
 	return false
 end
+unstick = function(hrp, hum, target, repath)
+	local now = os.clock()
+	local td = flat(target - hrp.Position).Magnitude
+	if stuck.target and (stuck.target - target).Magnitude > 2 then
+		-- reached / switched waypoint since the last check = progress
+		stuck.n, stuck.td, stuck.target, stuck.at = 0, td, target, now
+		return
+	end
+	if not stuck.td or now - stuck.at > 1 then
+		if stuck.td and td > 2.5 and stuck.td - td < 1 and hum.MoveDirection.Magnitude > 0.5
+			and hum.FloorMaterial ~= Enum.Material.Air then
+			stuck.n += 1
+			st.stuck = (st.stuck or 0) + 1
+			hum.Jump = true
+			stuck.pathOnly = now + 5
+			if stuck.n <= 2 then
+				repath()
+			else
+				local dir = flat(target - hrp.Position)
+				dir = dir.Magnitude > 0.1 and dir.Unit or hrp.CFrame.LookVector
+				hrp.CFrame = CFrame.new(hrp.Position + dir * math.min(4, td)) * (hrp.CFrame - hrp.Position)
+				lastPosSkip = true
+				if stuck.n >= 5 then stuck.n = 0; repath() end
+			end
+		elseif stuck.td and stuck.td - td >= 1 then
+			stuck.n = 0
+		end
+		stuck.td, stuck.target, stuck.at = td, target, now
+	end
+end
 local function walkTo(hrp, hum, goal)
 	local c = hrp.Parent
 	-- straight line when nothing is in the way, else Pathfinding (recomputed only when the goal moves or we get stuck);
@@ -287,34 +320,94 @@ local function walkTo(hrp, hum, goal)
 	end
 	mover.walk = target
 
-	-- unstuck, judged by progress toward the goal (sliding along a fence moves us but gets us nowhere):
-	-- 1) jump + Pathfinding only  2) path with a thinner agent  3+) short hop toward the next waypoint
-	-- (hops under ~10 studs pass the server's position check)
+	-- unstuck, judged by progress toward the CURRENT waypoint (a long path winds sideways, so distance to the final
+	-- goal often doesn't shrink while we walk it fine): 1) jump + Pathfinding only 2) thinner-agent path
+	-- 3+) short flat hop toward the waypoint (hops under ~10 studs pass the server's position check)
 	local now = os.clock()
-	local gd = flat(goal - hrp.Position).Magnitude
-	if not stuck.gd or now - stuck.at > 1 then
-		-- only when we are really pushing forward (MoveDirection > 0): standing still for another reason is not "stuck"
-		if stuck.gd and gd > 4 and stuck.gd - gd < 1.5 and (stuck.goal and (stuck.goal - goal).Magnitude < 6)
-			and hum.MoveDirection.Magnitude > 0.5 then
-			stuck.n += 1
-			st.stuck = (st.stuck or 0) + 1
-			hum.Jump = true
-			stuck.pathOnly = now + 5
-			if stuck.n <= 2 then
-				computePath(hrp, goal)
-			else
-				local dir = flat(target - hrp.Position)
-				dir = dir.Magnitude > 0.1 and dir.Unit or hrp.CFrame.LookVector
-				local hop = hrp.Position + dir * math.min(6, flat(target - hrp.Position).Magnitude + 1) + Vector3.new(0, 3, 0)
-				hrp.CFrame = CFrame.new(hop) * (hrp.CFrame - hrp.Position)
-				lastPosSkip = true
-				if stuck.n >= 5 then stuck.n = 0; computePath(hrp, goal) end
-			end
-		elseif stuck.gd and stuck.gd - gd >= 1.5 then
-			stuck.n = 0
-		end
-		stuck.gd, stuck.goal, stuck.at = gd, goal, now
+	unstick(hrp, hum, target, function() computePath(hrp, goal) end)
+end
+
+-- recorded route: our own footsteps from where a long trip started (normally the respawn in town) to the farm spot,
+-- saved to PolyLoot/route_<uid>.json the first time we arrive; later trips follow it instead of Pathfinding
+local ROUTE_FILE = ("PolyLoot/route_%d.json"):format(plr.UserId)
+local trail = {}          -- recent footsteps (grounded, >= 4 studs apart)
+local backtrack = {i = nil, stop = 1, untilT = 0}   -- watchdog: walk our footsteps backwards
+local busyUntil = 0     -- eating / drinking: the farm loop doesn't swing or re-equip until then
+local route = nil         -- {anchor = {x,y,z}, pts = {{x,y,z}, ...}}
+local routeI = nil
+local tripStart = nil     -- trail index where the current far-away trip began
+pcall(function()
+	if isfile and isfile(ROUTE_FILE) then
+		local t = HS:JSONDecode(readfile(ROUTE_FILE))
+		if type(t) == "table" and type(t.pts) == "table" and #t.pts >= 2 then route = t end
 	end
+end)
+local function routeFor(anchor)
+	if not (route and anchor and route.anchor) then return nil end
+	local a = Vector3.new(route.anchor[1], route.anchor[2], route.anchor[3])
+	return (a - anchor).Magnitude < 15 and route or nil
+end
+local function trailTick(hrp, hum)
+	if hum.FloorMaterial == Enum.Material.Air then return end
+	local last = trail[#trail]
+	local p = hrp.Position
+	if not last or (p - Vector3.new(last[1], last[2], last[3])).Magnitude >= 4 then
+		if last and (p - Vector3.new(last[1], last[2], last[3])).Magnitude > 30 then
+			-- a teleport / respawn: start a fresh trail
+			table.clear(trail)
+			tripStart = nil
+		end
+		trail[#trail + 1] = {math.floor(p.X * 10) / 10, math.floor(p.Y * 10) / 10, math.floor(p.Z * 10) / 10}
+		if #trail > 600 then
+			table.remove(trail, 1)
+			if tripStart then tripStart = math.max(1, tripStart - 1) end
+		end
+	end
+	local anchor = anchorPos()
+	if not anchor then return end
+	local da = flat(p - anchor).Magnitude
+	if da > e.anchorR + 150 then
+		tripStart = tripStart or #trail
+	elseif tripStart and da < 20 then
+		local pts = {}
+		for i = tripStart, #trail do pts[#pts + 1] = trail[i] end
+		if #pts >= 10 then
+			route = {anchor = {anchor.X, anchor.Y, anchor.Z}, pts = pts}
+			pcall(function()
+				if makefolder and not isfolder("PolyLoot") then makefolder("PolyLoot") end
+				writefile(ROUTE_FILE, HS:JSONEncode(route))
+			end)
+			log(("บันทึกเส้นทางมาจุดฟาร์มแล้ว (%d จุด)"):format(#pts))
+		end
+		tripStart = nil
+	end
+end
+-- walk the recorded route from the point nearest to us; false = not usable from here
+local function followRoute(hrp, hum)
+	local r = routeFor(anchorPos())
+	if not r then return false end
+	local p = hrp.Position
+	if not routeI then
+		local best, bd
+		for i, q in ipairs(r.pts) do
+			local d = (Vector3.new(q[1], q[2], q[3]) - p).Magnitude
+			if not bd or d < bd then best, bd = i, d end
+		end
+		if not best or bd > 40 then return false end
+		routeI = best
+	end
+	local q = r.pts[routeI]
+	while q and flat(Vector3.new(q[1], q[2], q[3]) - p).Magnitude < 3 do
+		routeI += 1
+		q = r.pts[routeI]
+	end
+	if not q then routeI = nil return false end
+	local target = Vector3.new(q[1], q[2], q[3])
+	if target.Y > p.Y + 1.5 then hum.Jump = true end
+	mover.walk = target
+	unstick(hrp, hum, target, function() routeI = nil end)
+	st.route = ("%d/%d"):format(routeI, #r.pts)
+	return true
 end
 
 -- one call per tick: send the character toward goal with the selected mode
@@ -337,6 +430,13 @@ local function moveTo(goal, free)
 	if e.moveMode == "Walk" then
 		mover.goal = nil
 		setControls(false)
+		-- far from the farm spot and heading back into it: use the recorded route when there is one
+		local a = anchorPos()
+		if a and flat(hrp.Position - a).Magnitude > e.anchorR + 40 and flat(goal - a).Magnitude < e.anchorR + 40 then
+			if followRoute(hrp, hum) then return end
+		else
+			routeI = nil
+		end
 		walkTo(hrp, hum, goal)
 	elseif e.moveMode == "Teleport" and (goal - hrp.Position).Magnitude <= e.tpMax then
 		mover.goal, mover.mode, mover.walk = goal, "tp", nil
@@ -364,6 +464,7 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	if lastPos and (hrp.Position - lastPos).Magnitude > 20 and not (mover.goal and mover.mode == "tp") and not lastPosSkip then
 		st.snaps += 1
 	end
+	if not lastPosSkip then pcall(trailTick, hrp, hum) end
 	lastPosSkip = false
 	do
 		local want = (e.farm and e.speedOn and e.speedMult ~= 1) and e.speedMult or nil
@@ -946,7 +1047,7 @@ end
 -- Kill Aura: any aggressor inside weapon reach gets swung at (the server's hitbox needs us next to it, so a real
 -- long-range aura is impossible)
 local function aura(c, hrp)
-	if not (e.aura and e.attack) then return false end
+	if not (e.aura and e.attack) or os.clock() < busyUntil then return false end
 	local folder = AnimalLive:FindFirstChild("Aggressors")
 	for _, m in ipairs(folder and folder:GetChildren() or {}) do
 		if mobAlive(m) then
@@ -967,6 +1068,22 @@ task.spawn(function()
 	while alive() do
 		local dt = 0.1
 		local ok, err = pcall(function()
+			if backtrack.i and os.clock() < backtrack.untilT then
+				local c, hrp, hum = char()
+				if not hrp then backtrack.i = nil return end
+				local q = trail[backtrack.i]
+				while q and flat(Vector3.new(q[1], q[2], q[3]) - hrp.Position).Magnitude < 3 and backtrack.i > backtrack.stop do
+					backtrack.i -= 1
+					q = trail[backtrack.i]
+				end
+				if not q or backtrack.i <= backtrack.stop then backtrack.i = nil; path.wps = nil return end
+				setControls(false)
+				mover.goal = nil
+				mover.walk = Vector3.new(q[1], q[2], q[3])
+				st.status = ("Watchdog: เดินย้อนรอยเท้า (%d)"):format(backtrack.i - backtrack.stop)
+				return
+			end
+			backtrack.i = nil
 			if trip.active then
 				local _, hrp = char()
 				if not hrp then return end
@@ -1146,7 +1263,9 @@ task.spawn(function()
 			end
 
 			-- attack when in reach (the hitbox is the server's; reach ~ stand distance + a few studs)
-			if e.attack and dist <= e.reach and ensureWeapon() then
+			if os.clock() < busyUntil then
+				-- eating / drinking: hands are busy
+			elseif e.attack and dist <= e.reach and ensureWeapon() then
 				-- Tool:Activate() runs the game's own swing: animation, combo 1-2-3 and its timing
 				face(hrp, tp)
 				swingNow(c)
@@ -1162,6 +1281,162 @@ task.spawn(function()
 	endCombo()
 	mover.goal = nil
 	pcall(function() local _, _, hum = char(); if hum then hum.AutoRotate = true end end)
+end)
+
+-- ------------------------------------------------------------------ heal items (potions / food)
+-- Consumables are used like the hotbar does: EquipRequest(serial) puts the item in hand, Tool:Activate() eats /
+-- drinks it, EquipRequest(weaponSerial) puts the weapon back (verified: Apple 76 -> 75, sword back in hand).
+local InvRemotes = RS.Inventory_Engine.Remotes
+local HEAL_ORDER = {"HealthPotion2", "HealthPotion", "GoldenApple", "Cake", "JungleCookies", "BananaBread", "Banana",
+	"Coconut", "Milk", "Bandage", "Apple"}
+local FOODS = {GoldenApple = true, Cake = true, JungleCookies = true, BananaBread = true, Banana = true, Coconut = true,
+	Milk = true, Apple = true, Bandage = true}
+local lastHeal = 0
+local function healItem(d)
+	local cons = (d.Inventory or {}).Consumables or {}
+	for _, id in ipairs(HEAL_ORDER) do
+		if (FOODS[id] and e.useFood) or (not FOODS[id] and e.usePotion) then
+			for serial, it in pairs(cons) do
+				if it.Id == id and (tonumber(it.Count) or 0) > 0 then return serial, id end
+			end
+		end
+	end
+end
+local function useHeal()
+	local d = invData()
+	local c, _, hum = char()
+	if not (d and c) then return end
+	local serial, id = healItem(d)
+	if not serial then return end
+	busyUntil = os.clock() + 3
+	lastHeal = os.clock()
+	pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
+	for _ = 1, 10 do
+		task.wait(0.1)
+		local held = c:FindFirstChildOfClass("Tool")
+		if held and held.Name ~= st.weapon then pcall(function() held:Activate() end) break end
+	end
+	task.wait(1.6)
+	local w = d.Equipped and d.Equipped.Weapon
+	if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+	task.wait(0.4)
+	busyUntil = 0
+	st.heals = (st.heals or 0) + 1
+	log(("กิน %s (เลือด %d%%)"):format(id, hpPct()))
+end
+task.spawn(function()
+	while alive() do
+		task.wait(0.25)
+		if e.farm and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
+			and os.clock() - lastHeal > e.healItemGap then
+			pcall(useHeal)
+		end
+	end
+end)
+
+-- death log: what we were fighting, who was around, who landed the last hit
+local function bindDeath(c)
+	local hum = c:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	hum.Died:Connect(function()
+		if not alive() then return end
+		local hrp = c:FindFirstChild("HumanoidRootPart")
+		local around = {}
+		for m, rec in pairs(mobState) do
+			if m.Parent and hrp then
+				local ok, pos = pcall(function() return m:GetPivot().Position end)
+				if ok and (pos - hrp.Position).Magnitude < 25 then
+					around[#around + 1] = ("%s(%s)"):format(tostring(m:GetAttribute("Animal")), tostring(rec.state))
+				end
+			end
+		end
+		local lastBy = recent[#recent] and recent[#recent].name or "?"
+		st.deaths = (st.deaths or 0) + 1
+		local line = ("ตาย: เป้า %s · รอบตัว %s · โดนล่าสุดจาก %s"):format(st.target and tostring(st.target:GetAttribute("Animal")) or "-",
+			#around > 0 and table.concat(around, ",") or "-", lastBy)
+		log(line)
+		e.deathLog = e.deathLog or {}
+		table.insert(e.deathLog, 1, os.date("%m-%d %H:%M ") .. line)
+		while #e.deathLog > 20 do table.remove(e.deathLog) end
+		sv()
+	end)
+end
+if plr.Character then task.spawn(bindDeath, plr.Character) end
+plr.CharacterAdded:Connect(bindDeath)
+
+-- ------------------------------------------------------------------ watchdog (unattended / overnight)
+-- 1) heading back to the farm spot but the distance hasn't shrunk 15 studs in wdTravel s -> reset the character
+--    (respawn in town, from where Pathfinding / the recorded route reaches the spot)
+-- 2) a target exists but nothing died for wdKill s -> reset
+-- 3) kicked / disconnected -> rejoin this place; the loader is queued to run again after the teleport
+local LOADER_URL = "https://raw.githubusercontent.com/ThomasSpecial/roblox/main/loader.lua"
+local wd = {best = nil, at = os.clock(), kills = 0, killAt = os.clock(), grace = 0, tries = 0}
+local function resetChar(why)
+	local _, _, hum = char()
+	if not hum then return end
+	st.resets = (st.resets or 0) + 1
+	log("Watchdog รีเซ็ตตัวละคร: " .. why)
+	wd.grace = os.clock() + 25
+	wd.best, wd.at, wd.killAt = nil, os.clock(), os.clock()
+	routeI = nil
+	path.wps = nil
+	pcall(function() hum.Health = 0 end)
+end
+task.spawn(function()
+	while alive() do
+		task.wait(5)
+		pcall(function()
+			local now = os.clock()
+			if st.kills ~= wd.kills then wd.kills, wd.killAt = st.kills, now end
+			if not (e.farm and e.watchdog) or now < wd.grace or trip.active then
+				wd.best, wd.at = nil, now
+				if not e.farm then wd.killAt = now end
+				return
+			end
+			local _, hrp = char()
+			if not hrp then wd.at, wd.killAt = now, now return end
+			local a = anchorPos()
+			if a then
+				local d = flat(hrp.Position - a).Magnitude
+				if d > e.anchorR + 40 then
+					if not wd.best or d < wd.best - 15 then wd.best, wd.at, wd.tries = d, now, 0 end
+					if now - wd.at > e.wdTravel then
+						wd.tries = (wd.tries or 0) + 1
+						if wd.tries <= 2 or not e.wdReset then
+							-- walk back the way we came (~100 studs of our own footsteps), then Pathfinding again
+							backtrack.i = #trail
+							backtrack.stop = math.max(1, #trail - 25)
+							backtrack.untilT = now + 20
+							path.wps, routeI = nil, nil
+							st.backtracks = (st.backtracks or 0) + 1
+							log(("Watchdog: ติด → เดินย้อนรอยเท้า (ครั้งที่ %d)"):format(wd.tries))
+							wd.at = now
+						else
+							resetChar(("เดินย้อนแล้วยังติด (ห่าง %.0f)"):format(d))
+						end
+						return
+					end
+				else
+					wd.best, wd.at, wd.tries = nil, now, 0
+				end
+			end
+			if st.target and now - wd.killAt > e.wdKill and e.wdReset then resetChar(("ไม่ได้ฆ่ามอนเลย %d วิ"):format(e.wdKill)) end
+			st.wd = ("ฆ่าล่าสุด %d วิก่อน%s"):format(now - wd.killAt, wd.best and (" · ระยะกลับ %.0f (คืบล่าสุด %d วิก่อน)"):format(wd.best, now - wd.at) or "")
+		end)
+	end
+end)
+pcall(function()
+	game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
+		if not (alive() and e.autoRejoin) or msg == "" then return end
+		log("หลุดจากเกม: " .. tostring(msg) .. " → เข้าใหม่")
+		local qot = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+		if qot then pcall(qot, ('loadstring(game:HttpGet("%s"))()'):format(LOADER_URL)) end
+		task.wait(5)
+		for _ = 1, 20 do
+			pcall(function() game:GetService("TeleportService"):Teleport(game.PlaceId, plr) end)
+			task.wait(15)
+		end
+	end)
 end)
 
 -- anti-AFK
@@ -1243,6 +1518,11 @@ L:Button({Name = "ตั้งจุดฟาร์ม = ตรงที่ย�
 	local _, hrp = char()
 	if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
 end})
+L:Button({Name = "ลบเส้นทางที่บันทึกไว้ (ให้บันทึกใหม่)", Callback = function()
+	route, routeI = nil, nil
+	pcall(function() if delfile and isfile(ROUTE_FILE) then delfile(ROUTE_FILE) end end)
+	log("ลบเส้นทางแล้ว")
+end})
 L:Button({Name = "ล้างจุดฟาร์ม (กลับไปใช้ระยะค้นหารอบตัว)", Callback = function() setAnchor(nil); log("ล้างจุดฟาร์มแล้ว") end})
 L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required = true, Options = TARGET_OPTS,
 	Default = idx(TARGET_OPTS, e.targetMode), Callback = function(v) e.targetMode = v; sv() end}, "PLTarget")
@@ -1304,6 +1584,13 @@ K:Dropdown({Name = "โหมดสกิล", Multi = false, Required = true, O
 K:Slider({Name = "└ ฮีลเมื่อเลือด ≤ %", Default = e.healAt, Minimum = 10, Maximum = 95, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.healAt = v; sv() end}, "PLHealAt")
 K:Label({Text = "เซิร์ฟเวอร์ยอมเฉพาะสกิลที่ใส่ในช่อง + คูลดาวน์หมด\nเปลี่ยนสกิลในเกมแล้วสคริปต์ใช้ตามเอง"})
+K:Header({Text = "กินยา / ของกินเมื่อเลือดต่ำ"})
+K:Toggle({Name = "ใช้ยา (HealthPotion)", Default = e.usePotion, Callback = function(v) e.usePotion = v; sv() end}, "PLUsePot")
+K:Toggle({Name = "ใช้ของกิน (GoldenApple / Apple / ...)", Default = e.useFood, Callback = function(v) e.useFood = v; sv() end}, "PLUseFood")
+K:Slider({Name = "└ กินเมื่อเลือด ≤ %", Default = e.healItemAt, Minimum = 10, Maximum = 90, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.healItemAt = v; sv() end}, "PLHealItemAt")
+K:Slider({Name = "└ เว้นระหว่างกิน (วิ)", Default = e.healItemGap, Minimum = 2, Maximum = 30, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.healItemGap = v; sv() end}, "PLHealItemGap")
 K:Toggle({Name = "อยู่ในวง AreaHeal จนวงหมด (7.5 วิ)", Default = e.stayInHeal, Callback = function(v) e.stayInHeal = v; sv() end}, "PLStayHeal")
 K:Slider({Name = "└ เว้นจากขอบวง (stud)", Default = e.healMargin, Minimum = 0, Maximum = 12, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.healMargin = v; sv() end}, "PLHealMargin")
@@ -1373,6 +1660,15 @@ local SetTab = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"})
 local SS = SetTab:Section({Side = "Left"})
 SS:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
 	Callback = function() pcall(function() Win:SetState(not Win:GetState()) end) end}, "PLToggleUI")
+SS:Header({Text = "Watchdog (ปล่อยทิ้งไว้ข้ามคืน)"})
+SS:Toggle({Name = "Watchdog: ติดนาน → รีเซ็ตตัวละคร", Default = e.watchdog, Callback = function(v) e.watchdog = v; sv() end}, "PLWd")
+SS:Slider({Name = "└ เดินกลับจุดฟาร์มไม่คืบ (วิ)", Default = e.wdTravel, Minimum = 20, Maximum = 300, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.wdTravel = v; sv() end}, "PLWdTravel")
+SS:Slider({Name = "└ ไม่ได้ฆ่ามอนเลย (วิ)", Default = e.wdKill, Minimum = 60, Maximum = 900, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.wdKill = v; sv() end}, "PLWdKill")
+SS:Toggle({Name = "└ ทางสุดท้าย: รีเซ็ตตัวละคร (ตาย 1 ครั้ง)", Default = e.wdReset, Callback = function(v) e.wdReset = v; sv() end}, "PLWdReset")
+SS:Label({Text = "ติด → เดินย้อนรอยเท้า 2 รอบก่อน · ยังติดอยู่ค่อยรีเซ็ต (ถ้าเปิดไว้)"})
+SS:Toggle({Name = "หลุดเกม → เข้าใหม่อัตโนมัติ", Default = e.autoRejoin, Callback = function(v) e.autoRejoin = v; sv() end}, "PLRejoin")
 SS:Toggle({Name = "ถืออาวุธให้อัตโนมัติ", Default = e.equip, Callback = function(v) e.equip = v; sv() end}, "PLEquip")
 SS:Toggle({Name = "Anti-AFK", Default = e.antiAfk, Callback = function(v) e.antiAfk = v; sv() end}, "PLAntiAfk")
 SS:Label({Text = "God Mode / Inf Damage ทำไม่ได้: ดาเมจคิดฝั่งเซิร์ฟเวอร์\nXP / เหรียญเข้าตัวตอนมอนตายเอง · ของชิ้นใช้ Instant Loot\nตั้งค่าเซฟที่: " .. SF})
@@ -1386,12 +1682,17 @@ task.spawn(function()
 				(function()
 					local a = anchorPos()
 					local _, hrp = char()
-					return a and ("จุดฟาร์ม %.0f,%.0f,%.0f · ห่าง %.0f stud"):format(a.X, a.Y, a.Z, hrp and flat(a - hrp.Position).Magnitude or 0) or "จุดฟาร์ม: ไม่ได้ตั้ง (ใช้ระยะค้นหารอบตัว)"
+					local r = routeFor(a)
+					return a and ("จุดฟาร์ม %.0f,%.0f,%.0f · ห่าง %.0f stud · เส้นทาง: %s"):format(a.X, a.Y, a.Z, hrp and flat(a - hrp.Position).Magnitude or 0,
+						r and (#r.pts .. " จุด" .. (routeI and (" (เดินอยู่ " .. tostring(st.route) .. ")") or "")) or "ยังไม่มี (บันทึกตอนเดินมาถึงครั้งแรก)")
+						or "จุดฟาร์ม: ไม่ได้ตั้ง (ใช้ระยะค้นหารอบตัว)"
 				end)(),
 				("ดาเมจเรา ~%d/วิ (วัดจากที่ตีจริง)"):format(st.dps or 1200),
 				("เลือดเรา %s · โหมด %s · %s"):format(hum and ("%d/%d"):format(hum.Health, hum.MaxHealth) or "-", e.moveMode, e.pattern),
 				("ฆ่า %d · เก็บของ %d · สกิล %d · หลบ %d · ถอย Smart %d · โดนดึงกลับ %d"):format(st.kills, st.loots, st.skills, st.dodges, st.evades or 0, st.snaps),
 				"อาวุธ: " .. tostring(st.weapon or "-"),
+				("Watchdog: %s · ย้อนรอย %d · รีเซ็ต %d"):format(tostring(st.wd or "-"), st.backtracks or 0, st.resets or 0),
+				("ตาย %d · กินยา/ของกิน %d%s"):format(st.deaths or 0, st.heals or 0, (e.deathLog or {})[1] and ("\nตายล่าสุด " .. e.deathLog[1]) or ""),
 			}, "\n"))
 			logLbl:UpdateName(#st.last > 0 and table.concat(st.last, "\n") or "-")
 			learnLbl:UpdateName(learnText())
