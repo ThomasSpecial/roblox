@@ -47,6 +47,8 @@ local DEFAULTS = {
 	retreat = true, retreatAt = 35, resumeAt = 80, antiAfk = true, equip = true,
 	loot = true, lootAlways = false, lootRadius = 80,
 	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 3, disWhenFull = true, bagFree = 3,
+	useAnchor = true, anchor = nil, anchorR = 150,
+	speedOn = false, speedMult = 1.2,
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
 	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
 	stayInHeal = true, healMargin = 4,
@@ -127,15 +129,26 @@ local function wanted(m)
 	if any and not e.mobs[m:GetAttribute("Animal") or ""] then return false end
 	return true
 end
+-- farm spot: only mobs within anchorR of it count, and after a death / respawn we walk back to it
+local function anchorPos()
+	local a = e.useAnchor and e.anchor
+	return type(a) == "table" and tonumber(a[1]) and Vector3.new(a[1], a[2], a[3]) or nil
+end
+local function setAnchor(pos)
+	e.anchor = pos and {math.floor(pos.X * 10) / 10, math.floor(pos.Y * 10) / 10, math.floor(pos.Z * 10) / 10} or nil
+	sv()
+end
 local function pickTarget(hrp)
 	local best, bestScore
+	local anchor = anchorPos()
 	local folders = {AnimalLive:FindFirstChild("Aggressors")}
 	if e.passives then folders[#folders + 1] = AnimalLive:FindFirstChild("Passives") end
 	for _, folder in ipairs(folders) do
 		for _, m in ipairs(folder and folder:GetChildren() or {}) do
 			if wanted(m) then
-				local d = (mobPos(m) - hrp.Position).Magnitude
-				if d <= e.radius then
+				local mp = mobPos(m)
+				local d = (mp - hrp.Position).Magnitude
+				if (anchor and flat(mp - anchor).Magnitude <= e.anchorR) or (not anchor and d <= e.radius) then
 					local hp = tonumber(m:GetAttribute("Health")) or 0
 					local score = (e.targetMode == "เลือดน้อยสุด" and hp) or (e.targetMode == "เลือดมากสุด" and -hp) or d
 					if not bestScore or score < bestScore then best, bestScore = m, score end
@@ -303,6 +316,10 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 		st.snaps += 1
 	end
 	lastPosSkip = false
+	do
+		local want = (e.farm and e.speedOn and e.speedMult ~= 1) and e.speedMult or nil
+		if hum:GetAttribute("_WSMultC_PolyLoot") ~= want then hum:SetAttribute("_WSMultC_PolyLoot", want) end
+	end
 	if mover.walk then
 		local d = flat(mover.walk - hrp.Position)
 		if d.Magnitude > 0.8 then
@@ -593,6 +610,8 @@ local function invPass(manual)
 	end
 end
 st.invPass = invPass   -- debug handle
+st.setAnchor = function(pos) setAnchor(pos) end
+st.cfg = e
 task.spawn(function()
 	while alive() do
 		if e.sell or e.dismantle then pcall(invPass) end
@@ -938,7 +957,11 @@ task.spawn(function()
 				log(("ฆ่า %s (รวม %d)"):format(tostring(t:GetAttribute("Animal")), st.kills))
 				t = nil
 			end
-			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
+			local anchor = anchorPos()
+			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" then
+				if anchor and flat(mobPos(t) - anchor).Magnitude > e.anchorR + 30 then t = nil
+				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
+			end
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) then t = nil end
 			-- non-lock modes re-check twice a second: a mob that (re)spawned closer / weaker takes over,
 			-- with a margin so two similar mobs don't flip-flop
@@ -969,8 +992,16 @@ task.spawn(function()
 			end
 			st.target = t
 			if not t then
-				endCombo(); lookAt = nil; stopMove()
-				st.status = ("ไม่มีมอนที่เลือกในระยะ %d"):format(e.radius)
+				endCombo(); lookAt = nil
+				if anchor and flat(anchor - hrp.Position).Magnitude > 12 then
+					-- nothing to hit near the farm spot from here (e.g. just respawned in town): walk back
+					if not aura(c, hrp) then endCombo() end
+					moveTo(anchor)
+					st.status = ("กลับจุดฟาร์ม · %.0f stud"):format(flat(anchor - hrp.Position).Magnitude)
+				else
+					stopMove()
+					st.status = anchor and ("รอมอนเกิดรอบจุดฟาร์ม (รัศมี %d)"):format(e.anchorR) or ("ไม่มีมอนที่เลือกในระยะ %d"):format(e.radius)
+				end
 				return
 			end
 			local tp = mobPos(t)
@@ -1092,7 +1123,15 @@ local FarmTab = TG:Tab({Name = "Farm", Image = "rbxassetid://10723346959"})
 
 local L = FarmTab:Section({Side = "Left"})
 L:Header({Text = "Auto Farm"})
-L:Toggle({Name = "Auto Farm (ล็อกมอน · เดินไปตี)", Default = e.farm, Callback = function(v) e.farm = v; sv() end}, "PLFarm")
+L:Toggle({Name = "Auto Farm (ล็อกมอน · เดินไปตี)", Default = e.farm, Callback = function(v)
+	e.farm = v
+	-- first start with no farm spot yet: here becomes the spot
+	if v and e.useAnchor and not e.anchor then
+		local _, hrp = char()
+		if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
+	end
+	sv()
+end}, "PLFarm")
 L:Toggle({Name = "Auto Attack", Default = e.attack, Callback = function(v) e.attack = v; sv() end}, "PLAttack")
 L:Toggle({Name = "Kill Aura (ฟันทุกตัวที่อยู่ในระยะ แม้ตอนเดิน/เก็บของ)", Default = e.aura, Callback = function(v) e.aura = v; sv() end}, "PLAura")
 L:Dropdown({Name = "วิธีโจมตี", Multi = false, Required = true, Options = {ATTACK_GAME, ATTACK_REMOTE},
@@ -1127,6 +1166,15 @@ L:Toggle({Name = "เฉพาะบอส (Tier = Boss)", Default = e.bossOnly,
 L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
 L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
+L:Header({Text = "จุดฟาร์ม (ตายแล้วกลับมาที่เดิม)"})
+L:Toggle({Name = "ฟาร์มเฉพาะรอบจุดฟาร์ม", Default = e.useAnchor, Callback = function(v) e.useAnchor = v; sv() end}, "PLAnchorOn")
+L:Slider({Name = "└ รัศมีรอบจุดฟาร์ม (stud)", Default = e.anchorR, Minimum = 30, Maximum = 600, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.anchorR = v; sv() end}, "PLAnchorR")
+L:Button({Name = "ตั้งจุดฟาร์ม = ตรงที่ยืนอยู่", Callback = function()
+	local _, hrp = char()
+	if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
+end})
+L:Button({Name = "ล้างจุดฟาร์ม (กลับไปใช้ระยะค้นหารอบตัว)", Callback = function() setAnchor(nil); log("ล้างจุดฟาร์มแล้ว") end})
 L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required = true, Options = TARGET_OPTS,
 	Default = idx(TARGET_OPTS, e.targetMode), Callback = function(v) e.targetMode = v; sv() end}, "PLTarget")
 
@@ -1143,6 +1191,10 @@ local M = MoveTab:Section({Side = "Left"})
 M:Header({Text = "การเคลื่อนที่"})
 M:Dropdown({Name = "วิธีเดินทาง", Multi = false, Required = true, Options = MOVE_OPTS,
 	Default = idx(MOVE_OPTS, e.moveMode), Callback = function(v) e.moveMode = v; stopMove(); sv() end}, "PLMove")
+M:Toggle({Name = "ปรับความเร็ววิ่งตอนฟาร์ม", Default = e.speedOn, Callback = function(v) e.speedOn = v; sv() end}, "PLSpeedOn")
+M:Slider({Name = "└ ความเร็ว x เท่า (1.0 = ปกติ 20)", Default = e.speedMult, Minimum = 1, Maximum = 2, DisplayMethod = "Round", Precision = 2,
+	Callback = function(v) e.speedMult = v; sv() end}, "PLSpeedMult")
+M:Label({Text = "ใช้ระบบความเร็วของเกมเอง (ฟันแล้วช้าลงเหมือนเดิม)\nเซิร์ฟเวอร์เช็กความเร็ว: เกิน ~1.3 เท่า (26) อาจโดนดึงกลับ\nดูตัวเลข 'โดนดึงกลับ' ในหน้า Farm ถ้าขึ้น = ลดลง"})
 M:Slider({Name = "ความเร็ว Tween (stud/วินาที)", Default = e.tweenSpeed, Minimum = 10, Maximum = 120, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.tweenSpeed = v; sv() end}, "PLTweenSpeed")
 M:Slider({Name = "Teleport ไกลสุดต่อครั้ง (stud)", Default = e.tpMax, Minimum = 10, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
@@ -1262,6 +1314,11 @@ task.spawn(function()
 			local _, _, hum = char()
 			stLbl:UpdateName(table.concat({
 				st.status,
+				(function()
+					local a = anchorPos()
+					local _, hrp = char()
+					return a and ("จุดฟาร์ม %.0f,%.0f,%.0f · ห่าง %.0f stud"):format(a.X, a.Y, a.Z, hrp and flat(a - hrp.Position).Magnitude or 0) or "จุดฟาร์ม: ไม่ได้ตั้ง (ใช้ระยะค้นหารอบตัว)"
+				end)(),
 				("เลือดเรา %s · โหมด %s · %s"):format(hum and ("%d/%d"):format(hum.Health, hum.MaxHealth) or "-", e.moveMode, e.pattern),
 				("ฆ่า %d · เก็บของ %d · สกิล %d · หลบ %d · ถอย Smart %d · โดนดึงกลับ %d"):format(st.kills, st.loots, st.skills, st.dodges, st.evades or 0, st.snaps),
 				"อาวุธ: " .. tostring(st.weapon or "-"),
@@ -1313,6 +1370,7 @@ task.spawn(function()
 	pcall(function() idleConn:Disconnect() end)
 	mover.walk = nil
 	setControls(true)
+	pcall(function() local _, _, hum = char(); if hum then hum:SetAttribute("_WSMultC_PolyLoot", nil) end end)
 	pcall(function() local _, _, hum = char(); if hum then hum.AutoRotate = true; hum:Move(Vector3.zero) end end)
 end)
 pcall(function()
