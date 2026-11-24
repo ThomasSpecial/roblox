@@ -48,6 +48,7 @@ local DEFAULTS = {
 	loot = true, lootAlways = false, lootRadius = 80,
 	sell = false, sellRar = {}, dismantle = false, disRar = {}, invEvery = 20, disMin = 10,
 	autoStats = false, statW = {Damage = 0, Health = 0, Defense = 0},
+	claimQuest = true, claimIndex = true, claimPlaytime = true, claimDaily = true,
 }
 local e = {}
 pcall(function() if isfile and isfile(SF) then local t = HS:JSONDecode(readfile(SF)); if type(t) == "table" then e = t end end end)
@@ -150,9 +151,14 @@ local mover = {goal = nil, mode = nil, walk = nil}
 local Controls
 pcall(function() Controls = require(plr.PlayerScripts:WaitForChild("PlayerModule", 5)):GetControls() end)
 local controlsOff = false
+-- a respawn brings the ControlModule back (it zeroes Humanoid:Move every frame) -> disable it again next walk
+plr.CharacterAdded:Connect(function() controlsOff = false end)
+local controlsAt = 0
 local function setControls(on)
-	if not Controls or controlsOff == not on then return end
-	controlsOff = not on
+	if not Controls then return end
+	-- "off" is re-asserted every 2 s: a respawn or an older copy of this script unloading can switch it back on
+	if controlsOff == not on and (on or os.clock() - controlsAt < 2) then return end
+	controlsOff, controlsAt = not on, os.clock()
 	pcall(function() if on then Controls:Enable() else Controls:Disable() end end)
 end
 local path = {goal = nil, wps = nil, i = 0, at = 0}
@@ -221,7 +227,9 @@ local function walkTo(hrp, hum, goal)
 	local now = os.clock()
 	local gd = flat(goal - hrp.Position).Magnitude
 	if not stuck.gd or now - stuck.at > 1 then
-		if stuck.gd and gd > 4 and stuck.gd - gd < 1.5 and (stuck.goal and (stuck.goal - goal).Magnitude < 6) then
+		-- only when we are really pushing forward (MoveDirection > 0): standing still for another reason is not "stuck"
+		if stuck.gd and gd > 4 and stuck.gd - gd < 1.5 and (stuck.goal and (stuck.goal - goal).Magnitude < 6)
+			and hum.MoveDirection.Magnitude > 0.5 then
 			stuck.n += 1
 			st.stuck = (st.stuck or 0) + 1
 			hum.Jump = true
@@ -594,6 +602,95 @@ task.spawn(function()
 	end
 end)
 
+-- ------------------------------------------------------------------ auto claim
+-- Quests: Quest_Engine.Remotes.Claim:FireServer(questId) (the Quests window's Claim button); ids come from
+--   Data.Quests.Daily.Slots, Achievements.Progress and Story.Active; Daily/Achievements .Completed = already claimed.
+-- Index: Index_Engine.Remotes.ClaimReward:InvokeServer(category, key) for entries not yet "Claimed".
+-- Playtime: Reward_Engine.Remotes.ClaimPlaytime:InvokeServer(tier); Data.Rewards.Playtime.Claimed[tier].
+-- Daily login: Reward_Engine.Remotes.ClaimDaily:InvokeServer() once Data.Rewards.Daily.NextDailyAt has passed.
+local QuestClaim = RS:WaitForChild("Quest_Engine"):WaitForChild("Remotes"):WaitForChild("Claim")
+local IndexClaim = RS:WaitForChild("Index_Engine"):WaitForChild("Remotes"):WaitForChild("ClaimReward")
+local RewardRemotes = RS:WaitForChild("Reward_Engine"):WaitForChild("Remotes")
+local ClaimPlaytime = RewardRemotes:WaitForChild("ClaimPlaytime")
+local ClaimDaily = RewardRemotes:WaitForChild("ClaimDaily")
+local questTried = {}   -- id -> os.clock() of the last attempt (unfinished quests are refused; retry slowly)
+-- quest rewards arrive as ShowRewardPopup(rewards, claimId) and are only granted on ConfirmReward(claimId), which the
+-- game sends when the popup is closed -> confirm it ourselves so an AFK farm doesn't leave rewards hanging
+local confirmed = {}
+pcall(function()
+	RewardRemotes:WaitForChild("ShowRewardPopup").OnClientEvent:Connect(function(_, claimId)
+		if not claimId or not e.claimQuest then return end
+		task.delay(2, function()
+			if confirmed[claimId] or not alive() then return end
+			confirmed[claimId] = true
+			pcall(function() RewardRemotes.ConfirmReward:FireServer(claimId) end)
+			st.claims = (st.claims or 0) + 1
+			log("รับรางวัลเควส")
+		end)
+	end)
+end)
+local function claimPass()
+	local d = invData()
+	if not d then return end
+	if e.claimQuest then
+		local q = d.Quests or {}
+		local ids = {}
+		local daily = q.Daily or {}
+		for _, id in pairs(daily.Slots or {}) do if not (daily.Completed or {})[id] then ids[#ids + 1] = id end end
+		local ach = q.Achievements or {}
+		for id in pairs(ach.Progress or {}) do if not (ach.Completed or {})[id] then ids[#ids + 1] = id end end
+		for id in pairs((q.Story or {}).Active or {}) do ids[#ids + 1] = id end
+		for _, id in ipairs(ids) do
+			if os.clock() - (questTried[id] or -1e9) > 120 then
+				questTried[id] = os.clock()
+				pcall(function() QuestClaim:FireServer(id) end)
+				task.wait(0.25)
+			end
+		end
+	end
+	if e.claimIndex then
+		for cat, t in pairs(d.Index or {}) do
+			if type(t) == "table" then
+				for key, state in pairs(t) do
+					if state ~= "Claimed" then
+						local ok, r = pcall(function() return IndexClaim:InvokeServer(cat, key) end)
+						if ok and r then st.claims = (st.claims or 0) + 1; log("รับ Index " .. tostring(key)) end
+						task.wait(0.3)
+					end
+				end
+			end
+		end
+	end
+	local rw = d.Rewards or {}
+	if e.claimPlaytime then
+		local claimed = ((rw.Playtime or {}).Claimed) or {}
+		for tier = 1, 12 do
+			if not claimed[tier] and not claimed[tostring(tier)] then
+				local ok, r = pcall(function() return ClaimPlaytime:InvokeServer(tier) end)
+				if ok and r and (r == true or (type(r) == "table" and r.ok ~= false and r.success ~= false)) then
+					st.claims = (st.claims or 0) + 1; log("รับ Playtime ขั้น " .. tier)
+				end
+				break   -- tiers unlock in order: only the next one can be ready
+			end
+		end
+	end
+	if e.claimDaily then
+		local dl = rw.Daily or {}
+		local now = os.time()
+		if (tonumber(dl.Available) or 0) > 0 or (tonumber(dl.NextDailyAt) and now >= dl.NextDailyAt) then
+			local ok, r = pcall(function() return ClaimDaily:InvokeServer() end)
+			if ok and r then st.claims = (st.claims or 0) + 1; log("รับ Daily") end
+		end
+	end
+end
+task.spawn(function()
+	task.wait(3)
+	while alive() do
+		if e.claimQuest or e.claimIndex or e.claimPlaytime or e.claimDaily then pcall(claimPass) end
+		for _ = 1, 30 do if not alive() then break end task.wait(1) end
+	end
+end)
+
 -- ------------------------------------------------------------------ farm loop
 local combo, swingAt, swinging = 0, 0, false
 local function endCombo()
@@ -911,6 +1008,18 @@ local SR = StTab:Section({Side = "Right"})
 SR:Header({Text = "สเตตัสตอนนี้"})
 local statLbl = SR:Label({Text = "-"})
 
+local RwTab = TG:Tab({Name = "Rewards", Image = "rbxassetid://10723346959"})
+local RL = RwTab:Section({Side = "Left"})
+RL:Header({Text = "Auto Claim (เช็กทุก 30 วิ)"})
+RL:Toggle({Name = "Auto Claim Quest (Daily / Achievement / Story)", Default = e.claimQuest, Callback = function(v) e.claimQuest = v; sv() end}, "PLCQuest")
+RL:Toggle({Name = "Auto Claim Index", Default = e.claimIndex, Callback = function(v) e.claimIndex = v; sv() end}, "PLCIndex")
+RL:Toggle({Name = "Auto Claim Playtime", Default = e.claimPlaytime, Callback = function(v) e.claimPlaytime = v; sv() end}, "PLCPlay")
+RL:Toggle({Name = "Auto Claim Daily", Default = e.claimDaily, Callback = function(v) e.claimDaily = v; sv() end}, "PLCDaily")
+RL:Button({Name = "เคลมตอนนี้เลย", Callback = function() task.spawn(function() pcall(claimPass) end) end})
+local RR = RwTab:Section({Side = "Right"})
+RR:Header({Text = "สถานะรางวัล"})
+local rwLbl = RR:Label({Text = "-"})
+
 local SetTab = TG:Tab({Name = "Settings", Image = "rbxassetid://10734950309"})
 local SS = SetTab:Section({Side = "Left"})
 SS:Keybind({Name = "เปิด/ปิด UI", Blacklist = false, Default = Enum.KeyCode.RightShift,
@@ -938,6 +1047,14 @@ task.spawn(function()
 			skLbl:UpdateName(#sk > 0 and table.concat(sk, "\n") or "ไม่มีสกิลในช่อง")
 			local d = invData()
 			if d then
+				local rw = d.Rewards or {}
+				local pt, dl = rw.Playtime or {}, rw.Daily or {}
+				local nClaimed = 0
+				for _ in pairs(pt.Claimed or {}) do nClaimed += 1 end
+				local left = (tonumber(dl.NextDailyAt) or 0) - os.time()
+				rwLbl:UpdateName(("Playtime: รับแล้ว %d ขั้น · เล่นมา %d นาที\nDaily: streak %s · %s\nเคลมรอบนี้ %d"):format(nClaimed,
+					math.floor((tonumber(pt.Accrued) or 0) / 60), tostring(dl.Streak or 0),
+					left > 0 and ("รอบหน้าอีก %dชม %dนาที"):format(left // 3600, (left % 3600) // 60) or "พร้อมรับ", st.claims or 0))
 				local up = d.Upgrades or {}
 				statLbl:UpdateName(("Damage %d · Health %d · Defense %d\nแต้มว่าง %d · เลเวล %s\nลงไปรอบนี้ %d แต้ม"):format(tonumber(up.Damage) or 0,
 					tonumber(up.Health) or 0, tonumber(up.Defense) or 0, freePoints(d), tostring(d.Level), st.statsSpent or 0))
