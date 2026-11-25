@@ -2768,6 +2768,103 @@ L:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เก�
 	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
 L:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
 L:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้\nTripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
+L:Header({Text = "เวลาเกิดบอส"})
+local bossLbl = L:Label({Text = "-"})
+-- Boss signs (tag "BossSign": attrs Boss, BossAlive, BossRespawnAt = server epoch) only exist while streamed in, so
+-- every time we see one we remember it (e.bossTimes, saved). A boss model alive near us = up right now. A boss we saw
+-- alive and then lost without a sign telling us more -> predicted from its RespawnSeconds (Animal_Engine.Config).
+if type(e.bossTimes) ~= "table" then e.bossTimes = {} end
+local bossLive = {}   -- kind -> {m = model, seen = os.clock()}
+local function fmtLeft(s)
+	s = math.max(0, math.floor(s))
+	if s >= 3600 then return ("%d:%02d:%02d"):format(s // 3600, s % 3600 // 60, s % 60) end
+	return ("%d:%02d"):format(s // 60, s % 60)
+end
+task.spawn(function()
+	local lastSave = 0
+	while alive() do
+		pcall(function()
+			local now = workspace:GetServerTimeNow()
+			local changed = false
+			for _, s in ipairs(CS:GetTagged("BossSign")) do
+				local kind = s:GetAttribute("Boss")
+				if type(kind) == "string" then
+					local at = tonumber(s:GetAttribute("BossRespawnAt")) or 0
+					local up = s:GetAttribute("BossAlive") == true
+					local old = e.bossTimes[kind]
+					if not old or old.at ~= at or old.alive ~= up then
+						e.bossTimes[kind] = {at = at, alive = up, seen = now, src = "sign"}
+						changed = true
+					else
+						old.seen = now
+					end
+				end
+			end
+			-- live boss models in range of streaming
+			local liveNow = {}
+			for _, f in ipairs({"Aggressors", "Passives"}) do
+				local folder = AnimalLive:FindFirstChild(f)
+				for _, m in ipairs(folder and folder:GetChildren() or {}) do
+					if m:GetAttribute("Tier") == "Boss" and mobAlive(m) then
+						local kind = tostring(m:GetAttribute("Animal") or "?")
+						liveNow[kind] = m
+						bossLive[kind] = {m = m, seen = os.clock()}
+					end
+				end
+			end
+			for kind, rec in pairs(bossLive) do
+				if not liveNow[kind] and (not rec.m.Parent or not mobAlive(rec.m)) then
+					-- it died (or despawned) in front of us: no sign around -> predict from its respawn time
+					local bt = e.bossTimes[kind]
+					if not bt or bt.src ~= "sign" or (now - (bt.seen or 0)) > 5 then
+						local rs = 0
+						pcall(function() rs = tonumber(AnimalCfg.Get(kind).RespawnSeconds) or 0 end)
+						if rs > 0 then e.bossTimes[kind] = {at = now + rs, alive = false, seen = now, src = "kill"}; changed = true end
+					end
+					bossLive[kind] = nil
+				elseif not liveNow[kind] then
+					bossLive[kind] = nil   -- streamed out, still alive somewhere: keep what the sign said
+				end
+			end
+			if changed and os.clock() - lastSave > 20 then lastSave = os.clock(); sv() end
+
+			-- one line per boss: picked ones first, then everything we know about
+			local _, hrp = char()
+			local names, seenN = {}, {}
+			local function add(k) if not seenN[k] then seenN[k] = true; names[#names + 1] = k end end
+			local picked = {}
+			for k in pairs(e.bossPick) do picked[#picked + 1] = k end
+			table.sort(picked)
+			for _, k in ipairs(picked) do add(k) end
+			local rest = {}
+			for k in pairs(e.bossTimes) do rest[#rest + 1] = k end
+			for k in pairs(liveNow) do rest[#rest + 1] = k end
+			table.sort(rest)
+			for _, k in ipairs(rest) do add(k) end
+			local lines = {}
+			for _, k in ipairs(names) do
+				local m, bt = liveNow[k], e.bossTimes[k]
+				local mark = e.bossPick[k] and "★ " or ""
+				local txt
+				if m then
+					local d = hrp and (mobPos(m) - hrp.Position).Magnitude
+					txt = ("เกิดแล้ว! HP %s · ห่าง %s stud"):format(tostring(math.floor(mobHp(m))), d and ("%.0f"):format(d) or "?")
+				elseif bt and bt.alive then
+					txt = ("เกิดแล้ว (ป้ายบอก%s)"):format(now - (bt.seen or now) > 5 and (" เมื่อ " .. fmtLeft(now - bt.seen) .. " ก่อน") or "")
+				elseif bt and bt.at > now then
+					txt = ("เกิดในอีก %s%s"):format(fmtLeft(bt.at - now), bt.src == "kill" and " (คาดจากเวลาที่ตาย)" or "")
+				elseif bt and bt.at > 0 then
+					txt = ("น่าจะเกิดแล้ว (ถึงเวลาเมื่อ %s ก่อน)"):format(fmtLeft(now - bt.at))
+				else
+					txt = "ยังไม่รู้เวลา (ต้องเคยเห็นป้ายบอส/เห็นมันตาย)"
+				end
+				lines[#lines + 1] = ("%s%s: %s"):format(mark, k, txt)
+			end
+			bossLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่มีข้อมูล · เดินผ่านป้ายบอสครั้งเดียวก็จำเวลาได้")
+		end)
+		task.wait(1)
+	end
+end)
 L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
 L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
