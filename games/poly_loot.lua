@@ -94,16 +94,40 @@ end
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
 
 -- keep the weapon in hand (the server swings whatever tool is equipped)
+-- weapon tools carry WeaponId / InventorySerial attributes; food and potions don't. The old check took "holding any
+-- tool" as armed, so an Apple left in hand after eating stayed there and the farm never swung again.
+local function isWeaponTool(t) return t ~= nil and t:IsA("Tool") and t:GetAttribute("WeaponId") ~= nil end
+local busyUntil = 0     -- the farm loop doesn't swing / re-equip while we eat
 local function ensureWeapon()
 	local c, _, hum = char()
 	if not c then return false end
 	local held = c:FindFirstChildOfClass("Tool")
-	if held then st.weapon = held.Name return true end
-	if not e.equip then return false end
+	if isWeaponTool(held) then
+		st.weapon, st.weaponSerial = held.Name, held:GetAttribute("InventorySerial") or st.weaponSerial
+		return true
+	end
+	if not e.equip or os.clock() < busyUntil then return false end
 	local bp = plr:FindFirstChildOfClass("Backpack")
-	local tool = bp and st.weapon and bp:FindFirstChild(st.weapon)
-	if tool and tool:IsA("Tool") then pcall(function() hum:EquipTool(tool) end) task.wait(0.3) end
-	return c:FindFirstChildOfClass("Tool") ~= nil
+	local tool
+	for _, t in ipairs(bp and bp:GetChildren() or {}) do
+		if isWeaponTool(t) and (not st.weapon or t.Name == st.weapon) then tool = t break end
+	end
+	if tool then
+		pcall(function() hum:EquipTool(tool) end)
+		task.wait(0.3)
+	elseif os.clock() - (st.reequipAt or 0) > 1.5 then
+		-- the item in hand replaced the weapon tool: ask the server for the weapon back (same as the hotbar)
+		st.reequipAt = os.clock()
+		local w = st.weaponSerial
+		if not w then
+			pcall(function()
+				local d = require(plr.PlayerScripts.Data_Client.PlayerData):WaitFor().Data
+				w = d.Equipped and d.Equipped.Weapon
+			end)
+		end
+		if w then pcall(function() RS.Inventory_Engine.Remotes.EquipRequest:FireServer(w) end) task.wait(0.4) end
+	end
+	return isWeaponTool(c:FindFirstChildOfClass("Tool"))
 end
 
 -- ------------------------------------------------------------------ mobs
@@ -1066,7 +1090,6 @@ end
 local ROUTE_FILE = ("PolyLoot/route_%d.json"):format(plr.UserId)
 local trail = {}          -- recent footsteps (grounded, >= 4 studs apart)
 local backtrack = {i = nil, stop = 1, untilT = 0}   -- watchdog: walk our footsteps backwards
-local busyUntil = 0     -- eating / drinking: the farm loop doesn't swing or re-equip until then
 local route = nil         -- {anchor = {x,y,z}, pts = {{x,y,z}, ...}}
 local routeI = nil
 local tripStart = nil     -- trail index where the current far-away trip began
@@ -1459,6 +1482,44 @@ local function candidates()
 end
 -- dismantling is refused away from a crafting table ("Head back to the crafting bench to do that."): tables are
 -- models tagged CraftingStation, the game's UI opens within 11 studs
+-- farm spot follows the picked mobs: when none of them lives within anchorR of the spot but some are loaded
+-- elsewhere, the spot moves to the middle of the nearest group of them (picked Frog + Crocodile while standing
+-- on the Cobra spot: they were 290-340 studs off, the farm just waited). With no spot yet: here.
+local lastFit = 0
+local function fitAnchor()
+	if not e.useAnchor then return end
+	lastFit = os.clock()
+	local _, hrp = char()
+	if not hrp then return end
+	local a = anchorPos()
+	if not a then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") return end
+	local pts = {}
+	for _, f in ipairs({"Aggressors", "Passives"}) do
+		local folder = AnimalLive:FindFirstChild(f)
+		for _, m in ipairs(folder and folder:GetChildren() or {}) do
+			if wanted(m) and (f == "Aggressors" or e.passives) then
+				local ok, p = pcall(function() return m:GetPivot().Position end)
+				if ok then
+					if flat(p - a).Magnitude <= e.anchorR then return end   -- spot still has picked mobs
+					pts[#pts + 1] = p
+				end
+			end
+		end
+	end
+	if #pts == 0 then return end
+	local near, nd
+	for _, p in ipairs(pts) do
+		local d = (p - hrp.Position).Magnitude
+		if not nd or d < nd then near, nd = p, d end
+	end
+	local sum, n = Vector3.zero, 0
+	for _, p in ipairs(pts) do
+		if flat(p - near).Magnitude <= math.max(60, e.anchorR * 0.8) then sum += p; n += 1 end
+	end
+	local c = sum / n
+	setAnchor(c)
+	log(("มอนที่เลือกไม่อยู่แถวจุดฟาร์มเดิม → ย้ายจุดฟาร์มไปกลางกลุ่ม (%d ตัว, ห่าง %.0f stud)"):format(n, flat(c - hrp.Position).Magnitude))
+end
 local trip = {active = false, at = 0, kind = nil}
 local noProg = {t = nil, hp = 0, at = 0}
 local healAvailable = function() return false end   -- set by the heal-item section (defined after the farm loop)
@@ -2079,6 +2140,7 @@ task.spawn(function()
 				else
 					stopMove()
 					st.status = anchor and ("รอมอนเกิดรอบจุดฟาร์ม (รัศมี %d)"):format(e.anchorR) or ("ไม่มีมอนที่เลือกในระยะ %d"):format(e.radius)
+					if anchor and os.clock() - lastFit > 5 then fitAnchor() end
 				end
 				return
 			end
@@ -2268,11 +2330,14 @@ local function useHeal()
 	lastHeal = os.clock()
 	local before = (d.Inventory.Consumables[serial] or {}).Count
 	local hp0 = hum and hum.Health or 0
+	-- remember the weapon BEFORE the food goes in hand (Equipped changes once it's held)
+	local held0 = c:FindFirstChildOfClass("Tool")
+	local w = (isWeaponTool(held0) and held0:GetAttribute("InventorySerial")) or st.weaponSerial or (d.Equipped and d.Equipped.Weapon)
 	pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
 	for _ = 1, 10 do
 		task.wait(0.1)
 		local held = c:FindFirstChildOfClass("Tool")
-		if held and held.Name ~= st.weapon then pcall(function() held:Activate() end) break end
+		if held and not isWeaponTool(held) then pcall(function() held:Activate() end) break end
 	end
 	-- weapon back the moment it's eaten (count dropped / HP jumped), not after a fixed 2 s
 	local t0 = os.clock()
@@ -2281,11 +2346,16 @@ local function useHeal()
 		local it = (invData() or d).Inventory.Consumables[serial]
 		if not it or it.Count ~= before or (hum and hum.Health > hp0 + 20) then break end
 	end
-	local w = d.Equipped and d.Equipped.Weapon
-	if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+	-- weapon back, and make sure it really is in hand (retry, then the backpack route in ensureWeapon)
+	for _ = 1, 3 do
+		if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+		local t1 = os.clock()
+		while os.clock() - t1 < 0.8 and not isWeaponTool(c:FindFirstChildOfClass("Tool")) do task.wait(0.1) end
+		if isWeaponTool(c:FindFirstChildOfClass("Tool")) then break end
+	end
 	if (regen or 0) > 0 then regenUntil = os.clock() + math.min(regen, 30) end
-	task.wait(0.2)
 	busyUntil = 0
+	if not isWeaponTool(c:FindFirstChildOfClass("Tool")) then pcall(ensureWeapon) end
 	st.heals = (st.heals or 0) + 1
 	log(("กิน %s (เลือด %d%%)"):format(id, hpPct()))
 end
@@ -2483,31 +2553,6 @@ local FarmTab = TG:Tab({Name = "Farm", Image = "rbxassetid://10723346959"})
 
 local L = FarmTab:Section({Side = "Left"})
 L:Header({Text = "Auto Farm"})
-local function fitAnchor()
-	-- start with no farm spot yet -> here. Also when none of the picked mobs live around the old spot but some are
-	-- around us (picked Gargoyle while the spot was still the bear field: the farm walked off to the bears' field)
-	if e.useAnchor then
-		local _, hrp = char()
-		local a = anchorPos()
-		if hrp and a and flat(hrp.Position - a).Magnitude > e.anchorR then
-			local nearSpot, nearMe = false, false
-			for _, f in ipairs({"Aggressors", "Passives"}) do
-				local folder = AnimalLive:FindFirstChild(f)
-				for _, m in ipairs(folder and folder:GetChildren() or {}) do
-					if wanted(m) then
-						local ok, p = pcall(function() return m:GetPivot().Position end)
-						if ok then
-							if flat(p - a).Magnitude <= e.anchorR then nearSpot = true end
-							if (p - hrp.Position).Magnitude <= e.radius then nearMe = true end
-						end
-					end
-				end
-			end
-			if nearMe and not nearSpot then a = nil; log("มอนที่เลือกไม่อยู่แถวจุดฟาร์มเดิม → ย้ายจุดฟาร์มมาตรงนี้") end
-		end
-		if hrp and not a then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
-	end
-end
 L:Toggle({Name = "Auto Farm (ล็อกมอน · เดินไปตี)", Default = e.farm, Callback = function(v)
 	e.farm = v
 	if v then fitAnchor() end
