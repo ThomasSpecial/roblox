@@ -281,6 +281,14 @@ local function bossKinds()
 	local seen, list = {}, {}
 	for k in pairs(e.bossSeen) do seen[k] = true end
 	for k in pairs(e.bossPick) do seen[k] = true end
+	-- every boss the game defines (Animal_Engine.Config), not only the ones streamed in near us so far
+	pcall(function()
+		local AC = require(RS.Animal_Engine.Config)
+		for _, n in ipairs(AC.AnimalNames()) do
+			local d = AC.Get(n)
+			if type(d) == "table" and d.Tier == "Boss" then seen[n] = true end
+		end
+	end)
 	for _, f in ipairs({"Aggressors", "Passives"}) do
 		local folder = AnimalLive:FindFirstChild(f)
 		for _, m in ipairs(folder and folder:GetChildren() or {}) do
