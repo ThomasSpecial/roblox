@@ -447,10 +447,17 @@ function S.mountFarm(gen)
 			-- only the TripleCobra left: wait at the cobra area, boss hunt takes it when it spawns
 			stage = STAGES[3]
 		end
-		if cur ~= stage then
-			cur = stage
-			setFarm(stage.mobs, stage.anchor, stage.r)
-			log("ฟาร์ม " .. table.concat(stage.mobs, "/"))
+		-- only the species still short (Frog done -> stop spending swings on frogs)
+		local want = {}
+		for k, o in ipairs(stage.objs) do
+			if (tonumber(p[o]) or 0) < NEED[o] then want[#want + 1] = stage.mobs[k] end
+		end
+		if #want == 0 then want = stage.mobs end
+		local key = table.concat(want, "/")
+		if cur ~= key then
+			cur = key
+			setFarm(want, stage.anchor, stage.r)
+			log("ฟาร์ม " .. key)
 		end
 		st.extBusy = false
 		e.farm = true
@@ -464,7 +471,12 @@ function S.mountFarm(gen)
 	e.farm = false
 	st.extBusy = true
 	task.wait(1)
-	claim(MOUNT)
+	-- turn-ins need Sela close by (the taming claim failed from afar)
+	setStatus("เดินไปส่งเควสที่ Sela")
+	for _ = 1, 3 do
+		walk(SELA_POS, 6, 400, gen)
+		if claim(MOUNT) then break end
+	end
 	log(("SelaGorilla ในกระเป๋า: %d"):format(count("SelaGorilla")))
 	e.bossPick, e.bossHunt = oldPick, oldHunt
 	-- then back to the Moth farm, as asked
