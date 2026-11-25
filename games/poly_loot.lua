@@ -1461,6 +1461,7 @@ end
 -- models tagged CraftingStation, the game's UI opens within 11 studs
 local trip = {active = false, at = 0, kind = nil}
 local noProg = {t = nil, hp = 0, at = 0}
+local healAvailable = function() return false end   -- set by the heal-item section (defined after the farm loop)
 local shopTripPos = function() return nil end   -- set by the auto-buy section (defined after the farm loop)
 local shopTripBuy = function() end
 local function nearestStation(pos)
@@ -2116,7 +2117,9 @@ task.spawn(function()
 
 			-- low HP: back off and let AreaHeal / regen work
 			if e.retreat then
-				if hpPct() <= e.retreatAt then retreating = true end
+				-- retreat only when there's nothing worth eating: ranged mobs (Cobra spit) hit us while we wait anyway
+				if hpPct() <= e.retreatAt and not ((e.usePotion or e.useFood) and healAvailable()) then retreating = true end
+				if retreating and (e.usePotion or e.useFood) and healAvailable() and hpPct() > e.retreatAt then retreating = false end
 				if retreating and hpPct() >= e.resumeAt then retreating = false end
 			else
 				retreating = false
@@ -2213,34 +2216,75 @@ local HEAL_ORDER = {"HealthPotion2", "HealthPotion", "GoldenApple", "Cake", "Jun
 local FOODS = {GoldenApple = true, Cake = true, JungleCookies = true, BananaBread = true, Banana = true, Coconut = true,
 	Milk = true, Apple = true, Bandage = true}
 local lastHeal = 0
-local function healItem(d)
-	local cons = (d.Inventory or {}).Consumables or {}
-	for _, id in ipairs(HEAL_ORDER) do
-		if (FOODS[id] and e.useFood) or (not FOODS[id] and e.usePotion) then
-			for serial, it in pairs(cons) do
-				if it.Id == id and (tonumber(it.Count) or 0) > 0 then return serial, id end
-			end
+local regenUntil = 0
+-- how much an item really heals (Consumable_Engine.ConsumableDefs): HealthPotion = 50 HP flat, Apple = 30 HP,
+-- GoldenApple = 50 % of max HP + 5 %/s regeneration for 60 s. With ~6k max HP the flat ones are worthless: the old
+-- fixed order drank 50-HP potions over and over while a Cobra spat on us.
+local ConsDefs
+pcall(function() ConsDefs = require(RS.Consumable_Engine.ConsumableDefs) end)
+local function healValue(id, maxHp)
+	local def = ConsDefs and ConsDefs[id]
+	if type(def) ~= "table" then return 0, 0 end
+	local v, regen = 0, 0
+	for _, fx in ipairs(def) do
+		if fx.type == "heal" then
+			v += tonumber(fx.amount) or 0
+		elseif fx.type == "healPercent" then
+			v += (tonumber(fx.percent) or 0) * maxHp
+		elseif fx.type == "applyEffect" and fx.effect == "Regeneration" and type(fx.params) == "table" then
+			local per = (tonumber(fx.params.pctPerTick) or 0) * maxHp / (tonumber(fx.params.tickInterval) or 1)
+			v += per * math.min(tonumber(fx.duration) or 0, 15)   -- count the first 15 s of regen
+			regen = tonumber(fx.duration) or 0
 		end
 	end
+	return v, regen
+end
+-- best item we have that heals at least 10 % of max HP
+local function healItem(d)
+	local _, _, hum = char()
+	local maxHp = hum and hum.MaxHealth or 100
+	local cons = (d.Inventory or {}).Consumables or {}
+	local best, bestId, bestV, bestRegen
+	for serial, it in pairs(cons) do
+		local id = it.Id
+		if (tonumber(it.Count) or 0) > 0 and ((FOODS[id] and e.useFood) or (not FOODS[id] and e.usePotion)) then
+			local v, regen = healValue(id, maxHp)
+			if v >= maxHp * 0.1 and (not bestV or v > bestV) then best, bestId, bestV, bestRegen = serial, id, v, regen end
+		end
+	end
+	return best, bestId, bestRegen
+end
+healAvailable = function()
+	local d = invData()
+	return d ~= nil and healItem(d) ~= nil
 end
 local function useHeal()
 	local d = invData()
 	local c, _, hum = char()
 	if not (d and c) then return end
-	local serial, id = healItem(d)
+	local serial, id, regen = healItem(d)
 	if not serial then return end
-	busyUntil = os.clock() + 3
+	busyUntil = os.clock() + 2.5
 	lastHeal = os.clock()
+	local before = (d.Inventory.Consumables[serial] or {}).Count
+	local hp0 = hum and hum.Health or 0
 	pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
 	for _ = 1, 10 do
 		task.wait(0.1)
 		local held = c:FindFirstChildOfClass("Tool")
 		if held and held.Name ~= st.weapon then pcall(function() held:Activate() end) break end
 	end
-	task.wait(1.6)
+	-- weapon back the moment it's eaten (count dropped / HP jumped), not after a fixed 2 s
+	local t0 = os.clock()
+	while os.clock() - t0 < 1.6 do
+		task.wait(0.1)
+		local it = (invData() or d).Inventory.Consumables[serial]
+		if not it or it.Count ~= before or (hum and hum.Health > hp0 + 20) then break end
+	end
 	local w = d.Equipped and d.Equipped.Weapon
 	if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
-	task.wait(0.4)
+	if (regen or 0) > 0 then regenUntil = os.clock() + math.min(regen, 30) end
+	task.wait(0.2)
 	busyUntil = 0
 	st.heals = (st.heals or 0) + 1
 	log(("กิน %s (เลือด %d%%)"):format(id, hpPct()))
@@ -2248,8 +2292,9 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.25)
+		-- while a regeneration item works, eat again only in an emergency
 		if e.farm and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
-			and os.clock() - lastHeal > e.healItemGap then
+			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= 25) then
 			pcall(useHeal)
 		end
 	end
