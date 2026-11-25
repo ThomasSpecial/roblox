@@ -1291,6 +1291,9 @@ local function stopMove()
 	local _, _, hum = char()
 	if hum then hum:Move(Vector3.zero) end
 end
+-- for helper scripts (quest runners): walk with the same navmap / unstick logic as the farm
+st.api = {moveTo = moveTo, stopMove = stopMove, char = char, setControls = setControls}
+st.api.plan = function(a, b) local m = getNav() if not m then return nil, "no-map" end return Nav.plan(m, a, b, true) end
 
 local lookAt = nil   -- position the character keeps facing while farming
 local rp = RaycastParams.new()
@@ -2188,6 +2191,8 @@ task.spawn(function()
 				end
 			end
 			if not e.farm then
+				-- a helper script (quest runner) is driving the character through st.api: hands off
+				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
 				if st.target then st.target = nil; lookAt = nil; endCombo(); stopMove() end
 				if controlsOff and not (e.lootAlways and mover.walk) then mover.walk = nil; setControls(true) end
 				local _, hrp, hum = char()
