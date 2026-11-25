@@ -179,6 +179,8 @@ local function mobXp(m) return tonumber(m:GetAttribute("_RolledXP")) or 1 end
 local function killTime(m, dps) return math.max(mobHp(m) / dps, 0.6) end
 -- mobs we couldn't damage (on a ledge above us / behind rock): ignored for a while
 local skipUntil = setmetatable({}, {__mode = "k"})
+local NEAR_R = 90     -- picked mobs this close always count, farm spot or not
+local CLOSE_R = 35    -- a picked mob this close is fought before anything farther (smart mode included)
 local function candidates_(hrp)
 	local anchor = anchorPos()
 	local list = {}
@@ -189,9 +191,11 @@ local function candidates_(hrp)
 			if wanted(m) and not ((skipUntil[m] or 0) > os.clock()) then
 				local mp = mobPos(m)
 				local d = (mp - hrp.Position).Magnitude
-				-- with a farm spot: mobs around the spot, plus any picked mob right next to us (don't run past one
-				-- standing beside us to an empty spot)
-				if (anchor and (flat(mp - anchor).Magnitude <= e.anchorR or d <= 50)) or (not anchor and d <= e.radius) then
+				-- with a farm spot: mobs around the spot, plus any picked mob near us (don't run past one standing
+				-- 70 studs away to the spot circle). Moths spread 180+ studs from the spot: with 50 here half of them
+				-- were ignored and the bot walked away from them.
+				if (anchor and (flat(mp - anchor).Magnitude <= e.anchorR or (d <= NEAR_R and math.abs(mp.Y - hrp.Position.Y) < 20)))
+					or (not anchor and d <= e.radius) then
 					list[#list + 1] = {m = m, p = mp, d = d}
 				end
 			end
@@ -227,10 +231,15 @@ local function pickTarget(hrp)
 		table.sort(list, function(a, b) return a.d < b.d end)
 		local pool = {}
 		for i = 1, math.min(#list, 25) do pool[i] = list[i] end
+		-- a mob right next to us goes first: the XP/s route math liked a wounded mob 150 studs away (kill time looks
+		-- tiny) and the bot walked past Moths standing beside it. Only the close ones compete then.
+		local closeOnly = pool[1] and pool[1].d <= CLOSE_R
 		local best, bestV
 		for _, c in ipairs(pool) do
-			local v = routeValue(hrp.Position, c, pool)
-			if not bestV or v > bestV then best, bestV = c.m, v end
+			if not closeOnly or c.d <= CLOSE_R * 1.7 then
+				local v = routeValue(hrp.Position, c, pool)
+				if not bestV or v > bestV then best, bestV = c.m, v end
+			end
 		end
 		return best, bestV, pool
 	end
@@ -2157,7 +2166,9 @@ task.spawn(function()
 				end
 			else
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" then
-				if anchor and flat(mobPos(t) - anchor).Magnitude > e.anchorR + 30 then t = nil
+				-- out of the spot circle AND not near us (a mob near us counts as a candidate, see NEAR_R)
+				if anchor and flat(mobPos(t) - anchor).Magnitude > e.anchorR + 30
+					and (mobPos(t) - hrp.Position).Magnitude > NEAR_R + 20 then t = nil
 				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
 			end
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) then t = nil end
@@ -2177,7 +2188,9 @@ task.spawn(function()
 						local dt = flat(mobPos(t) - hrp.Position).Magnitude
 						if dt > e.reach + 2 then
 							local curV = routeValue(hrp.Position, {m = t, p = mobPos(t)}, pool or {})
-							better = candV and candV > curV * 1.3
+							local dc = flat(mobPos(cand) - hrp.Position).Magnitude
+							-- walking to a far one while a picked mob stands right here: take the close one
+							better = (candV and candV > curV * 1.3) or (dc <= CLOSE_R and dt > CLOSE_R * 2)
 						end
 					elseif e.targetMode == "เลือดน้อยสุด" then
 						better = (tonumber(cand:GetAttribute("Health")) or 0) < (tonumber(t:GetAttribute("Health")) or 0) * 0.8
