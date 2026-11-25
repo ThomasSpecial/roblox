@@ -140,7 +140,7 @@ local function setAnchor(pos)
 	e.anchor = pos and {math.floor(pos.X * 10) / 10, math.floor(pos.Y * 10) / 10, math.floor(pos.Z * 10) / 10} or nil
 	sv()
 end
--- "fastest farm" targeting: value of going for mob X = kills per second of the short route X -> nearest neighbour
+-- "fastest farm" targeting: value of going for mob X = XP per second (each mob's _RolledXP attribute) of the short route X -> nearest neighbour
 -- -> ... (up to 4 mobs, hops < 45 studs), time = run time (distance / run speed) + kill time (HP / our measured DPS).
 -- One lone mob far away loses to two mobs standing together in the other direction.
 local SMART_TARGET = "คุ้มที่สุด (ฟาร์มไวสุด)"
@@ -148,6 +148,9 @@ local dpsStat = {dmg = 0, time = 0, t = nil, h = 0, at = 0}
 local function myDps() return (dpsStat.dmg + 1200 * 8) / (dpsStat.time + 8) end   -- 1200/s prior, ~8 s weight
 local function runSpeed() return 20 * ((e.speedOn and e.speedMult) or 1) * 0.85 end  -- 0.85: paths aren't straight
 local function mobHp(m) return tonumber(m:GetAttribute("Health")) or 0 end
+local function mobXp(m) return tonumber(m:GetAttribute("_RolledXP")) or 1 end
+-- a kill takes at least one swing (~0.6 s) even when the hit one-shots it
+local function killTime(m, dps) return math.max(mobHp(m) / dps, 0.6) end
 local function candidates_(hrp)
 	local anchor = anchorPos()
 	local list = {}
@@ -170,8 +173,8 @@ local function routeValue(fromPos, first, pool)
 	local speed, dps = runSpeed(), myDps()
 	local used = {[first.m] = true}
 	local pos = first.p
-	local time = flat(pos - fromPos).Magnitude / speed + mobHp(first.m) / dps
-	local n = 1
+	local time = flat(pos - fromPos).Magnitude / speed + killTime(first.m, dps)
+	local n = mobXp(first.m)
 	for _ = 1, 3 do
 		local nb, nd
 		for _, c in ipairs(pool) do
@@ -182,8 +185,8 @@ local function routeValue(fromPos, first, pool)
 		end
 		if not nb then break end
 		used[nb.m] = true
-		time += nd / speed + mobHp(nb.m) / dps
-		n += 1
+		time += nd / speed + killTime(nb.m, dps)
+		n += mobXp(nb.m)
 		pos = nb.p
 	end
 	return n / math.max(time, 0.1)
@@ -515,13 +518,30 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 end)
 
 -- ------------------------------------------------------------------ dodge
--- returns a safe point outside the first telegraph box the character stands in, or nil
-local function dodgePoint(hrp)
+-- the mob that owns a telegraph = the aggressor standing nearest to it; its Damage attribute is the hit we'd take
+local function telegraphDamage(p)
+	local best, bd
+	local folder = AnimalLive:FindFirstChild("Aggressors")
+	for _, m in ipairs(folder and folder:GetChildren() or {}) do
+		local ok, pos = pcall(function() return m:GetPivot().Position end)
+		if ok then
+			local d = (pos - p.Position).Magnitude
+			if d < 20 and (not bd or d < bd) then best, bd = m, d end
+		end
+	end
+	return best and tonumber(best:GetAttribute("Damage"))
+end
+-- returns a safe point outside the first telegraph box the character stands in, or nil.
+-- Weak hits (< smartDanger % of our current HP) aren't worth dodging: stepping out stops our swings, and a pack of
+-- wolves kept us dodging for minutes (9.8k dodges, no kills). Our own hit knocks the mob back and cancels its attack.
+local function dodgePoint(hrp, hum)
 	for _, p in ipairs(CS:GetTagged("AttackBoxTelegraph")) do
 		if p:IsA("BasePart") and p.Parent then
 			local lp = p.CFrame:PointToObjectSpace(hrp.Position)
 			local hx, hz = p.Size.X / 2 + e.dodgeMargin, p.Size.Z / 2 + e.dodgeMargin
-			if math.abs(lp.X) < hx and math.abs(lp.Z) < hz and math.abs(lp.Y) < p.Size.Y / 2 + 8 then
+			local dmg = hum and telegraphDamage(p)
+			local weak = dmg and hum.Health > 0 and dmg < hum.Health * e.smartDanger / 100
+			if not weak and math.abs(lp.X) < hx and math.abs(lp.Z) < hz and math.abs(lp.Y) < p.Size.Y / 2 + 8 then
 				-- leave through the nearest side
 				local outs = {
 					{hx - lp.X, Vector3.new(hx + 2, lp.Y, lp.Z)},
@@ -1222,7 +1242,7 @@ task.spawn(function()
 				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
 				return
 			end
-			local dp = e.dodge and dodgePoint(hrp)
+			local dp = e.dodge and dodgePoint(hrp, hum)
 			if not dp and lootStep(hrp) then
 				lookAt = nil
 				if not aura(c, hrp) then endCombo() end
@@ -1438,6 +1458,39 @@ pcall(function()
 		end
 	end)
 end)
+
+-- reward screen ("NEW LOOT!" / "Click Anywhere To Continue"): while it is up the game sets UIWorldClear, and the
+-- weapon client's canAttack() refuses every swing -> an AFK farm stood next to mobs for minutes until the watchdog
+-- reset it (217 resets in one night). Close it like a player would: click the footer (not a card, which would flip it).
+do
+	local RewardScreenMod
+	pcall(function() RewardScreenMod = require(RS.Reward_Engine.Modules.RewardScreen) end)
+	local VIM = game:GetService("VirtualInputManager")
+	local shownAt
+	task.spawn(function()
+		while alive() do
+			task.wait(0.5)
+			pcall(function()
+				local gui = plr.PlayerGui:FindFirstChild("RewardScreen")
+				local up = gui and gui.Enabled and (not RewardScreenMod or RewardScreenMod.IsActive())
+				if not up then shownAt = nil return end
+				shownAt = shownAt or os.clock()
+				-- the screen ignores clicks until its reveal has played (~1-2 s)
+				if not e.farm or os.clock() - shownAt < 2 then return end
+				local foot = gui:FindFirstChild("Main") and gui.Main:FindFirstChild("Footer")
+				local cam = workspace.CurrentCamera
+				local p = foot and (foot.AbsolutePosition + foot.AbsoluteSize / 2)
+					or Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y * 0.95)
+				local inset = game:GetService("GuiService"):GetGuiInset()
+				VIM:SendMouseButtonEvent(p.X + inset.X, p.Y + inset.Y, 0, true, game, 0)
+				task.wait(0.05)
+				VIM:SendMouseButtonEvent(p.X + inset.X, p.Y + inset.Y, 0, false, game, 0)
+				st.popups = (st.popups or 0) + 1
+				shownAt = os.clock() - 1   -- retry in ~1 s if it is still up
+			end)
+		end
+	end)
+end
 
 -- anti-AFK
 local idleConn = plr.Idled:Connect(function()
