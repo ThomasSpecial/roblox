@@ -731,7 +731,15 @@ do
 					local i1, j1 = math.min(W - 1, i0 + TILE - 1), math.min(H - 1, j0 + TILE - 1)
 					local cx = x0 + (i0 + i1) / 2 * CELL
 					local cz = z0 + (j0 + j1) / 2 * CELL
-					pcall(function() plr:RequestStreamAroundAsync(Vector3.new(cx, (B.top + B.bot) / 2, cz), 10) end)
+					-- streaming request with our own time limit: one tile west of town never returned (scan hung at 120/160)
+					local streamed = false
+					task.spawn(function()
+						pcall(function() plr:RequestStreamAroundAsync(Vector3.new(cx, (B.top + B.bot) / 2, cz), 6) end)
+						streamed = true
+					end)
+					local ts = os.clock()
+					while not streamed and os.clock() - ts < 8 do task.wait(0.1) end
+					if opts.alive and not opts.alive() then error("cancelled") end
 					flip()
 					rp = rayParams()
 					say(("สแกนพื้น %d/%d"):format(n, total))
@@ -791,7 +799,7 @@ local function getNav()
 				task.wait(5)
 				if st.navScanning or not alive() then return end
 				st.navScanning = true
-				local m2, info = Nav.scan({name = NAV_NAME, onStatus = function(t) st.navWhy = t end})
+				local m2, info = Nav.scan({name = NAV_NAME, alive = alive, onStatus = function(t) st.navWhy = t end})
 				if m2 and alive() then navMap = m2; path.wps = nil end
 				log(m2 and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
 				st.navScanning = false
@@ -2261,7 +2269,7 @@ M:Button({Name = "สแกน NavMap ใหม่ (เมือง ทุ่ง
 	if st.navScanning then return end
 	st.navScanning = true
 	task.spawn(function()
-		local m, info = Nav.scan({name = NAV_NAME, onStatus = function(t) pcall(function() navLbl:UpdateName(t) end) end})
+		local m, info = Nav.scan({name = NAV_NAME, alive = alive, onStatus = function(t) pcall(function() navLbl:UpdateName(t) end) end})
 		if m then navMap, navTried = m, true; path.wps = nil end
 		log(m and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
 		st.navScanning = false
