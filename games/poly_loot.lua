@@ -1473,7 +1473,7 @@ local function invPass(manual)
 			local _, d = nearestStation(hrp and hrp.Position or Vector3.zero)
 			if d and d <= 10 then
 				dismantleNow()
-			elseif not trip.active and (manual or n >= e.disMin or (e.disWhenFull and (function()
+			elseif not trip.active and (manual or n >= math.min(e.disMin, select(2, bagState(invData())) or e.disMin) or (e.disWhenFull and (function()
 				local used, cap = bagState(invData())
 				return used >= cap - e.bagFree
 			end)())) then
@@ -2592,8 +2592,25 @@ IL:Dropdown({Name = "Rarity ที่จะย่อย", Multi = true, Required
 	Callback = function(v) e.disRar = multiSet(v); sv() end}, "PLDisRar")
 IL:Slider({Name = "เช็กกระเป๋าทุก (วินาที)", Default = e.invEvery, Minimum = 5, Maximum = 120, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.invEvery = v; sv() end}, "PLInvEvery")
-IL:Slider({Name = "└ ย่อยเมื่อของรอย่อย ≥ (ชิ้น)", Default = e.disMin, Minimum = 1, Maximum = 50, DisplayMethod = "Round", Precision = 0,
+-- max = the bag's real capacity (InvLimits.GetCap, grows with bag upgrades), not a fixed 50
+local disMinSl = IL:Slider({Name = "└ ย่อยเมื่อของรอย่อย ≥ (ชิ้น)", Default = e.disMin, Minimum = 1,
+	Maximum = math.max(select(2, bagState(invData())) or 50, 1), DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.disMin = v; sv() end}, "PLDisMin")
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			local d = invData()
+			if not d then return end
+			local _, cap = bagState(d)
+			if cap and cap > 0 and disMinSl.Settings.Maximum ~= cap then
+				disMinSl.Settings.Maximum = cap
+				if e.disMin > cap then e.disMin = cap; sv() end
+				disMinSl:UpdateValue(e.disMin)
+			end
+		end)
+		task.wait(10)
+	end
+end)
 IL:Toggle({Name = "└ หรือไปย่อยเมื่อกระเป๋าใกล้เต็ม", Default = e.disWhenFull, Callback = function(v) e.disWhenFull = v; sv() end}, "PLDisFull")
 IL:Slider({Name = "    ใกล้เต็ม = เหลือช่องว่าง ≤", Default = e.bagFree, Minimum = 0, Maximum = 20, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.bagFree = v; sv() end}, "PLBagFree")
