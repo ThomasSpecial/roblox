@@ -2774,6 +2774,68 @@ local bossLbl   -- shown in the status column (replaces the Smart learn table th
 -- alive and then lost without a sign telling us more -> predicted from its RespawnSeconds (Animal_Engine.Config).
 if type(e.bossTimes) ~= "table" then e.bossTimes = {} end
 local bossLive = {}   -- kind -> {m = model, seen = os.clock()}
+if e.bossHud == nil then e.bossHud = true end
+-- on-screen box right above the game's coin counter (HUD.Holder.LeftList.YourCoins), follows it when the HUD rescales
+local HUD_NAME = "PolyLootBossHud"
+local hudGui, hudText
+pcall(function()
+	-- gethui() here is CoreGui.RobloxGui, itself a ScreenGui: a ScreenGui inside it never renders
+	local root = (gethui and gethui()) or game:GetService("CoreGui")
+	if root:IsA("ScreenGui") then root = root.Parent end
+	local old = root:FindFirstChild(HUD_NAME)
+	if old then old:Destroy() end
+	hudGui = Instance.new("ScreenGui")
+	hudGui.Name = HUD_NAME
+	hudGui.ResetOnSpawn = false
+	hudGui.IgnoreGuiInset = true
+	hudGui.DisplayOrder = 5
+	local f = Instance.new("Frame")
+	f.Name = "Box"
+	f.AnchorPoint = Vector2.new(0, 1)
+	f.AutomaticSize = Enum.AutomaticSize.Y
+	f.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+	f.BackgroundTransparency = 0.35
+	f.BorderSizePixel = 0
+	f.Visible = false
+	f.Parent = hudGui
+	Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+	local pad = Instance.new("UIPadding", f)
+	pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 10), UDim.new(0, 10)
+	pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+	hudText = Instance.new("TextLabel")
+	hudText.BackgroundTransparency = 1
+	hudText.Size = UDim2.new(1, 0, 0, 0)
+	hudText.AutomaticSize = Enum.AutomaticSize.Y
+	hudText.Font = Enum.Font.GothamBold
+	hudText.TextSize = 16
+	hudText.TextColor3 = Color3.new(1, 1, 1)
+	hudText.TextStrokeTransparency = 0.5
+	hudText.TextXAlignment = Enum.TextXAlignment.Left
+	hudText.TextYAlignment = Enum.TextYAlignment.Top
+	hudText.TextWrapped = true
+	hudText.RichText = true
+	hudText.Parent = f
+	hudGui.Parent = root
+end)
+local function bossHud(text)
+	if not hudGui then return end
+	local f = hudGui.Box
+	if not text then f.Visible = false return end
+	hudText.Text = '<font color="#FFB347">⏱ เวลาเกิดบอส</font>\n' .. text
+	local coins
+	pcall(function() coins = plr.PlayerGui.HUD.Holder.LeftList.YourCoins end)
+	if coins and coins.AbsoluteSize.X > 0 then
+		-- AbsolutePosition is measured from below the top bar (any ScreenGui); our Position (IgnoreGuiInset) from the
+		-- very top of the screen -> add the bar height
+		local dy = game:GetService("GuiService"):GetGuiInset().Y
+		f.Size = UDim2.fromOffset(math.max(coins.AbsoluteSize.X, 200), 0)
+		f.Position = UDim2.fromOffset(coins.AbsolutePosition.X, coins.AbsolutePosition.Y + dy - 6)
+	else
+		f.Size = UDim2.fromOffset(240, 0)
+		f.Position = UDim2.new(0, 18, 0, 220)
+	end
+	f.Visible = true
+end
 local function fmtLeft(s)
 	s = math.max(0, math.floor(s))
 	if s >= 3600 then return ("%d:%02d:%02d"):format(s // 3600, s % 3600 // 60, s % 60) end
@@ -2840,30 +2902,38 @@ task.spawn(function()
 			for k in pairs(liveNow) do rest[#rest + 1] = k end
 			table.sort(rest)
 			for _, k in ipairs(rest) do add(k) end
-			local lines = {}
+			local lines, hud = {}, {}
 			for _, k in ipairs(names) do
 				local m, bt = liveNow[k], e.bossTimes[k]
 				local mark = e.bossPick[k] and "★ " or ""
-				local txt
+				local txt, short, col
 				if m then
 					local d = hrp and (mobPos(m) - hrp.Position).Magnitude
 					txt = ("เกิดแล้ว! HP %s · ห่าง %s stud"):format(tostring(math.floor(mobHp(m))), d and ("%.0f"):format(d) or "?")
+					short, col = ("เกิดแล้ว! %s stud"):format(d and ("%.0f"):format(d) or "?"), "#6CFF7A"
 				elseif bt and bt.alive then
 					txt = ("เกิดแล้ว (ป้ายบอก%s)"):format(now - (bt.seen or now) > 5 and (" เมื่อ " .. fmtLeft(now - bt.seen) .. " ก่อน") or "")
+					short, col = "เกิดแล้ว!", "#6CFF7A"
 				elseif bt and bt.at > now then
 					txt = ("เกิดในอีก %s%s"):format(fmtLeft(bt.at - now), bt.src == "kill" and " (คาดจากเวลาที่ตาย)" or "")
+					short, col = fmtLeft(bt.at - now) .. (bt.src == "kill" and " ~" or ""), bt.at - now < 60 and "#FFD84A" or "#FFFFFF"
 				elseif bt and bt.at > 0 then
 					txt = ("น่าจะเกิดแล้ว (ถึงเวลาเมื่อ %s ก่อน)"):format(fmtLeft(now - bt.at))
+					short, col = "น่าจะเกิดแล้ว", "#FFD84A"
 				else
 					txt = "ยังไม่รู้เวลา (ต้องเคยเห็นป้ายบอส/เห็นมันตาย)"
+					short, col = "?", "#9A9A9A"
 				end
 				lines[#lines + 1] = ("%s%s: %s"):format(mark, k, txt)
+				hud[#hud + 1] = ('%s%s  <font color="%s">%s</font>'):format(mark, k, col, short)
 			end
+			pcall(function() bossHud(e.bossHud and #hud > 0 and table.concat(hud, "\n") or nil) end)
 			bossLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่มีข้อมูล · เดินผ่านป้ายบอสครั้งเดียวก็จำเวลาได้")
 		end)
 		task.wait(1)
 	end
 end)
+L:Toggle({Name = "แสดงเวลาเกิดบอสบนจอ (เหนือช่องเหรียญ)", Default = e.bossHud, Callback = function(v) e.bossHud = v; sv() end}, "PLBossHud")
 L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
 L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
@@ -3186,6 +3256,7 @@ task.spawn(function()
 	setControls(true)
 	pcall(function() local _, _, hum = char(); if hum then hum:SetAttribute("_WSMultC_PolyLoot", nil) end end)
 	pcall(function() local _, _, hum = char(); if hum then hum.AutoRotate = true; hum:Move(Vector3.zero) end end)
+	pcall(function() if hudGui then hudGui:Destroy() end end)
 end)
 pcall(function()
 	Win.onUnloaded(function() if getgenv().__PLOOT == G then getgenv().__PLOOT = G + 1 end end)
