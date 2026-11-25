@@ -1230,7 +1230,9 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	if not lastPosSkip then pcall(trailTick, hrp, hum) end
 	lastPosSkip = false
 	do
-		local want = (e.farm and e.speedOn and e.speedMult ~= 1) and e.speedMult or nil
+		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
+		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
+		local want = (e.farm and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
 		if hum:GetAttribute("_WSMultC_PolyLoot") ~= want then hum:SetAttribute("_WSMultC_PolyLoot", want) end
 	end
 	if mover.walk then
@@ -1992,6 +1994,7 @@ local function aura(c, hrp)
 		if mobAlive(m) then
 			local ok, pos = pcall(function() return m:GetPivot().Position end)
 			if ok and flat(pos - hrp.Position).Magnitude <= e.reach and math.abs(pos.Y - hrp.Position.Y) < 12 then
+				st.fightUntil = os.clock() + 2
 				if ensureWeapon() then face(hrp, pos); swingNow(c) end
 				return true
 			end
@@ -2147,6 +2150,7 @@ task.spawn(function()
 			local tp = mobPos(t)
 			local dist = flat(tp - hrp.Position).Magnitude
 			-- a mob on a ledge 20 studs up but 9 across is NOT in reach: we stood under the cliff swinging at rock
+			if dist < 30 then st.fightUntil = os.clock() + 2 end
 			local dy = math.abs(tp.Y - hrp.Position.Y)
 			if dy > 8 then dist = math.max(dist, math.max(e.standDist, e.orbitRadius) + 9 + dy) end
 			-- in reach but its HP doesn't move for 8 s -> we can't actually hit it: skip it for 45 s
@@ -2228,7 +2232,21 @@ task.spawn(function()
 			else
 				lookAt = tp
 				local pattern = e.pattern
-				if pattern == "วนรอบตัว (Orbit)" then
+				-- small mobs (Frog / Tiny / Small): circling turned our back to them and they hopped under our feet;
+				-- the swing's hitbox is in front of us -> stand ~4.5 studs off, face it, no orbit
+				local tier = t:GetAttribute("Tier")
+				local fd = flat(hrp.Position - tp).Magnitude
+				if tier == "Tiny" or tier == "Small" then
+					if fd < 3.5 then
+						local away = flat(hrp.Position - tp)
+						away = away.Magnitude > 0.1 and away.Unit or -hrp.CFrame.LookVector
+						moveTo(tp + away * 4.5, true)
+					elseif fd > e.reach - 1 then
+						moveTo(Vector3.new(tp.X, hrp.Position.Y, tp.Z), true)
+					else
+						stopMove()
+					end
+				elseif pattern == "วนรอบตัว (Orbit)" then
 					local cur = math.atan2(hrp.Position.Z - tp.Z, hrp.Position.X - tp.X)
 					orbitAng = cur + e.orbitSpeed * 0.6
 					local goal = tp + Vector3.new(math.cos(orbitAng), 0, math.sin(orbitAng)) * e.orbitRadius
