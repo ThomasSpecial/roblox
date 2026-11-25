@@ -153,6 +153,8 @@ local function mobHp(m) return tonumber(m:GetAttribute("Health")) or 0 end
 local function mobXp(m) return tonumber(m:GetAttribute("_RolledXP")) or 1 end
 -- a kill takes at least one swing (~0.6 s) even when the hit one-shots it
 local function killTime(m, dps) return math.max(mobHp(m) / dps, 0.6) end
+-- mobs we couldn't damage (on a ledge above us / behind rock): ignored for a while
+local skipUntil = setmetatable({}, {__mode = "k"})
 local function candidates_(hrp)
 	local anchor = anchorPos()
 	local list = {}
@@ -160,7 +162,7 @@ local function candidates_(hrp)
 	if e.passives then folders[#folders + 1] = AnimalLive:FindFirstChild("Passives") end
 	for _, folder in ipairs(folders) do
 		for _, m in ipairs(folder and folder:GetChildren() or {}) do
-			if wanted(m) then
+			if wanted(m) and not ((skipUntil[m] or 0) > os.clock()) then
 				local mp = mobPos(m)
 				local d = (mp - hrp.Position).Magnitude
 				-- with a farm spot: mobs around the spot, plus any picked mob right next to us (don't run past one
@@ -942,6 +944,26 @@ local function blocked(c, from, to)
 	end
 	return false
 end
+-- is there floor (no more than 6 studs below our feet) under point p? Orbit / dodge / short straight walks
+-- stepped off the Cobra plateau into a 24-stud pit nobody can climb out of
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+local function groundOk(c, feetY, p)
+	groundParams.FilterDescendantsInstances = {c, AnimalLive}
+	local r = workspace:Raycast(Vector3.new(p.X, feetY + 4, p.Z), Vector3.new(0, -10.5, 0), groundParams)
+	return r ~= nil
+end
+local function groundAlong(c, from, to, feetY)
+	local d = flat(to - from)
+	local n = math.floor(d.Magnitude / 3)
+	for k = 1, n do
+		if not groundOk(c, feetY, from + d * (k / math.max(n, 1))) then return false end
+	end
+	return groundOk(c, feetY, to)
+end
+local function feetOf(hrp, hum)
+	return hrp.Position.Y - hrp.Size.Y / 2 - (hum and hum.HipHeight or 2)
+end
 local function computePath(hrp, goal)
 	path.goal, path.at, path.wps, path.i, path.nav = goal, os.clock(), nil, 2, false
 	local m = getNav()
@@ -1005,6 +1027,7 @@ local function walkTo(hrp, hum, goal)
 	-- straight line when nothing is in the way, else Pathfinding (recomputed only when the goal moves or we get stuck);
 	-- after getting stuck the straight line is not trusted for a few seconds
 	local direct = os.clock() > (stuck.pathOnly or 0) and flat(goal - hrp.Position).Magnitude < 30 and not blocked(c, hrp.Position, goal)
+		and math.abs(goal.Y - hrp.Position.Y) < 6 and groundAlong(c, hrp.Position, goal, feetOf(hrp, hum))
 	if direct then
 		path.wps = nil
 	elseif not path.wps or (path.goal - goal).Magnitude > math.max(8, flat(goal - hrp.Position).Magnitude * 0.15) then
@@ -1135,9 +1158,14 @@ local function clampHeal(goal)
 	return Vector3.new(p.X, goal.Y, p.Z)
 end
 local function moveTo(goal, free)
-	local _, hrp, hum = char()
+	local c, hrp, hum = char()
 	if not hrp then return end
 	if not free then goal = clampHeal(goal) end
+	-- short repositioning (combat): the spot must have floor under it, else hold position
+	if e.moveMode == "Walk" and flat(goal - hrp.Position).Magnitude < 20 and not groundOk(c, feetOf(hrp, hum), goal) then
+		mover.walk = nil
+		return
+	end
 	if e.moveMode == "Walk" then
 		mover.goal = nil
 		setControls(false)
@@ -1432,6 +1460,7 @@ end
 -- dismantling is refused away from a crafting table ("Head back to the crafting bench to do that."): tables are
 -- models tagged CraftingStation, the game's UI opens within 11 studs
 local trip = {active = false, at = 0, kind = nil}
+local noProg = {t = nil, hp = 0, at = 0}
 local shopTripPos = function() return nil end   -- set by the auto-buy section (defined after the farm loop)
 local shopTripBuy = function() end
 local function nearestStation(pos)
@@ -2001,7 +2030,11 @@ task.spawn(function()
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) then t = nil end
 			-- non-lock modes re-check twice a second: a mob that (re)spawned closer / weaker takes over,
 			-- with a margin so two similar mobs don't flip-flop
-			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
+			-- a mob we already hurt is finished first: our hits knock it back out of reach, and re-evaluating then
+			-- swapped a half-dead Cobra (177k/300k) for a full one 100 studs away, back and forth
+			local committed = t and mobAlive(t) and mobHp(t) < (tonumber(t:GetAttribute("MaxHealth")) or math.huge) * 0.97
+				and flat(mobPos(t) - hrp.Position).Magnitude < 45
+			if t and not committed and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
 				st.reevalAt = os.clock()
 				local cand, candV, pool = pickTarget(hrp)
 				if cand and cand ~= t then
@@ -2050,6 +2083,23 @@ task.spawn(function()
 			end
 			local tp = mobPos(t)
 			local dist = flat(tp - hrp.Position).Magnitude
+			-- a mob on a ledge 20 studs up but 9 across is NOT in reach: we stood under the cliff swinging at rock
+			local dy = math.abs(tp.Y - hrp.Position.Y)
+			if dy > 8 then dist = math.max(dist, math.max(e.standDist, e.orbitRadius) + 9 + dy) end
+			-- in reach but its HP doesn't move for 8 s -> we can't actually hit it: skip it for 45 s
+			do
+				local h = mobHp(t)
+				-- close by (flat < 40) but no damage: 8 s when "in reach", 20 s while still trying to climb to it
+				if noProg.t ~= t or h < noProg.hp - 1 or flat(tp - hrp.Position).Magnitude > 40 then
+					noProg.t, noProg.hp, noProg.at = t, h, os.clock()
+				elseif os.clock() - noProg.at > (dist <= e.reach + 2 and 8 or 20) then
+					skipUntil[t] = os.clock() + 45
+					log(("ตี %s ไม่เข้า (อยู่บนที่สูง/หลังหิน) → ข้ามไปตัวอื่น 45 วิ"):format(tostring(t:GetAttribute("Animal"))))
+					st.target, noProg.t = nil, nil
+					endCombo()
+					return
+				end
+			end
 			do
 				local now, h = os.clock(), mobHp(t)
 				if dpsStat.t == t then
@@ -2107,7 +2157,7 @@ task.spawn(function()
 			elseif dist > math.max(e.standDist, e.orbitRadius) + 8 then
 				lookAt = nil
 				if not aura(c, hrp) then endCombo() end
-				moveTo(Vector3.new(tp.X, hrp.Position.Y, tp.Z))
+				moveTo(e.moveMode == "Walk" and tp or Vector3.new(tp.X, hrp.Position.Y, tp.Z))
 				st.status = ("เดินทางไปหา %s · %.0f stud (%s)"):format(tostring(t:GetAttribute("Animal")), dist, e.moveMode)
 				return
 			else
@@ -2291,7 +2341,24 @@ task.spawn(function()
 					wd.best, wd.at, wd.tries = nil, now, 0
 				end
 			end
-			if st.target and now - wd.killAt > e.wdKill and e.wdReset then resetChar(("ไม่ได้ฆ่ามอนเลย %d วิ"):format(e.wdKill)) end
+			if st.target and now - wd.killAt > e.wdKill and e.wdReset then resetChar(("ไม่ได้ฆ่ามอนเลย %d วิ"):format(e.wdKill)) return end
+			-- trapped: near the spot, nothing killed for 30 s, and the navmap's walkable area around us doesn't
+			-- reach the spot while we stand well below it (fell into a pit) -> twice in a row = reset now
+			if a and navMap and e.wdReset and now - wd.killAt > 30 and flat(hrp.Position - a).Magnitude < e.anchorR + 40
+				and hrp.Position.Y < a.Y - 8 then
+				local ok, pts = pcall(Nav.plan, navMap, hrp.Position, a, true, function() task.wait() end)
+				local endP = ok and pts and pts[#pts].pos
+				if endP and flat(endP - a).Magnitude > 30 and endP.Y < a.Y - 8 then
+					wd.trapped = (wd.trapped or 0) + 1
+					if wd.trapped >= 2 then
+						wd.trapped = 0
+						resetChar("ตกหลุม เดินกลับขึ้นจุดฟาร์มไม่ได้")
+						return
+					end
+				else
+					wd.trapped = 0
+				end
+			end
 			st.wd = ("ฆ่าล่าสุด %d วิก่อน%s"):format(now - wd.killAt, wd.best and (" · ระยะกลับ %.0f (คืบล่าสุด %d วิก่อน)"):format(wd.best, now - wd.at) or "")
 		end)
 	end
