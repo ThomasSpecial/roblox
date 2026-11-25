@@ -1310,6 +1310,12 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
 		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
 		local want = (e.farm and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
+		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
+		-- Cancel it only, so we run at the normal 20, never faster than a player can
+		if e.farm and os.clock() < (st.evadeUntil or 0) then
+			local sw = tonumber(hum:GetAttribute("_WSMultC_WeaponSwing")) or 1
+			want = sw > 0 and sw < 1 and math.min(1 / sw, 2) or nil
+		end
 		if hum:GetAttribute("_WSMultC_PolyLoot") ~= want then hum:SetAttribute("_WSMultC_PolyLoot", want) end
 	end
 	if mover.walk then
@@ -2003,23 +2009,68 @@ end
 if plr.Character then task.spawn(bindHurt, plr.Character) end
 plr.CharacterAdded:Connect(bindHurt)
 -- point to step to while a dangerous attack winds up, or nil
+-- how far a mob's hit reaches (Animal_Engine.Config): Haunted Tree Slam = 12-stud root eruption around it
+local AnimalCfg
+pcall(function() AnimalCfg = require(RS.Animal_Engine.Config) end)
+local hitRadCache, areaCache = {}, {}
+-- radius of an area attack (slam / impale / skyfall circle), 0 for plain melee
+local function areaRadius(name)
+	if areaCache[name] == nil then
+		local r = 0
+		pcall(function()
+			local d = AnimalCfg.Get(name)
+			r = math.max(tonumber(d.SlamRadius) or 0, tonumber(d.ImpaleRadius) or 0, tonumber(d.SkyfallRadius) or 0)
+		end)
+		areaCache[name] = r
+	end
+	return areaCache[name]
+end
+local function hitRadius(name)
+	if hitRadCache[name] == nil then
+		local r = 0
+		pcall(function()
+			local d = AnimalCfg.Get(name)
+			r = math.max(tonumber(d.SlamRadius) or 0, tonumber(d.AttackRange) or 0, tonumber(d.ImpaleRadius) or 0,
+				tonumber(d.SkyfallRadius) or 0)
+		end)
+		hitRadCache[name] = r
+	end
+	return hitRadCache[name]
+end
 local function smartEvade(hrp, hum)
 	if not e.smart then return nil end
 	local now = os.clock()
+	-- every attack about to land on us is summed: one Haunted Tree slam (~5.7k) is under 15 % of our HP, but a pack of
+	-- 3-4 trees slams together for 11k+ -> judged one by one, none was "dangerous" and we stood in all of them
+	local total, need, push, worst, worstDmg = 0, 0, Vector3.zero, nil, 0
 	for m, rec in pairs(mobState) do
-		if rec.state == "ATTACK" and rec.attackAt and m.Parent then
+		-- the attack START counts, not the current state: our swing puts the mob in KNOCKBACK 0.1 s later, but a Slam
+		-- already wound up still lands ~0.6 s after it began. Requiring state == ATTACK ended the evade early and we
+		-- walked back into the roots.
+		if rec.attackAt and m.Parent then
 			local name = m:GetAttribute("Animal") or "?"
-			if now - rec.attackAt < windupOf(name) + 0.12 then
+			if now - rec.attackAt < windupOf(name) + 0.15 then
 				local mp = mobPos(m)
 				local d = flat(mp - hrp.Position).Magnitude
-				local dmg = hitOf(m)
-				if d < e.smartRange and dmg >= hum.Health * e.smartDanger / 100 then
+				local safeR = math.max(e.smartRange, hitRadius(name) + 4)
+				if d < safeR then
+					local dmg = hitOf(m)
+					total += dmg
+					need = math.max(need, safeR - d)
 					local away = flat(hrp.Position - mp)
 					away = away.Magnitude > 0.1 and away.Unit or -hrp.CFrame.LookVector
-					return hrp.Position + away * (e.smartRange - d + 3), name, dmg
+					push += away * dmg
+					if dmg > worstDmg then worst, worstDmg = name, dmg end
 				end
 			end
 		end
+	end
+	-- also anything >= 8 % of max HP: at full HP the "% of current HP" rule let 5.7k slams (9 % of 61k) through every time
+	if total > 0 and total >= math.min(hum.Health * e.smartDanger / 100, hum.MaxHealth * 0.08) then
+		local dir = flat(push)
+		dir = dir.Magnitude > 0.1 and dir.Unit or -hrp.CFrame.LookVector
+		local p = hrp.Position + dir * (need + 3)
+		return Vector3.new(p.X, hrp.Position.Y, p.Z), worst, total
 	end
 end
 local function learnText()
@@ -2289,6 +2340,8 @@ task.spawn(function()
 			local ev, evName, evDmg = smartEvade(hrp, hum)
 			if ev then
 				st.evades = (st.evades or 0) + 1
+				st.evadeUntil = os.clock() + 0.3
+				endCombo()
 				moveTo(ev, true)
 				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
 				return
@@ -2330,7 +2383,13 @@ task.spawn(function()
 				elseif pattern == "วนรอบตัว (Orbit)" then
 					local cur = math.atan2(hrp.Position.Z - tp.Z, hrp.Position.X - tp.X)
 					orbitAng = cur + e.orbitSpeed * 0.6
-					local goal = tp + Vector3.new(math.cos(orbitAng), 0, math.sin(orbitAng)) * e.orbitRadius
+					-- area slams (Haunted Tree: 12-stud circle around it, lands 0.62 s after the wind-up, we swing at
+					-- WalkSpeed 10): from 7 studs we only got to ~13 before it landed and took every slam. Fight at the
+					-- edge of our reach instead -> a few steps clear it.
+					local r = e.orbitRadius
+					local area = areaRadius(t:GetAttribute("Animal") or "?")
+					if area > r then r = math.max(r, math.min(e.reach - 1.5, area - 2)) end
+					local goal = tp + Vector3.new(math.cos(orbitAng), 0, math.sin(orbitAng)) * r
 					moveTo(Vector3.new(goal.X, hrp.Position.Y, goal.Z))
 				elseif pattern == "ตีแล้วถอย (Hit & Run)" then
 					local phase = (os.clock() - lockStart) % 3
