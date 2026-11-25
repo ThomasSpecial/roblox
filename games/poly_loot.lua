@@ -897,6 +897,61 @@ do
 		restore()
 		return ok and n or 0
 	end
+
+	-- a tile scanned while its real ground wasn't streamed in keeps only what lay below it (Dark Forest: the map had a
+	-- flat 89.8 under the forest floor at 103.6 -> "start-off-map", the bot hopped in place). Spot-check the scanned
+	-- tiles near us once per session: real top floor clearly higher than the stored one -> back to "0", fillNear redoes it.
+	-- Only "higher" counts: a hit we miss now (unqueryable part, streamed out) never makes a tile stale.
+	function Nav.verifyNear(m, pos, maxTiles)
+		m.checked = m.checked or {}
+		local list = {}
+		for t = 1, m.tx * m.tz do
+			if m.tiles[t] == "1" and not m.checked[t] then
+				local cx, cz = tileCentre(m, t)
+				local d = Vector2.new(pos.X - cx, pos.Z - cz).Magnitude
+				if d < 300 then list[#list + 1] = {t, d} end
+			end
+		end
+		if #list == 0 then return 0 end
+		table.sort(list, function(a, b) return a[2] < b[2] end)
+		local rp = rayParams()
+		local top, bot = m.top or 420, m.bot or 30
+		local function liveTop(x, z)
+			local y0 = top
+			for _ = 1, 12 do
+				local r = workspace:Raycast(Vector3.new(x, y0, z), Vector3.new(0, bot - y0, 0), rp)
+				if not r then return nil end
+				local y = r.Position.Y
+				if r.Normal.Y >= 0.55 and not workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, HEAD, 0), rp) then
+					return y
+				end
+				y0 = y - 0.3
+				if y0 <= bot then return nil end
+			end
+		end
+		local stale = 0
+		for n = 1, math.min(#list, maxTiles or 3) do
+			local t = list[n][1]
+			m.checked[t] = true
+			local _, _, i0, j0, i1, j1 = tileCentre(m, t)
+			local bad, seen = 0, 0
+			for j = j0 + 4, j1, 10 do
+				for i = i0 + 4, i1, 10 do
+					local y = liveTop(m.x0 + i * CELL, m.z0 + j * CELL)
+					if y then
+						seen += 1
+						local h = m.hts[1][j * m.w + i + 1]
+						if not h or y > h + 2 then bad += 1 end
+					end
+				end
+			end
+			if bad >= 4 and bad >= seen * 0.1 then
+				m.tiles[t] = "0"
+				stale += 1
+			end
+		end
+		return stale
+	end
 end
 return Nav
 end)()
@@ -934,6 +989,11 @@ task.spawn(function()
 		local m = navMap
 		local _, hrp = char()
 		if m and hrp and not st.navScanning then
+			local okV, stale = pcall(Nav.verifyNear, m, hrp.Position, 3)
+			if okV and stale > 0 then
+				st.navStale = (st.navStale or 0) + stale
+				log(("NavMap: พื้นในแผนที่ไม่ตรงของจริง %d ส่วน -> สแกนใหม่"):format(stale))
+			end
 			local n = Nav.fillNear(m, hrp.Position, 2, function() task.wait() end)
 			if n > 0 then
 				dirty += n
