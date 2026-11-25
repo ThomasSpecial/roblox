@@ -41,6 +41,7 @@ local SF = ("PolyLoot/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {
 	farm = false, mobs = {}, bossOnly = false, passives = false, radius = 400,
 	bossHunt = false, bossPick = {}, bossRange = 500, bossSeen = {}, bossSafe = true,
+	autoBuy = false, buyPick = {}, buyEqRar = {}, buyKeep = 20000, buyTrip = true, merchantPos = nil,
 	targetMode = "คุ้มที่สุด (ฟาร์มไวสุด)", pattern = "วนรอบตัว (Orbit)", moveMode = "Walk",
 	tweenSpeed = 22, tpMax = 40, standDist = 5, orbitRadius = 7, orbitSpeed = 1.6,
 	attack = true, swing = 0.55, attackMode = "ท่าฟันของเกม (Tool:Activate)", reach = 11, dodge = true, dodgeMargin = 3,
@@ -1430,7 +1431,9 @@ local function candidates()
 end
 -- dismantling is refused away from a crafting table ("Head back to the crafting bench to do that."): tables are
 -- models tagged CraftingStation, the game's UI opens within 11 studs
-local trip = {active = false, at = 0}
+local trip = {active = false, at = 0, kind = nil}
+local shopTripPos = function() return nil end   -- set by the auto-buy section (defined after the farm loop)
+local shopTripBuy = function() end
 local function nearestStation(pos)
 	local best, bd
 	for _, m in ipairs(CS:GetTagged("CraftingStation")) do
@@ -1474,7 +1477,7 @@ local function invPass(manual)
 				local used, cap = bagState(invData())
 				return used >= cap - e.bagFree
 			end)())) then
-				trip.active, trip.at = true, os.clock()
+				trip.active, trip.at, trip.kind = true, os.clock(), "craft"
 				log(("ของรอย่อย %d ชิ้น → ไปโต๊ะคราฟ"):format(n))
 			end
 		end
@@ -1496,6 +1499,123 @@ task.spawn(function()
 		for _ = 1, math.max(5, e.invEvery) do if not alive() then break end task.wait(1) end
 	end
 end)
+
+-- ------------------------------------------------------------------ auto buy (Merchant)
+-- The coin shop: Data.Merchant.Slots = {{Key, Remaining}} (5 daily offers + unlocked extra slots, restock every 12 h,
+-- NextRestockAt). Merchant_Engine.Remotes.PurchaseRequest:FireServer(key) buys one; the server answers
+-- (ok, ?, reason) and refuses "not-at-merchant" unless we stand by a "MerchantStation"-tagged model (UI opens at 11).
+-- MerchantConfig.Get(key) -> {ItemId, Price}; weapons / armour offers are keyed "EQ_<item>".
+local MerchantConfig
+pcall(function() MerchantConfig = require(RS.Merchant_Engine.MerchantConfig) end)
+local PurchaseRequest = RS:WaitForChild("Merchant_Engine"):WaitForChild("Remotes"):WaitForChild("PurchaseRequest")
+local buyReply = nil
+PurchaseRequest.OnClientEvent:Connect(function(ok, _, reason) buyReply = {ok = ok, reason = reason} end)
+local BUY_REASON = {coins = "เหรียญไม่พอ", ["not-at-merchant"] = "ไม่ได้ยืนที่ร้าน", ["inventory-full"] = "กระเป๋าเต็ม",
+	["out-of-stock"] = "ของหมด", ["not-offered"] = "วันนี้ไม่มีขาย"}
+local buyBlockUntil = 0
+-- the station only exists while streamed in -> remember where it was
+local function merchantPos(from)
+	local best, bd
+	for _, m in ipairs(CS:GetTagged("MerchantStation")) do
+		local ok, p = pcall(function() return m:IsA("Model") and m:GetPivot().Position or m.Position end)
+		if ok then
+			local d = from and (p - from).Magnitude or 0
+			if not bd or d < bd then best, bd = p, d end
+		end
+	end
+	if best then
+		local cur = e.merchantPos
+		if not cur or (Vector3.new(cur[1], cur[2], cur[3]) - best).Magnitude > 3 then
+			e.merchantPos = {math.floor(best.X * 10) / 10, math.floor(best.Y * 10) / 10, math.floor(best.Z * 10) / 10}
+			sv()
+			log("จำตำแหน่งร้าน Merchant แล้ว")
+		end
+		return best
+	end
+	local a = e.merchantPos
+	return a and Vector3.new(a[1], a[2], a[3]) or nil
+end
+-- offers we want and can afford (keeping buyKeep coins)
+local function shopWants(d)
+	local out = {}
+	if not (MerchantConfig and d and d.Merchant) then return out end
+	local coins = tonumber(d.Coins) or 0
+	for _, slot in ipairs(d.Merchant.Slots or {}) do
+		local left = tonumber(slot.Remaining) or 0
+		local ent = left > 0 and MerchantConfig.Get(slot.Key)
+		if ent then
+			local want
+			if MerchantConfig.IsEquipment(ent) then
+				local def = ItemRegistry and ItemRegistry[ent.ItemId]
+				want = def and e.buyEqRar[def.Rarity or "Common"]
+			else
+				want = e.buyPick[ent.ItemId]
+			end
+			local price = tonumber(ent.Price) or 0
+			if want and coins - price >= e.buyKeep then
+				out[#out + 1] = {key = slot.Key, id = ent.ItemId, price = price, left = left}
+			end
+		end
+	end
+	return out, coins
+end
+local function buyNow()
+	local bought = 0
+	for _, o in ipairs((shopWants(invData()))) do
+		for _ = 1, o.left do
+			local d = invData()
+			if not d or (tonumber(d.Coins) or 0) - o.price < e.buyKeep then break end
+			buyReply = nil
+			pcall(function() PurchaseRequest:FireServer(o.key) end)
+			local t0 = os.clock()
+			while not buyReply and os.clock() - t0 < 4 do task.wait(0.1) end
+			if not (buyReply and buyReply.ok) then
+				local why = buyReply and tostring(buyReply.reason) or "ไม่ตอบ"
+				log(("ซื้อ %s ไม่ได้: %s"):format(o.id, BUY_REASON[why] or why))
+				if why ~= "out-of-stock" then buyBlockUntil = os.clock() + 300 return bought end
+				break
+			end
+			bought += 1
+			st.bought = (st.bought or 0) + 1
+			log(("ซื้อ %s (%d เหรียญ)"):format(o.id, o.price))
+			task.wait(0.4)
+		end
+	end
+	return bought
+end
+st.buyNow = buyNow   -- debug handle
+shopTripPos = function(from) return merchantPos(from) end
+shopTripBuy = function() buyNow() end
+-- every 20 s: something worth buying -> buy if we stand at the shop, else (farming) walk there
+task.spawn(function()
+	while alive() do
+		for _ = 1, 20 do if not alive() then return end task.wait(1) end
+		if e.autoBuy and not trip.active and os.clock() > buyBlockUntil then
+			pcall(function()
+				local wants = shopWants(invData())
+				if #wants == 0 then return end
+				local _, hrp = char()
+				if not hrp then return end
+				local pos = merchantPos(hrp.Position)
+				if pos and (pos - hrp.Position).Magnitude <= 10 then
+					buyNow()
+				elseif pos and e.farm and e.buyTrip then
+					trip.active, trip.at, trip.kind = true, os.clock(), "shop"
+					log(("ร้านมีของที่ตั้งไว้ %d อย่าง → เดินไปซื้อ"):format(#wants))
+				elseif not pos then
+					st.shopNote = "ยังไม่รู้ว่าร้านอยู่ไหน: เดินผ่านร้านในเมืองสักครั้ง สคริปต์จะจำเอง"
+				end
+			end)
+		end
+	end
+end)
+-- remember the shop the moment it streams in
+CS:GetInstanceAddedSignal("MerchantStation"):Connect(function()
+	task.wait(1)
+	local _, hrp = char()
+	pcall(merchantPos, hrp and hrp.Position)
+end)
+task.spawn(function() local _, hrp = char() pcall(merchantPos, hrp and hrp.Position) end)
 
 -- ------------------------------------------------------------------ auto stats
 -- Free points = Data.StatPoints + Data.BankedPoints (Upgrades_Client); spent with
@@ -1815,19 +1935,32 @@ task.spawn(function()
 			if trip.active then
 				local _, hrp = char()
 				if not hrp then return end
-				local pos, d = nearestStation(hrp.Position)
-				if not pos or os.clock() - trip.at > 120 then
+				local shop = trip.kind == "shop"
+				local pos, d
+				if shop then
+					pos = shopTripPos(hrp.Position)
+					d = pos and (pos - hrp.Position).Magnitude
+				else
+					pos, d = nearestStation(hrp.Position)
+				end
+				-- the shop is in town, far from most farm spots: allow a longer walk
+				if not pos or os.clock() - trip.at > (shop and 300 or 120) then
 					trip.active = false
-					log("ไปโต๊ะคราฟไม่ถึง (หมดเวลา)")
+					log(shop and "ไปร้านไม่ถึง (หมดเวลา)" or "ไปโต๊ะคราฟไม่ถึง (หมดเวลา)")
 				elseif d > 8 then
 					endCombo(); lookAt = nil
 					moveTo(pos)
-					st.status = ("เดินไปโต๊ะคราฟเพื่อย่อย · %.0f stud"):format(d)
+					st.status = (shop and "เดินไปร้าน Merchant เพื่อซื้อของ · %.0f stud" or "เดินไปโต๊ะคราฟเพื่อย่อย · %.0f stud"):format(d)
 					return
 				else
 					stopMove()
-					st.status = "ย่อยของที่โต๊ะคราฟ"
-					dismantleNow()
+					if shop then
+						st.status = "ซื้อของที่ร้าน Merchant"
+						shopTripBuy()
+					else
+						st.status = "ย่อยของที่โต๊ะคราฟ"
+						dismantleNow()
+					end
 					trip.active = false
 					return
 				end
@@ -2469,6 +2602,49 @@ IL:Label({Text = "เฉพาะอาวุธ + เกราะ · ไม่�
 local IR2 = InvTab:Section({Side = "Right"})
 IR2:Header({Text = "กระเป๋า (ของที่ขาย/ย่อยได้)"})
 local invLbl = IR2:Label({Text = "-"})
+IR2:Header({Text = "Auto Buy (ร้าน Merchant)"})
+local BUY_ITEMS = {}
+pcall(function()
+	local seen = {}
+	for _, ent in pairs(MerchantConfig.Pool) do
+		if ent.ItemId and not seen[ent.ItemId] then seen[ent.ItemId] = true; BUY_ITEMS[#BUY_ITEMS + 1] = ent.ItemId end
+	end
+	table.sort(BUY_ITEMS)
+end)
+IR2:Toggle({Name = "Auto Buy", Default = e.autoBuy, Callback = function(v) e.autoBuy = v; sv() end}, "PLBuy")
+IR2:Dropdown({Name = "ของที่จะซื้อ", Multi = true, Required = false, Search = true, Options = BUY_ITEMS, Default = picked(e.buyPick),
+	Callback = function(v) e.buyPick = multiSet(v); sv() end}, "PLBuyPick")
+IR2:Dropdown({Name = "อาวุธ/เกราะที่ร้านขาย (ตาม Rarity)", Multi = true, Required = false, Options = {"Epic", "Legendary", "Godly"},
+	Default = picked(e.buyEqRar), Callback = function(v) e.buyEqRar = multiSet(v); sv() end}, "PLBuyEq")
+IR2:Slider({Name = "เก็บเหรียญไว้อย่างน้อย", Default = e.buyKeep, Minimum = 0, Maximum = 500000, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.buyKeep = v; sv() end}, "PLBuyKeep")
+IR2:Toggle({Name = "└ ตอนฟาร์ม: เดินไปร้านเองเมื่อมีของที่ตั้งไว้", Default = e.buyTrip, Callback = function(v) e.buyTrip = v; sv() end}, "PLBuyTrip")
+local shopLbl = IR2:Label({Text = "-"})
+IR2:Button({Name = "ซื้อตอนนี้เลย (ต้องยืนที่ร้าน)", Callback = function() task.spawn(function() pcall(buyNow) end) end})
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			local d = invData()
+			local m = d and d.Merchant
+			local lines = {}
+			if m and MerchantConfig then
+				for _, slot in ipairs(m.Slots or {}) do
+					local ent = MerchantConfig.Get(slot.Key)
+					lines[#lines + 1] = ("%s %s · %s เหรียญ · เหลือ %s"):format(tonumber(slot.Remaining) and slot.Remaining > 0 and "•" or "×",
+						tostring(ent and ent.ItemId or slot.Key), tostring(ent and ent.Price or "?"), tostring(slot.Remaining))
+				end
+				local left = math.max(0, (tonumber(m.NextRestockAt) or 0) - os.time())
+				lines[#lines + 1] = ("เหรียญ %s · รีสต็อกใน %d ชม. %d น. · ซื้อไปแล้ว %d"):format(tostring(d.Coins), left // 3600, left % 3600 // 60, st.bought or 0)
+			end
+			local _, hrp = char()
+			local pos = merchantPos(hrp and hrp.Position)
+			lines[#lines + 1] = pos and ("ร้านอยู่ห่าง %.0f stud"):format(hrp and (pos - hrp.Position).Magnitude or 0)
+				or "ยังไม่รู้ตำแหน่งร้าน: เดินผ่านร้านในเมืองสักครั้ง สคริปต์จะจำเอง"
+			shopLbl:UpdateName(table.concat(lines, "\n"))
+		end)
+		task.wait(3)
+	end
+end)
 
 local StTab = TG:Tab({Name = "Stats", Image = "rbxassetid://10723346959"})
 local SL = StTab:Section({Side = "Left"})
