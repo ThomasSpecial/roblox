@@ -40,7 +40,7 @@ local AnimalLive = workspace:WaitForChild("Animal_Live")
 local SF = ("PolyLoot/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {
 	farm = false, mobs = {}, bossOnly = false, passives = false, radius = 400,
-	bossHunt = false, bossPick = {}, bossRange = 500, bossSeen = {},
+	bossHunt = false, bossPick = {}, bossRange = 500, bossSeen = {}, bossSafe = true,
 	targetMode = "คุ้มที่สุด (ฟาร์มไวสุด)", pattern = "วนรอบตัว (Orbit)", moveMode = "Walk",
 	tweenSpeed = 22, tpMax = 40, standDist = 5, orbitRadius = 7, orbitSpeed = 1.6,
 	attack = true, swing = 0.55, attackMode = "ท่าฟันของเกม (Tool:Activate)", reach = 11, dodge = true, dodgeMargin = 3,
@@ -229,7 +229,15 @@ local function bossTarget(hrp)
 				local kind = tostring(m:GetAttribute("Animal") or "?")
 				if not e.bossSeen[kind] then e.bossSeen[kind] = true; sv() end
 				-- only the bosses picked by name: TripleCobra has ~1.4M HP, "any boss" would park us on it
-				if e.bossPick[kind] then
+				local _, _, hum = char()
+				-- one hit of it kills us (TripleCobra hits ~13k): walking there only feeds the death loop
+				local lethal = e.bossSafe and hum and (tonumber(m:GetAttribute("Damage")) or 0) >= hum.MaxHealth * 0.9
+				if lethal and e.bossPick[kind] and st.bossSkip ~= kind then
+					st.bossSkip = kind
+					log(("ข้ามบอส %s: ตีทีละ %s แต่เลือดเต็มเรา %d (ปิด 'ข้ามบอสที่ตีทีเดียวตาย' ถ้าจะไปจริง)"):format(kind,
+						tostring(m:GetAttribute("Damage")), hum.MaxHealth))
+				end
+				if e.bossPick[kind] and not lethal then
 					local ok, p = pcall(function() return m:GetPivot().Position end)
 					if ok then
 						local d = (p - hrp.Position).Magnitude
@@ -294,9 +302,11 @@ do
 	local DROP = 12        -- max drop we walk off
 	local HEAD = 5         -- clear space a floor needs above it
 	local TILE = 64        -- columns per scan tile side (192 studs)
-	Nav.SCAN_V = 2   -- maps saved by an older scanner are ignored (rescan)
+	Nav.SCAN_V = 3   -- maps saved by an older scanner are ignored (rescan); v3: bounds cover the jungle / dark forest
 	Nav.maps = {}
-	Nav.BOUNDS = {x0 = -160, z0 = -1440, x1 = 1120, z1 = 260, top = 420, bot = 40}
+	-- town + fields + cave + jungle (TripleCobra -305,-1418) + dark forest; v2 stopped at x -160 and bosses past it
+	-- fell back to Roblox Pathfinding
+	Nav.BOUNDS = {x0 = -620, z0 = -2380, x1 = 1200, z1 = 500, top = 420, bot = 30}
 
 	-- direction n (1..8) <-> bit 2^(n-1)
 	local DIRS = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}, {1, 1}, {-1, 1}, {-1, -1}, {1, -1}}
@@ -877,7 +887,9 @@ local function walkTo(hrp, hum, goal)
 	local direct = os.clock() > (stuck.pathOnly or 0) and flat(goal - hrp.Position).Magnitude < 30 and not blocked(c, hrp.Position, goal)
 	if direct then
 		path.wps = nil
-	elseif not path.wps or (path.goal - goal).Magnitude > 8 then
+	elseif not path.wps or (path.goal - goal).Magnitude > math.max(8, flat(goal - hrp.Position).Magnitude * 0.15) then
+		-- a far, moving target (boss) is re-planned only when it moved a fair share of the distance: re-planning a
+		-- 400-stud route every few studs it walked made us stop and turn constantly
 		computePath(hrp, goal)
 	end
 	local target = goal
@@ -2187,6 +2199,7 @@ L:Button({Name = "รีเฟรชรายชื่อบอส", Callback = 
 end})
 L:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เกิน (stud จากตัว/จุดฟาร์ม)", Default = e.bossRange, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
+L:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
 L:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้
 TripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
 L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
