@@ -232,7 +232,495 @@ local function setControls(on)
 	controlsOff, controlsAt = not on, os.clock()
 	pcall(function() if on then Controls:Enable() else Controls:Disable() end end)
 end
-local path = {goal = nil, wps = nil, i = 0, at = 0}
+-- [NAV BEGIN] generated from polyloot_nav.lua by sync_plnav.py -- edit that file, not this block
+local Nav = (function()
+-- Poly Loot NavMap: multi-layer grid (the cave runs under the mountains, bridges over rivers), scanned tile by tile
+-- (StreamingEnabled: each tile is streamed in first), A* + string-pull. Saved to PolyLoot/nav/<name>.json.
+-- Cell = 3 studs. A column holds up to 8 standable floors (top-down raycasts that keep going below every hit).
+-- Each floor stores 8 "blocked" bits, one per neighbour direction (waist-height rays both ways, headroom for jumps).
+local Nav = {}
+do
+	local HS = game:GetService("HttpService")
+	local Players = game:GetService("Players")
+	local DIR = "PolyLoot/nav/"
+	local CELL = 3
+	local MAXL = 8
+	local WALK_UP = 2.0    -- climb without jumping between orthogonal cells (ramps sample ~2 per cell)
+	local JUMP_UP = 5.5    -- ledge we can jump onto (JumpPower 50 clears ~7)
+	local DROP = 12        -- max drop we walk off
+	local HEAD = 5         -- clear space a floor needs above it
+	local TILE = 64        -- columns per scan tile side (192 studs)
+	Nav.SCAN_V = 1
+	Nav.maps = {}
+	Nav.BOUNDS = {x0 = -160, z0 = -1440, x1 = 1120, z1 = 260, top = 420, bot = 40}
+
+	-- direction n (1..8) <-> bit 2^(n-1)
+	local DIRS = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}, {1, 1}, {-1, 1}, {-1, -1}, {1, -1}}
+	local DIRN = {}
+	for n, d in ipairs(DIRS) do DIRN[d[1] * 3 + d[2]] = n end
+
+	local function decode(d)
+		local hts, wall = {}, {}
+		for l = 1, MAXL do hts[l], wall[l] = {}, {} end
+		local k = 0
+		for col in (d.cols .. ","):gmatch("([^,]*),") do
+			k += 1
+			if col ~= "" then
+				local l = 0
+				for h, w in col:gmatch("(%-?%d+):(%x%x)") do
+					l += 1
+					hts[l][k] = tonumber(h) / 10 + d.base
+					wall[l][k] = tonumber(w, 16)
+				end
+			end
+		end
+		return {name = d.name, cell = d.cell, x0 = d.x0, z0 = d.z0, w = d.w, h = d.h, hts = hts, wall = wall,
+			bad = {}, edge = {}, nodes = d.nodes, scanned = d.scanned}
+	end
+
+	function Nav.load(name)
+		if Nav.maps[name] then return Nav.maps[name] end
+		local path = DIR .. name .. ".json"
+		if not (isfile and isfile(path)) then return nil end
+		local ok, d = pcall(function() return HS:JSONDecode(readfile(path)) end)
+		if not ok or type(d) ~= "table" or not d.cols then return nil end
+		local m = decode(d)
+		Nav.maps[name] = m
+		return m
+	end
+
+	function Nav.inside(m, p)
+		local i = math.floor((p.X - m.x0) / CELL + 0.5)
+		local j = math.floor((p.Z - m.z0) / CELL + 0.5)
+		return i >= 0 and j >= 0 and i < m.w and j < m.h
+	end
+
+	-- floor of column k nearest to y within [y - DROP, y + up] (the same rule the scanner used for wall bits)
+	local function layerTo(m, k, y, up)
+		local best, bd
+		for l = 1, MAXL do
+			local h = m.hts[l][k]
+			if not h then break end
+			local dh = h - y
+			if dh <= up and dh >= -DROP and (not bd or math.abs(dh) < bd) then best, bd = l, math.abs(dh) end
+		end
+		return best
+	end
+
+	-- legal step from floor (i,j,l) in direction (di,dj)? -> neighbour layer, isJump
+	local step
+	step = function(m, i, j, l, di, dj, walkOnly)
+		local ni, nj = i + di, j + dj
+		if ni < 0 or nj < 0 or ni >= m.w or nj >= m.h then return nil end
+		local k = j * m.w + i + 1
+		local y = m.hts[l][k]
+		if not y then return nil end
+		local diag = di ~= 0 and dj ~= 0
+		local k2 = nj * m.w + ni + 1
+		local l2 = layerTo(m, k2, y, diag and WALK_UP * 1.42 or JUMP_UP)
+		if not l2 then return nil end
+		local n = DIRN[di * 3 + dj]
+		if bit32.band(m.wall[l][k] or 0, bit32.lshift(1, n - 1)) ~= 0 then return nil end
+		if m.bad[((k - 1) * MAXL + l - 1) * 8 + n] then return nil end
+		local dh = m.hts[l2][k2] - y
+		if walkOnly and dh > WALK_UP then return nil end
+		if diag then
+			-- no corner cutting: both orthogonal legs must be walkable
+			local la = step(m, i, j, l, di, 0, true)
+			if not la or not step(m, i + di, j, la, 0, dj, true) then return nil end
+			local lb = step(m, i, j, l, 0, dj, true)
+			if not lb or not step(m, i, j + dj, lb, di, 0, true) then return nil end
+		end
+		return l2, dh > WALK_UP
+	end
+	Nav.step = step
+
+	local function isEdge(m, i, j, l)
+		local key = ((j * m.w + i) * MAXL + l)
+		local v = m.edge[key]
+		if v == nil then
+			v = false
+			for n = 1, 4 do
+				if not step(m, i, j, l, DIRS[n][1], DIRS[n][2]) then v = true break end
+			end
+			m.edge[key] = v
+		end
+		return v
+	end
+
+	function Nav.worldOf(m, i, j, l)
+		return Vector3.new(m.x0 + i * CELL, m.hts[l][j * m.w + i + 1] + 3, m.z0 + j * CELL)
+	end
+
+	-- nearest standable floor to a world point (root-part height, or a mob pivot) within r cells
+	function Nav.snap(m, p, r)
+		local ci = math.floor((p.X - m.x0) / CELL + 0.5)
+		local cj = math.floor((p.Z - m.z0) / CELL + 0.5)
+		local best, bi, bj, bl = math.huge
+		for dj = -r, r do
+			for di = -r, r do
+				local i, j = ci + di, cj + dj
+				if i >= 0 and j >= 0 and i < m.w and j < m.h then
+					local k = j * m.w + i + 1
+					for l = 1, MAXL do
+						local h = m.hts[l][k]
+						if not h then break end
+						local dy = h + 3 - p.Y
+						if dy > -14 and dy < 7 then
+							local d = di * di + dj * dj + dy * dy * 0.3
+							if d < best then
+								local enter = false
+								for n = 1, 4 do
+									if step(m, i, j, l, DIRS[n][1], DIRS[n][2]) then enter = true break end
+								end
+								if enter then best, bi, bj, bl = d, i, j, l end
+							end
+						end
+					end
+				end
+			end
+		end
+		return bi, bj, bl
+	end
+
+	-- A* over floors; partial = route to the reachable floor closest to the goal when it can't be reached.
+	-- yieldFn() is called every 4000 expansions (long trips explore 100k+ floors).
+	function Nav.astar(m, si, sj, sl, gi, gj, gl, partial, yieldFn)
+		local W = m.w
+		local function id(i, j, l) return (j * W + i) * MAXL + l - 1 end
+		local start, goal = id(si, sj, sl), id(gi, gj, gl)
+		if start == goal then return {{si, sj, sl}} end
+		local g, came, closed = {[start] = 0}, {}, {}
+		local heap, hn = {{0, start}}, 1
+		local function push(f, nd)
+			hn += 1
+			heap[hn] = {f, nd}
+			local c = hn
+			while c > 1 do
+				local p = c // 2
+				if heap[p][1] <= heap[c][1] then break end
+				heap[p], heap[c] = heap[c], heap[p]
+				c = p
+			end
+		end
+		local function pop()
+			local top = heap[1]
+			heap[1] = heap[hn]
+			heap[hn] = nil
+			hn -= 1
+			local c = 1
+			while true do
+				local a, b, s = c * 2, c * 2 + 1, c
+				if a <= hn and heap[a][1] < heap[s][1] then s = a end
+				if b <= hn and heap[b][1] < heap[s][1] then s = b end
+				if s == c then break end
+				heap[s], heap[c] = heap[c], heap[s]
+				c = s
+			end
+			return top
+		end
+		local function hcost(i, j)
+			local dx, dz = math.abs(i - gi), math.abs(j - gj)
+			return math.max(dx, dz) + 0.414 * math.min(dx, dz)
+		end
+		local function build(last)
+			local out, nd = {}, last
+			while nd do
+				local l = nd % MAXL + 1
+				local c = nd // MAXL
+				table.insert(out, 1, {c % W, c // W, l})
+				nd = came[nd]
+			end
+			return out
+		end
+		local it, bestN, bestH = 0, start, hcost(si, sj)
+		while hn > 0 do
+			it += 1
+			if it > 400000 then break end
+			if yieldFn and it % 4000 == 0 then yieldFn() end
+			local cur = pop()[2]
+			if cur == goal then return build(goal) end
+			if not closed[cur] then
+				closed[cur] = true
+				local cl = cur % MAXL + 1
+				local cc = cur // MAXL
+				local ci, cj = cc % W, cc // W
+				local hc = hcost(ci, cj)
+				if hc < bestH then bestN, bestH = cur, hc end
+				for n = 1, 8 do
+					local d = DIRS[n]
+					local l2, jump = step(m, ci, cj, cl, d[1], d[2])
+					if l2 then
+						local ni, nj = ci + d[1], cj + d[2]
+						local nb = id(ni, nj, l2)
+						if not closed[nb] then
+							local cost = n > 4 and 1.414 or 1
+							if jump then cost += 3 end
+							if isEdge(m, ni, nj, l2) then cost += 1.5 end
+							local ng = g[cur] + cost
+							if not g[nb] or ng < g[nb] then
+								g[nb] = ng
+								came[nb] = cur
+								push(ng + hcost(ni, nj), nb)
+							end
+						end
+					end
+				end
+			end
+		end
+		if partial and bestN ~= start then return build(bestN), true end
+		return nil
+	end
+
+	-- straight walk from floor a to floor b: every supercover step walkable, no cliff-lip / wall-side floors
+	local function lineOk(m, a, b)
+		local i, j, l = a[1], a[2], a[3]
+		local dx, dz = b[1] - i, b[2] - j
+		local sx, sz = dx > 0 and 1 or -1, dz > 0 and 1 or -1
+		local nx, nz = math.abs(dx), math.abs(dz)
+		local ix, iz = 0, 0
+		while ix < nx or iz < nz do
+			local t1 = nx == 0 and math.huge or (0.5 + ix) / nx
+			local t2 = nz == 0 and math.huge or (0.5 + iz) / nz
+			local di, dj = 0, 0
+			if math.abs(t1 - t2) < 1e-9 then
+				di, dj = sx, sz
+				ix += 1
+				iz += 1
+			elseif t1 < t2 then
+				di = sx
+				ix += 1
+			else
+				dj = sz
+				iz += 1
+			end
+			local l2 = step(m, i, j, l, di, dj, true)
+			if not l2 then return false end
+			i, j, l = i + di, j + dj, l2
+			if isEdge(m, i, j, l) and not (i == b[1] and j == b[2]) then return false end
+		end
+		return l == b[3]
+	end
+
+	function Nav.smooth(m, cells)
+		if #cells <= 2 then return cells end
+		local out = {cells[1]}
+		local a = 1
+		while a < #cells do
+			local b = math.min(#cells, a + 40)   -- cap the look-ahead: long lines are costly and rarely valid
+			while b > a + 1 and not lineOk(m, cells[a], cells[b]) do b -= 1 end
+			out[#out + 1] = cells[b]
+			a = b
+		end
+		return out
+	end
+
+	-- from / to world points -> {{pos = Vector3, jump = bool}, ...} (first = where we stand) or nil, reason
+	function Nav.plan(m, from, to, partial, yieldFn)
+		local si, sj, sl = Nav.snap(m, from, 3)
+		if not si then return nil, "start-off-map" end
+		local gi, gj, gl = Nav.snap(m, to, 6)
+		if not gi then return nil, "goal-off-map" end
+		local cells, part = Nav.astar(m, si, sj, sl, gi, gj, gl, partial, yieldFn)
+		if not cells then return nil, "no-path" end
+		local pts, prevY = {}, nil
+		for _, c in ipairs(Nav.smooth(m, cells)) do
+			local p = Nav.worldOf(m, c[1], c[2], c[3])
+			pts[#pts + 1] = {pos = p, jump = prevY ~= nil and p.Y - prevY > WALK_UP}
+			prevY = p.Y
+		end
+		return pts, part and "partial" or nil
+	end
+
+	-- the step from p toward q failed in the real world: forbid it for this session
+	function Nav.markBad(m, p, q)
+		local i, j, l = Nav.snap(m, p, 1)
+		if not i then return end
+		local qi = math.floor((q.X - m.x0) / CELL + 0.5)
+		local qj = math.floor((q.Z - m.z0) / CELL + 0.5)
+		local di, dj = math.clamp(qi - i, -1, 1), math.clamp(qj - j, -1, 1)
+		local n = DIRN[di * 3 + dj]
+		if not n or (di == 0 and dj == 0) then return end
+		m.bad[((j * m.w + i) * MAXL + l - 1) * 8 + n] = true
+		m.edge = {}
+	end
+
+	-- ---------------------------------------------------------------- scanner
+	local DYNAMIC = {"Animal_Live", "Companion_Live", "AbilityEffects", "RuntimeMounts", "Animal_LocalDebris",
+		"WorldBits", "_EmoteFX_Local", "Camera", "Animal_SpawnPoints", "Knight_SpawnPoints", "AudioZones"}
+	local function rayParams()
+		local ex = {}
+		for _, n in ipairs(DYNAMIC) do
+			local f = workspace:FindFirstChild(n)
+			if f then ex[#ex + 1] = f end
+		end
+		for _, p in ipairs(Players:GetPlayers()) do if p.Character then ex[#ex + 1] = p.Character end end
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.FilterDescendantsInstances = ex
+		rp.RespectCanCollide = true
+		return rp
+	end
+
+	-- opts: name, bounds, onStatus(text), yieldFn()
+	function Nav.scan(opts)
+		opts = opts or {}
+		local name = opts.name or "main"
+		local B = opts.bounds or Nav.BOUNDS
+		local say = opts.onStatus or function() end
+		local yieldFn = opts.yieldFn or function() task.wait() end
+		local plr = Players.LocalPlayer
+		local x0 = math.floor(B.x0 / CELL) * CELL
+		local z0 = math.floor(B.z0 / CELL) * CELL
+		local W = math.floor((B.x1 - x0) / CELL) + 1
+		local H = math.floor((B.z1 - z0) / CELL) + 1
+		local base = math.floor(B.bot) - 10
+		local hts, wall, done = {}, {}, {}
+		for l = 1, MAXL do hts[l], wall[l] = {}, {} end
+		local rp = rayParams()
+		local down = Vector3.new(0, B.bot - B.top, 0)
+
+		-- collidable parts the game made unqueryable would be invisible to rays: flip them on while scanning
+		local flipped = {}
+		local function flip()
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("BasePart") and d.CanCollide and not d.CanQuery and not flipped[d] then
+					d.CanQuery = true
+					flipped[d] = true
+				end
+			end
+		end
+
+		local function floorsAt(i, j)
+			local k = j * W + i + 1
+			if done[k] then return end
+			done[k] = true
+			local x, z = x0 + i * CELL, z0 + j * CELL
+			local y0, l = B.top, 0
+			for _ = 1, 20 do
+				local r = workspace:Raycast(Vector3.new(x, y0, z), Vector3.new(0, B.bot - y0, 0), rp)
+				if not r then break end
+				local y = r.Position.Y
+				if r.Normal.Y >= 0.55 and not workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, HEAD, 0), rp) then
+					l += 1
+					hts[l][k] = math.floor((y - base) * 10 + 0.5) / 10 + base
+					if l >= MAXL then break end
+				end
+				-- keep going below this surface (a ray starting inside the part passes out of it)
+				y0 = y - 0.3
+				if y0 <= B.bot then break end
+			end
+		end
+
+		local function wallsAt(i, j)
+			local k = j * W + i + 1
+			local x, z = x0 + i * CELL, z0 + j * CELL
+			for l = 1, MAXL do
+				local y = hts[l][k]
+				if not y then break end
+				local bits = 0
+				for n = 1, 8 do
+					local d = DIRS[n]
+					local ni, nj = i + d[1], j + d[2]
+					local blockedDir = true
+					if ni >= 0 and nj >= 0 and ni < W and nj < H then
+						local k2 = nj * W + ni + 1
+						local diag = n > 4
+						-- same neighbour rule as layerTo()
+						local best, bd
+						for l2 = 1, MAXL do
+							local h = hts[l2][k2]
+							if not h then break end
+							local dh = h - y
+							if dh <= (diag and WALK_UP * 1.42 or JUMP_UP) and dh >= -DROP and (not bd or math.abs(dh) < bd) then
+								best, bd = h, math.abs(dh)
+							end
+						end
+						if best then
+							local wy = math.max(y, best) + 2.2
+							local a = Vector3.new(x, wy, z)
+							local b = Vector3.new(x0 + ni * CELL, wy, z0 + nj * CELL)
+							blockedDir = workspace:Raycast(a, b - a, rp) ~= nil or workspace:Raycast(b, a - b, rp) ~= nil
+							if not blockedDir and best - y > WALK_UP then
+								-- jumping up needs room above our head for the whole arc
+								blockedDir = workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, best - y + HEAD, 0), rp) ~= nil
+							end
+						end
+					end
+					if blockedDir then bits += bit32.lshift(1, n - 1) end
+				end
+				wall[l][k] = bits
+			end
+		end
+
+		local tilesX, tilesZ = math.ceil(W / TILE), math.ceil(H / TILE)
+		local total, t0 = tilesX * tilesZ, os.clock()
+		local ok, err = pcall(function()
+			local n = 0
+			for tz = 0, tilesZ - 1 do
+				for tx = 0, tilesX - 1 do
+					n += 1
+					local i0, j0 = tx * TILE, tz * TILE
+					local i1, j1 = math.min(W - 1, i0 + TILE - 1), math.min(H - 1, j0 + TILE - 1)
+					local cx = x0 + (i0 + i1) / 2 * CELL
+					local cz = z0 + (j0 + j1) / 2 * CELL
+					pcall(function() plr:RequestStreamAroundAsync(Vector3.new(cx, (B.top + B.bot) / 2, cz), 10) end)
+					flip()
+					rp = rayParams()
+					say(("สแกนพื้น %d/%d"):format(n, total))
+					-- floors of the tile plus a 1-column border (wall rays need the neighbours' floors)
+					for j = math.max(0, j0 - 1), math.min(H - 1, j1 + 1) do
+						for i = math.max(0, i0 - 1), math.min(W - 1, i1 + 1) do floorsAt(i, j) end
+						if j % 8 == 0 then yieldFn() end
+					end
+					for j = j0, j1 do
+						for i = i0, i1 do wallsAt(i, j) end
+						if j % 4 == 0 then yieldFn() end
+					end
+				end
+			end
+		end)
+		for d in pairs(flipped) do pcall(function() d.CanQuery = false end) end
+		if not ok then return nil, tostring(err) end
+
+		local cols, nodes = table.create(W * H), 0
+		for k = 1, W * H do
+			local parts = {}
+			for l = 1, MAXL do
+				local y = hts[l][k]
+				if not y then break end
+				nodes += 1
+				parts[#parts + 1] = ("%d:%02x"):format(math.floor((y - base) * 10 + 0.5), wall[l][k] or 255)
+			end
+			cols[k] = table.concat(parts, "|")
+		end
+		local data = {v = Nav.SCAN_V, name = name, cell = CELL, x0 = x0, z0 = z0, w = W, h = H, base = base,
+			cols = table.concat(cols, ","), nodes = nodes, scanned = os.time(), placeVersion = game.PlaceVersion,
+			secs = math.floor(os.clock() - t0)}
+		if makefolder then
+			if not isfolder("PolyLoot") then makefolder("PolyLoot") end
+			if not isfolder("PolyLoot/nav") then makefolder("PolyLoot/nav") end
+		end
+		writefile(DIR .. name .. ".json", HS:JSONEncode(data))
+		Nav.maps[name] = decode(data)
+		return Nav.maps[name], ("%dx%d · %d จุดยืน · %d วิ"):format(W, H, nodes, data.secs)
+	end
+end
+return Nav
+end)()
+-- [NAV END]
+local NAV_NAME = "main"
+local navMap = nil
+local navTried = false
+local function getNav()
+	if not navMap and not navTried then
+		navTried = true
+		local ok, m = pcall(Nav.load, NAV_NAME)
+		if ok then navMap = m end
+	end
+	return navMap
+end
+local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 local lastPosSkip = false   -- our own unstuck hop: don't count it as a server snap-back
 
 -- stuck watch: progress is sampled every 0.8 s while walking
@@ -256,7 +744,23 @@ local function blocked(c, from, to)
 	return false
 end
 local function computePath(hrp, goal)
-	path.goal, path.at, path.wps, path.i = goal, os.clock(), nil, 2
+	path.goal, path.at, path.wps, path.i, path.nav = goal, os.clock(), nil, 2, false
+	local m = getNav()
+	if m and Nav.inside(m, hrp.Position) and Nav.inside(m, goal) then
+		local ok, pts, why = pcall(Nav.plan, m, hrp.Position, goal, true, function() task.wait() end)
+		if ok and pts and #pts >= 2 then
+			local wps = {}
+			for _, q in ipairs(pts) do
+				wps[#wps + 1] = {Position = q.pos, Action = q.jump and Enum.PathWaypointAction.Jump or Enum.PathWaypointAction.Walk}
+			end
+			path.wps, path.nav = wps, true
+			path.goal, path.at = goal, os.clock()
+			st.navPlans = (st.navPlans or 0) + 1
+			st.navWhy = why or "ok"
+			return true
+		end
+		st.navWhy = ok and tostring(pts == nil and why or "short") or ("error " .. tostring(pts))
+	end
 	for _, cfg in ipairs({
 		{AgentRadius = 2, AgentHeight = 5.5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 4},
 		{AgentRadius = 1, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 3},
@@ -327,7 +831,10 @@ local function walkTo(hrp, hum, goal)
 	-- goal often doesn't shrink while we walk it fine): 1) jump + Pathfinding only 2) thinner-agent path
 	-- 3+) short flat hop toward the waypoint (hops under ~10 studs pass the server's position check)
 	local now = os.clock()
-	unstick(hrp, hum, target, function() computePath(hrp, goal) end)
+	unstick(hrp, hum, target, function()
+		if path.nav and navMap then Nav.markBad(navMap, hrp.Position, target) end
+		computePath(hrp, goal)
+	end)
 end
 
 -- recorded route: our own footsteps from where a long trip started (normally the respawn in town) to the farm spot,
@@ -435,7 +942,8 @@ local function moveTo(goal, free)
 		setControls(false)
 		-- far from the farm spot and heading back into it: use the recorded route when there is one
 		local a = anchorPos()
-		if a and flat(hrp.Position - a).Magnitude > e.anchorR + 40 and flat(goal - a).Magnitude < e.anchorR + 40 then
+		local navHere = getNav() and Nav.inside(navMap, hrp.Position)
+		if not navHere and a and flat(hrp.Position - a).Magnitude > e.anchorR + 40 and flat(goal - a).Magnitude < e.anchorR + 40 then
 			if followRoute(hrp, hum) then return end
 		else
 			routeI = nil
@@ -1601,6 +2109,31 @@ M:Slider({Name = "ความเร็ว Tween (stud/วินาที)", Def
 	Callback = function(v) e.tweenSpeed = v; sv() end}, "PLTweenSpeed")
 M:Slider({Name = "Teleport ไกลสุดต่อครั้ง (stud)", Default = e.tpMax, Minimum = 10, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.tpMax = v; sv() end}, "PLTpMax")
+M:Header({Text = "NavMap (แผนที่ทางเดิน)"})
+local navLbl = M:Label({Text = "-"})
+local function navText()
+	local m = getNav()
+	if not m then return "NavMap: ยังไม่มี → ใช้ Pathfinding ของ Roblox\nกดสแกนด้านล่าง (ยืนที่ไหนก็ได้ ~1-2 นาที)" end
+	return ("NavMap: %dx%d ช่อง · %d จุดยืน · สแกนเมื่อ %s\nวางเส้นทางไปแล้ว %d ครั้ง (%s)"):format(m.w, m.h, m.nodes or 0,
+		m.scanned and os.date("%d/%m %H:%M", m.scanned) or "-", st.navPlans or 0, tostring(st.navWhy or "-"))
+end
+pcall(function() navLbl:UpdateName(navText()) end)
+task.spawn(function()
+	while alive() do
+		task.wait(2)
+		pcall(function() navLbl:UpdateName(navText()) end)
+	end
+end)
+M:Button({Name = "สแกน NavMap ใหม่ (เมือง ทุ่ง ถ้ำ)", Callback = function()
+	if st.navScanning then return end
+	st.navScanning = true
+	task.spawn(function()
+		local m, info = Nav.scan({name = NAV_NAME, onStatus = function(t) pcall(function() navLbl:UpdateName(t) end) end})
+		if m then navMap, navTried = m, true; path.wps = nil end
+		log(m and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
+		st.navScanning = false
+	end)
+end})
 M:Label({Text = "Walk = เดินจริง (Pathfinding) ปลอดภัยสุด\nTween/Teleport: เกมมีกันโกงเช็กตำแหน่งทุก 0.2 วิ\n· Tween 28+ ทะลุตึกโดนดึงกลับ · 60 ตัวละครตาย\n· Teleport เกินระยะที่ตั้งจะ Tween แทน\nตัวเลข 'โดนดึงกลับ' ในสถานะขึ้น = ลดความเร็ว"})
 
 local P = MoveTab:Section({Side = "Right"})
