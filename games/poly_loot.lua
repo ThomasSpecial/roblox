@@ -2768,8 +2768,7 @@ L:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เก�
 	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
 L:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
 L:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้\nTripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
-L:Header({Text = "เวลาเกิดบอส"})
-local bossLbl = L:Label({Text = "-"})
+local bossLbl   -- shown in the status column (replaces the Smart learn table there)
 -- Boss signs (tag "BossSign": attrs Boss, BossAlive, BossRespawnAt = server epoch) only exist while streamed in, so
 -- every time we see one we remember it (e.bossTimes, saved). A boss model alive near us = up right now. A boss we saw
 -- alive and then lost without a sign telling us more -> predicted from its RespawnSeconds (Animal_Engine.Config).
@@ -2888,8 +2887,9 @@ L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required 
 local Rt = FarmTab:Section({Side = "Right"})
 Rt:Header({Text = "สถานะ"})
 local stLbl = Rt:Label({Text = "-"})
-Rt:Header({Text = "Smart: มอนที่เรียนรู้แล้ว"})
-local learnLbl = Rt:Label({Text = "-"})
+-- Smart still learns every mob's hits in the background (e.learn); the table itself isn't shown any more
+Rt:Header({Text = "เวลาเกิดบอส"})
+bossLbl = Rt:Label({Text = "-"})
 Rt:Header({Text = "ล่าสุด"})
 local logLbl = Rt:Label({Text = "-"})
 
@@ -3139,7 +3139,6 @@ task.spawn(function()
 				("ตาย %d · กินยา/ของกิน %d%s"):format(st.deaths or 0, st.heals or 0, (e.deathLog or {})[1] and ("\nตายล่าสุด " .. e.deathLog[1]) or ""),
 			}, "\n"))
 			logLbl:UpdateName(#st.last > 0 and table.concat(st.last, "\n") or "-")
-			learnLbl:UpdateName(learnText())
 			local sk = {}
 			for _, name in ipairs(equippedSkills()) do
 				local left = (skillCd[name] or 0) - os.clock()
