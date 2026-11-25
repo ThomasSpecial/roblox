@@ -328,8 +328,21 @@ do
 				end
 			end
 		end
-		return {name = d.name, cell = d.cell, x0 = d.x0, z0 = d.z0, w = d.w, h = d.h, hts = hts, wall = wall,
-			bad = {}, edge = {}, nodes = d.nodes, scanned = d.scanned}
+		local m = {name = d.name, cell = d.cell, x0 = d.x0, z0 = d.z0, w = d.w, h = d.h, base = d.base, top = d.top or 420,
+			bot = d.bot or 30, hts = hts, wall = wall, bad = {}, edge = {}, nodes = d.nodes, scanned = d.scanned, tiles = {},
+			tx = math.ceil(d.w / TILE), tz = math.ceil(d.h / TILE)}
+		if type(d.tiles) == "string" and #d.tiles == m.tx * m.tz then
+			for t = 1, #d.tiles do m.tiles[t] = d.tiles:sub(t, t) end
+		else
+			-- older file: a tile with any floor counts as scanned, an empty one as unknown
+			for k = 1, d.w * d.h do
+				if hts[1][k] then
+					local i, j = (k - 1) % d.w, (k - 1) // d.w
+					m.tiles[(j // TILE) * m.tx + i // TILE + 1] = "1"
+				end
+			end
+		end
+		return m
 	end
 
 	function Nav.load(name)
@@ -616,43 +629,88 @@ do
 		return rp
 	end
 
-	-- opts: name, bounds, onStatus(text), yieldFn()
-	function Nav.scan(opts)
-		opts = opts or {}
-		local name = opts.name or "main"
-		local B = opts.bounds or Nav.BOUNDS
-		local say = opts.onStatus or function() end
-		local yieldFn = opts.yieldFn or function() task.wait() end
-		local plr = Players.LocalPlayer
+	local function newMap(name, B)
 		local x0 = math.floor(B.x0 / CELL) * CELL
 		local z0 = math.floor(B.z0 / CELL) * CELL
 		local W = math.floor((B.x1 - x0) / CELL) + 1
 		local H = math.floor((B.z1 - z0) / CELL) + 1
-		local base = math.floor(B.bot) - 10
-		local hts, wall, done = {}, {}, {}
-		for l = 1, MAXL do hts[l], wall[l] = {}, {} end
-		local rp = rayParams()
-		local down = Vector3.new(0, B.bot - B.top, 0)
+		local m = {name = name, cell = CELL, x0 = x0, z0 = z0, w = W, h = H, base = math.floor(B.bot) - 10,
+			top = B.top, bot = B.bot, hts = {}, wall = {}, bad = {}, edge = {}, nodes = 0, tiles = {},
+			tx = math.ceil(W / TILE), tz = math.ceil(H / TILE)}
+		for l = 1, MAXL do m.hts[l], m.wall[l] = {}, {} end
+		return m
+	end
 
-		-- collidable parts the game made unqueryable would be invisible to rays: flip them on while scanning
+	function Nav.save(m)
+		local cols, nodes = table.create(m.w * m.h), 0
+		for k = 1, m.w * m.h do
+			local parts = {}
+			for l = 1, MAXL do
+				local y = m.hts[l][k]
+				if not y then break end
+				nodes += 1
+				parts[#parts + 1] = ("%d:%02x"):format(math.floor((y - m.base) * 10 + 0.5), m.wall[l][k] or 255)
+			end
+			cols[k] = table.concat(parts, "|")
+		end
+		local tiles = table.create(m.tx * m.tz)
+		for t = 1, m.tx * m.tz do tiles[t] = m.tiles[t] or "0" end
+		m.nodes, m.scanned = nodes, os.time()
+		local data = {v = Nav.SCAN_V, name = m.name, cell = CELL, x0 = m.x0, z0 = m.z0, w = m.w, h = m.h, base = m.base,
+			top = m.top, bot = m.bot, cols = table.concat(cols, ","), tiles = table.concat(tiles), nodes = nodes,
+			scanned = m.scanned, placeVersion = game.PlaceVersion}
+		if makefolder then
+			if not isfolder("PolyLoot") then makefolder("PolyLoot") end
+			if not isfolder("PolyLoot/nav") then makefolder("PolyLoot/nav") end
+		end
+		writefile(DIR .. m.name .. ".json", HS:JSONEncode(data))
+	end
+
+	-- tile states: "1" scanned with floors, "2" scanned while standing next to it and empty (void / sea),
+	-- "0" unknown: it wasn't streamed in when we looked (StreamingEnabled) -> filled later when we pass by
+	function Nav.tileCounts(m)
+		local c = {["0"] = 0, ["1"] = 0, ["2"] = 0}
+		for t = 1, m.tx * m.tz do
+			local v = m.tiles[t] or "0"
+			c[v] = (c[v] or 0) + 1
+		end
+		return c
+	end
+	local function tileCentre(m, t)
+		local tx, tz = (t - 1) % m.tx, (t - 1) // m.tx
+		local i0, j0 = tx * TILE, tz * TILE
+		local i1, j1 = math.min(m.w - 1, i0 + TILE - 1), math.min(m.h - 1, j0 + TILE - 1)
+		return m.x0 + (i0 + i1) / 2 * CELL, m.z0 + (j0 + j1) / 2 * CELL, i0, j0, i1, j1
+	end
+
+	-- collidable parts the game made unqueryable would be invisible to rays: flip them on while scanning
+	local function flipOn()
 		local flipped = {}
-		local function flip()
-			for _, d in ipairs(workspace:GetDescendants()) do
-				if d:IsA("BasePart") and d.CanCollide and not d.CanQuery and not flipped[d] then
-					d.CanQuery = true
-					flipped[d] = true
-				end
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide and not d.CanQuery then
+				d.CanQuery = true
+				flipped[#flipped + 1] = d
 			end
 		end
+		return function()
+			for _, d in ipairs(flipped) do pcall(function() d.CanQuery = false end) end
+		end
+	end
 
+	-- scan one tile into the map from what is streamed in right now. near = we stand next to it (an empty result
+	-- is real); returns true when the tile was written
+	local function scanTile(m, t, rp, near, yieldFn)
+		local W, H = m.w, m.h
+		local _, _, i0, j0, i1, j1 = tileCentre(m, t)
+		local top, bot, base = m.top or 420, m.bot or 30, m.base
+		local fresh = {}
+		local found = 0
 		local function floorsAt(i, j)
-			local k = j * W + i + 1
-			if done[k] then return end
-			done[k] = true
-			local x, z = x0 + i * CELL, z0 + j * CELL
-			local y0, l, prevY = B.top, 0, nil
+			local x, z = m.x0 + i * CELL, m.z0 + j * CELL
+			local list = {}
+			local y0, prevY = top, nil
 			for _ = 1, 20 do
-				local r = workspace:Raycast(Vector3.new(x, y0, z), Vector3.new(0, B.bot - y0, 0), rp)
+				local r = workspace:Raycast(Vector3.new(x, y0, z), Vector3.new(0, bot - y0, 0), rp)
 				if not r then break end
 				local y = r.Position.Y
 				local standable = r.Normal.Y >= 0.55
@@ -669,21 +727,33 @@ do
 				end
 				prevY = y
 				if standable then
-					l += 1
-					hts[l][k] = math.floor((y - base) * 10 + 0.5) / 10 + base
-					if l >= MAXL then break end
+					list[#list + 1] = math.floor((y - base) * 10 + 0.5) / 10 + base
+					if #list >= MAXL then break end
 				end
 				-- keep going below this surface (a ray starting inside the part passes out of it)
 				y0 = y - 0.3
-				if y0 <= B.bot then break end
+				if y0 <= bot then break end
 			end
+			return list
+		end
+		for j = j0, j1 do
+			for i = i0, i1 do
+				local list = floorsAt(i, j)
+				fresh[j * W + i + 1] = list
+				if #list > 0 then found += 1 end
+			end
+			if yieldFn and j % 8 == 0 then yieldFn() end
+		end
+		if found == 0 and not near then return false end
+		for k, list in pairs(fresh) do
+			for l = 1, MAXL do m.hts[l][k], m.wall[l][k] = list[l], nil end
 		end
 
 		local function wallsAt(i, j)
 			local k = j * W + i + 1
-			local x, z = x0 + i * CELL, z0 + j * CELL
+			local x, z = m.x0 + i * CELL, m.z0 + j * CELL
 			for l = 1, MAXL do
-				local y = hts[l][k]
+				local y = m.hts[l][k]
 				if not y then break end
 				local bits = 0
 				for n = 1, 8 do
@@ -696,7 +766,7 @@ do
 						-- same neighbour rule as layerTo()
 						local best, bd
 						for l2 = 1, MAXL do
-							local h = hts[l2][k2]
+							local h = m.hts[l2][k2]
 							if not h then break end
 							local dh = h - y
 							if dh <= (diag and WALK_UP * 1.42 or JUMP_UP) and dh >= -DROP and (not bd or math.abs(dh) < bd) then
@@ -706,7 +776,7 @@ do
 						if best then
 							local wy = math.max(y, best) + 2.2
 							local a = Vector3.new(x, wy, z)
-							local b = Vector3.new(x0 + ni * CELL, wy, z0 + nj * CELL)
+							local b = Vector3.new(m.x0 + ni * CELL, wy, m.z0 + nj * CELL)
 							blockedDir = workspace:Raycast(a, b - a, rp) ~= nil or workspace:Raycast(b, a - b, rp) ~= nil
 							if not blockedDir and best - y > WALK_UP then
 								-- jumping up needs room above our head for the whole arc
@@ -716,69 +786,89 @@ do
 					end
 					if blockedDir then bits += bit32.lshift(1, n - 1) end
 				end
-				wall[l][k] = bits
+				m.wall[l][k] = bits
 			end
 		end
+		-- walls of the tile and of the ring around it (the neighbours' edge columns now see our fresh floors)
+		for j = math.max(0, j0 - 1), math.min(H - 1, j1 + 1) do
+			for i = math.max(0, i0 - 1), math.min(W - 1, i1 + 1) do wallsAt(i, j) end
+			if yieldFn and j % 4 == 0 then yieldFn() end
+		end
+		m.tiles[t] = found > 0 and "1" or "2"
+		m.edge = {}
+		return true
+	end
 
-		local tilesX, tilesZ = math.ceil(W / TILE), math.ceil(H / TILE)
-		local total, t0 = tilesX * tilesZ, os.clock()
+	-- full pass: every tile (or only the unknown ones with opts.missingOnly), streaming each in first when we can.
+	-- Keeps what an earlier scan found for tiles that aren't streamed in now.
+	-- opts: name, bounds, onStatus(text), yieldFn(), alive(), missingOnly
+	function Nav.scan(opts)
+		opts = opts or {}
+		local name = opts.name or "main"
+		local say = opts.onStatus or function() end
+		local yieldFn = opts.yieldFn or function() task.wait() end
+		local plr = Players.LocalPlayer
+		local m = Nav.maps[name] or Nav.load(name) or newMap(name, opts.bounds or Nav.BOUNDS)
+		local t0 = os.clock()
+		local streamStuck = false
+		local restore = flipOn()
+		local total = m.tx * m.tz
 		local ok, err = pcall(function()
-			local n = 0
-			for tz = 0, tilesZ - 1 do
-				for tx = 0, tilesX - 1 do
-					n += 1
-					local i0, j0 = tx * TILE, tz * TILE
-					local i1, j1 = math.min(W - 1, i0 + TILE - 1), math.min(H - 1, j0 + TILE - 1)
-					local cx = x0 + (i0 + i1) / 2 * CELL
-					local cz = z0 + (j0 + j1) / 2 * CELL
-					-- streaming request with our own time limit: one tile west of town never returned (scan hung at 120/160)
-					local streamed = false
-					task.spawn(function()
-						pcall(function() plr:RequestStreamAroundAsync(Vector3.new(cx, (B.top + B.bot) / 2, cz), 6) end)
-						streamed = true
-					end)
-					local ts = os.clock()
-					while not streamed and os.clock() - ts < 8 do task.wait(0.1) end
+			for t = 1, total do
+				if not (opts.missingOnly and m.tiles[t] ~= nil and m.tiles[t] ~= "0") then
+					local cx, cz = tileCentre(m, t)
+					-- tiles near us are already streamed in; a request that times out once means the queue is stuck
+					-- (one request never returned and blocked the rest: the scan hung at 120/160) -> from then on we
+					-- scan what is loaded and leave the rest to fillNear()
+					local me = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+					local dist = me and Vector2.new(me.Position.X - cx, me.Position.Z - cz).Magnitude or math.huge
+					if dist > 450 and not streamStuck then
+						local streamed = false
+						task.spawn(function()
+							pcall(function() plr:RequestStreamAroundAsync(Vector3.new(cx, 150, cz), 6) end)
+							streamed = true
+						end)
+						local ts = os.clock()
+						while not streamed and os.clock() - ts < 8 do task.wait(0.1) end
+						if not streamed then streamStuck = true end
+					end
 					if opts.alive and not opts.alive() then error("cancelled") end
-					flip()
-					rp = rayParams()
-					say(("สแกนพื้น %d/%d"):format(n, total))
-					-- floors of the tile plus a 1-column border (wall rays need the neighbours' floors)
-					for j = math.max(0, j0 - 1), math.min(H - 1, j1 + 1) do
-						for i = math.max(0, i0 - 1), math.min(W - 1, i1 + 1) do floorsAt(i, j) end
-						if j % 8 == 0 then yieldFn() end
-					end
-					for j = j0, j1 do
-						for i = i0, i1 do wallsAt(i, j) end
-						if j % 4 == 0 then yieldFn() end
-					end
+					say(("สแกนพื้น %d/%d"):format(t, total))
+					scanTile(m, t, rayParams(), dist < 250, yieldFn)
 				end
 			end
 		end)
-		for d in pairs(flipped) do pcall(function() d.CanQuery = false end) end
+		restore()
 		if not ok then return nil, tostring(err) end
+		Nav.save(m)
+		Nav.maps[name] = m
+		local c = Nav.tileCounts(m)
+		return m, ("%dx%d · %d จุดยืน · ครบ %d/%d ส่วน (ยังขาด %d) · %d วิ"):format(m.w, m.h, m.nodes, c["1"] + c["2"], total,
+			c["0"], math.floor(os.clock() - t0))
+	end
 
-		local cols, nodes = table.create(W * H), 0
-		for k = 1, W * H do
-			local parts = {}
-			for l = 1, MAXL do
-				local y = hts[l][k]
-				if not y then break end
-				nodes += 1
-				parts[#parts + 1] = ("%d:%02x"):format(math.floor((y - base) * 10 + 0.5), wall[l][k] or 255)
+	-- fill unknown tiles around a point (call it every few seconds while playing); returns how many were written
+	function Nav.fillNear(m, pos, maxTiles, yieldFn)
+		local list = {}
+		for t = 1, m.tx * m.tz do
+			if (m.tiles[t] or "0") == "0" then
+				local cx, cz = tileCentre(m, t)
+				local d = Vector2.new(pos.X - cx, pos.Z - cz).Magnitude
+				if d < 420 then list[#list + 1] = {t, d} end
 			end
-			cols[k] = table.concat(parts, "|")
 		end
-		local data = {v = Nav.SCAN_V, name = name, cell = CELL, x0 = x0, z0 = z0, w = W, h = H, base = base,
-			cols = table.concat(cols, ","), nodes = nodes, scanned = os.time(), placeVersion = game.PlaceVersion,
-			secs = math.floor(os.clock() - t0)}
-		if makefolder then
-			if not isfolder("PolyLoot") then makefolder("PolyLoot") end
-			if not isfolder("PolyLoot/nav") then makefolder("PolyLoot/nav") end
-		end
-		writefile(DIR .. name .. ".json", HS:JSONEncode(data))
-		Nav.maps[name] = decode(data)
-		return Nav.maps[name], ("%dx%d · %d จุดยืน · %d วิ"):format(W, H, nodes, data.secs)
+		if #list == 0 then return 0 end
+		table.sort(list, function(a, b) return a[2] < b[2] end)
+		local restore = flipOn()
+		local n = 0
+		local ok = pcall(function()
+			local rp = rayParams()
+			for i = 1, math.min(#list, maxTiles or 2) do
+				if scanTile(m, list[i][1], rp, list[i][2] < 250, yieldFn) then n += 1 end
+			end
+		end)
+		restore()
+		return ok and n or 0
 	end
 end
 return Nav
@@ -808,6 +898,27 @@ local function getNav()
 	end
 	return navMap
 end
+-- StreamingEnabled: parts of the map far from us weren't loaded during the scan. Every 8 s the unknown tiles within
+-- ~400 studs (streamed in now) are scanned into the map; the file is re-saved at most once a minute.
+task.spawn(function()
+	local dirty, lastSave = 0, os.clock()
+	while alive() do
+		task.wait(8)
+		local m = navMap
+		local _, hrp = char()
+		if m and hrp and not st.navScanning then
+			local n = Nav.fillNear(m, hrp.Position, 2, function() task.wait() end)
+			if n > 0 then
+				dirty += n
+				st.navFilled = (st.navFilled or 0) + n
+			end
+			if dirty > 0 and os.clock() - lastSave > 60 then
+				pcall(Nav.save, m)
+				dirty, lastSave = 0, os.clock()
+			end
+		end
+	end
+end)
 local lastPosSkip = false   -- our own unstuck hop: don't count it as a server snap-back
 
 -- stuck watch: progress is sampled every 0.8 s while walking
@@ -2255,8 +2366,9 @@ local navLbl = M:Label({Text = "-"})
 local function navText()
 	local m = getNav()
 	if not m then return "NavMap: ยังไม่มี → ใช้ Pathfinding ของ Roblox\nกดสแกนด้านล่าง (ยืนที่ไหนก็ได้ ~1-2 นาที)" end
-	return ("NavMap: %dx%d ช่อง · %d จุดยืน · สแกนเมื่อ %s\nวางเส้นทางไปแล้ว %d ครั้ง (%s)"):format(m.w, m.h, m.nodes or 0,
-		m.scanned and os.date("%d/%m %H:%M", m.scanned) or "-", st.navPlans or 0, tostring(st.navWhy or "-"))
+	local c = Nav.tileCounts(m)
+	return ("NavMap: %dx%d ช่อง · %d จุดยืน · ครบ %d/%d ส่วน (เติมระหว่างเล่นแล้ว %d)\nวางเส้นทางไปแล้ว %d ครั้ง (%s)"):format(
+		m.w, m.h, m.nodes or 0, c["1"] + c["2"], m.tx * m.tz, st.navFilled or 0, st.navPlans or 0, tostring(st.navWhy or "-"))
 end
 pcall(function() navLbl:UpdateName(navText()) end)
 task.spawn(function()
