@@ -40,6 +40,7 @@ local AnimalLive = workspace:WaitForChild("Animal_Live")
 local SF = ("PolyLoot/state_%d.json"):format(plr.UserId)
 local DEFAULTS = {
 	farm = false, mobs = {}, bossOnly = false, passives = false, radius = 400,
+	bossHunt = false, bossPick = {}, bossRange = 500, bossSeen = {},
 	targetMode = "คุ้มที่สุด (ฟาร์มไวสุด)", pattern = "วนรอบตัว (Orbit)", moveMode = "Walk",
 	tweenSpeed = 22, tpMax = 40, standDist = 5, orbitRadius = 7, orbitSpeed = 1.6,
 	attack = true, swing = 0.55, attackMode = "ท่าฟันของเกม (Tool:Activate)", reach = 11, dodge = true, dodgeMargin = 3,
@@ -161,7 +162,9 @@ local function candidates_(hrp)
 			if wanted(m) then
 				local mp = mobPos(m)
 				local d = (mp - hrp.Position).Magnitude
-				if (anchor and flat(mp - anchor).Magnitude <= e.anchorR) or (not anchor and d <= e.radius) then
+				-- with a farm spot: mobs around the spot, plus any picked mob right next to us (don't run past one
+				-- standing beside us to an empty spot)
+				if (anchor and (flat(mp - anchor).Magnitude <= e.anchorR or d <= 50)) or (not anchor and d <= e.radius) then
 					list[#list + 1] = {m = m, p = mp, d = d}
 				end
 			end
@@ -213,6 +216,47 @@ local function pickTarget(hrp)
 	return best
 end
 
+-- boss hunt: a picked boss (Tier = Boss) alive within bossRange of us or of the farm spot takes over from the normal
+-- target until it dies; then the farm goes back to its mobs / spot. Every boss seen is remembered for the picker.
+local function bossTarget(hrp)
+	if not e.bossHunt then return nil end
+	local anchor = anchorPos()
+	local best, bd
+	for _, f in ipairs({"Aggressors", "Passives"}) do
+		local folder = AnimalLive:FindFirstChild(f)
+		for _, m in ipairs(folder and folder:GetChildren() or {}) do
+			if m:GetAttribute("Tier") == "Boss" and mobAlive(m) then
+				local kind = tostring(m:GetAttribute("Animal") or "?")
+				if not e.bossSeen[kind] then e.bossSeen[kind] = true; sv() end
+				-- only the bosses picked by name: TripleCobra has ~1.4M HP, "any boss" would park us on it
+				if e.bossPick[kind] then
+					local ok, p = pcall(function() return m:GetPivot().Position end)
+					if ok then
+						local d = (p - hrp.Position).Magnitude
+						local da = anchor and flat(p - anchor).Magnitude or d
+						if math.min(d, da) <= e.bossRange and (not bd or d < bd) then best, bd = m, d end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+local function bossKinds()
+	local seen, list = {}, {}
+	for k in pairs(e.bossSeen) do seen[k] = true end
+	for k in pairs(e.bossPick) do seen[k] = true end
+	for _, f in ipairs({"Aggressors", "Passives"}) do
+		local folder = AnimalLive:FindFirstChild(f)
+		for _, m in ipairs(folder and folder:GetChildren() or {}) do
+			if m:GetAttribute("Tier") == "Boss" and m:GetAttribute("Animal") then seen[m:GetAttribute("Animal")] = true end
+		end
+	end
+	for k in pairs(seen) do list[#list + 1] = k end
+	table.sort(list)
+	return list
+end
+
 -- ------------------------------------------------------------------ movement
 -- tween/teleport goals are applied on Heartbeat; walk = Humanoid:Move(dir) every frame, like holding W: the game's
 -- Movement_Client.Animate reads Humanoid.MoveDirection, which MoveTo() leaves at zero (legs slid without stepping)
@@ -250,7 +294,7 @@ do
 	local DROP = 12        -- max drop we walk off
 	local HEAD = 5         -- clear space a floor needs above it
 	local TILE = 64        -- columns per scan tile side (192 studs)
-	Nav.SCAN_V = 1
+	Nav.SCAN_V = 2   -- maps saved by an older scanner are ignored (rescan)
 	Nav.maps = {}
 	Nav.BOUNDS = {x0 = -160, z0 = -1440, x1 = 1120, z1 = 260, top = 420, bot = 40}
 
@@ -283,7 +327,7 @@ do
 		local path = DIR .. name .. ".json"
 		if not (isfile and isfile(path)) then return nil end
 		local ok, d = pcall(function() return HS:JSONDecode(readfile(path)) end)
-		if not ok or type(d) ~= "table" or not d.cols then return nil end
+		if not ok or type(d) ~= "table" or not d.cols or (d.v or 1) < Nav.SCAN_V then return nil end
 		local m = decode(d)
 		Nav.maps[name] = m
 		return m
@@ -596,12 +640,25 @@ do
 			if done[k] then return end
 			done[k] = true
 			local x, z = x0 + i * CELL, z0 + j * CELL
-			local y0, l = B.top, 0
+			local y0, l, prevY = B.top, 0, nil
 			for _ = 1, 20 do
 				local r = workspace:Raycast(Vector3.new(x, y0, z), Vector3.new(0, B.bot - y0, 0), rp)
 				if not r then break end
 				local y = r.Position.Y
-				if r.Normal.Y >= 0.55 and not workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, HEAD, 0), rp) then
+				local standable = r.Normal.Y >= 0.55
+				if standable then
+					if not prevY then
+						standable = not workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, HEAD, 0), rp)
+					else
+						-- a surface lies above (the one we came down through). From open space the up-ray hits its
+						-- underside; from inside a solid (overlapping / embedded parts) the ray starts inside and hits
+						-- nothing -> that "floor" is buried. v2: such buried floors made routes through rock.
+						local up = workspace:Raycast(Vector3.new(x, y + 0.2, z), Vector3.new(0, prevY - y + 0.5, 0), rp)
+						standable = up ~= nil and up.Position.Y - y >= HEAD
+					end
+				end
+				prevY = y
+				if standable then
 					l += 1
 					hts[l][k] = math.floor((y - base) * 10 + 0.5) / 10 + base
 					if l >= MAXL then break end
@@ -709,6 +766,7 @@ end
 return Nav
 end)()
 -- [NAV END]
+local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 local NAV_NAME = "main"
 local navMap = nil
 local navTried = false
@@ -717,10 +775,21 @@ local function getNav()
 		navTried = true
 		local ok, m = pcall(Nav.load, NAV_NAME)
 		if ok then navMap = m end
+		if not navMap then
+			-- no map / made by an older scanner: scan once in the background (~40 s), Pathfinding meanwhile
+			task.spawn(function()
+				task.wait(5)
+				if st.navScanning or not alive() then return end
+				st.navScanning = true
+				local m2, info = Nav.scan({name = NAV_NAME, onStatus = function(t) st.navWhy = t end})
+				if m2 and alive() then navMap = m2; path.wps = nil end
+				log(m2 and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
+				st.navScanning = false
+			end)
+		end
 	end
 	return navMap
 end
-local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 local lastPosSkip = false   -- our own unstuck hop: don't count it as a server snap-back
 
 -- stuck watch: progress is sampled every 0.8 s while walking
@@ -1652,6 +1721,15 @@ task.spawn(function()
 				t = nil
 			end
 			local anchor = anchorPos()
+			local boss = bossTarget(hrp)
+			st.bossActive = boss ~= nil
+			if boss then
+				if t ~= boss then
+					t = boss
+					lockStart = os.clock()
+					log(("บอสเกิด → ไปตี %s (HP %s)"):format(tostring(boss:GetAttribute("Animal")), tostring(boss:GetAttribute("Health"))))
+				end
+			else
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" then
 				if anchor and flat(mobPos(t) - anchor).Magnitude > e.anchorR + 30 then t = nil
 				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
@@ -1687,6 +1765,7 @@ task.spawn(function()
 					end
 				end
 			end
+			end -- boss
 			if not t then
 				t = pickTarget(hrp)
 				if t then lockStart = os.clock(); log(("ล็อก %s/%s HP %s"):format(tostring(t:GetAttribute("Animal")), tostring(t:GetAttribute("Tier")), tostring(t:GetAttribute("Health")))) end
@@ -1916,7 +1995,7 @@ task.spawn(function()
 		pcall(function()
 			local now = os.clock()
 			if st.kills ~= wd.kills then wd.kills, wd.killAt = st.kills, now end
-			if not (e.farm and e.watchdog) or now < wd.grace or trip.active then
+			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive then
 				wd.best, wd.at = nil, now
 				if not e.farm then wd.killAt = now end
 				return
@@ -2028,13 +2107,34 @@ local FarmTab = TG:Tab({Name = "Farm", Image = "rbxassetid://10723346959"})
 
 local L = FarmTab:Section({Side = "Left"})
 L:Header({Text = "Auto Farm"})
+local function fitAnchor()
+	-- start with no farm spot yet -> here. Also when none of the picked mobs live around the old spot but some are
+	-- around us (picked Gargoyle while the spot was still the bear field: the farm walked off to the bears' field)
+	if e.useAnchor then
+		local _, hrp = char()
+		local a = anchorPos()
+		if hrp and a and flat(hrp.Position - a).Magnitude > e.anchorR then
+			local nearSpot, nearMe = false, false
+			for _, f in ipairs({"Aggressors", "Passives"}) do
+				local folder = AnimalLive:FindFirstChild(f)
+				for _, m in ipairs(folder and folder:GetChildren() or {}) do
+					if wanted(m) then
+						local ok, p = pcall(function() return m:GetPivot().Position end)
+						if ok then
+							if flat(p - a).Magnitude <= e.anchorR then nearSpot = true end
+							if (p - hrp.Position).Magnitude <= e.radius then nearMe = true end
+						end
+					end
+				end
+			end
+			if nearMe and not nearSpot then a = nil; log("มอนที่เลือกไม่อยู่แถวจุดฟาร์มเดิม → ย้ายจุดฟาร์มมาตรงนี้") end
+		end
+		if hrp and not a then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
+	end
+end
 L:Toggle({Name = "Auto Farm (ล็อกมอน · เดินไปตี)", Default = e.farm, Callback = function(v)
 	e.farm = v
-	-- first start with no farm spot yet: here becomes the spot
-	if v and e.useAnchor and not e.anchor then
-		local _, hrp = char()
-		if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
-	end
+	if v then fitAnchor() end
 	sv()
 end}, "PLFarm")
 L:Toggle({Name = "Auto Attack", Default = e.attack, Callback = function(v) e.attack = v; sv() end}, "PLAttack")
@@ -2063,11 +2163,32 @@ local mobDrop = L:Dropdown({Name = "มอนที่จะฟาร์ม (ไ
 			end
 		end
 		e.mobs = m; sv()
+		if e.farm then fitAnchor() end
 	end}, "PLMobs")
 L:Button({Name = "รีเฟรชรายชื่อมอน", Callback = function()
 	pcall(function() mobDrop:ClearOptions(); mobDrop:InsertOptions(mobKinds()) end)
 end})
 L:Toggle({Name = "เฉพาะบอส (Tier = Boss)", Default = e.bossOnly, Callback = function(v) e.bossOnly = v; sv() end}, "PLBoss")
+L:Header({Text = "ล่าบอส"})
+L:Toggle({Name = "บอสเกิด → ไปตีบอสก่อน แล้วกลับมาฟาร์มต่อ", Default = e.bossHunt, Callback = function(v) e.bossHunt = v; sv() end}, "PLBossHunt")
+local bossDrop = L:Dropdown({Name = "└ บอสที่จะไปตี (ต้องเลือกชื่อ)", Multi = true, Required = false, Search = true, Options = bossKinds(),
+	Default = (function() local d = {} for k in pairs(e.bossPick) do d[#d + 1] = k end return d end)(),
+	Callback = function(v)
+		local m = {}
+		if type(v) == "table" then
+			for k, on in pairs(v) do
+				if type(k) == "string" and on == true then m[k] = true elseif type(on) == "string" then m[on] = true end
+			end
+		end
+		e.bossPick = m; sv()
+	end}, "PLBossPick")
+L:Button({Name = "รีเฟรชรายชื่อบอส", Callback = function()
+	pcall(function() bossDrop:ClearOptions(); bossDrop:InsertOptions(bossKinds()) end)
+end})
+L:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เกิน (stud จากตัว/จุดฟาร์ม)", Default = e.bossRange, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
+L:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้
+TripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
 L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
 L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
