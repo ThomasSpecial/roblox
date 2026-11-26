@@ -2828,7 +2828,15 @@ task.spawn(function()
 						if rg and (hrp.Position - rg.from).Magnitude > 4 then rg.from, rg.at = hrp.Position, os.clock() end
 						if n > 0 and (not rg or os.clock() > rg.untilT or flat(rg.p - hrp.Position).Magnitude < 6 or os.clock() - rg.at > 2) then
 							local goal
-							if sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 and not (rg and rg.p == sp) then
+							-- inside the farm circle the "away from the nearest" step only zig-zagged between Pyrolisks
+							-- (4 always within 40 studs, death at 06:48): leave the spawn circle instead, anchorR + 120
+							-- (Pyrolisk leash 110) out from the farm spot on our side of it
+							local ap = anchor and flat(hrp.Position - anchor)
+							if ap and ap.Magnitude < e.anchorR + 80 and not (rg and rg.out and os.clock() - rg.at > 2) then
+								local dir = ap.Magnitude > 1 and ap.Unit or (away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0))
+								goal = anchor + dir * (e.anchorR + 120)
+								goal = Vector3.new(goal.X, hrp.Position.Y, goal.Z)
+							elseif sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 and not (rg and rg.p == sp) then
 								goal = sp
 							elseif away.Magnitude > 0.1 then
 								local dir = away.Unit
@@ -2838,7 +2846,8 @@ task.spawn(function()
 								end
 								goal = hrp.Position + dir * 60
 							end
-							st.restGoal = goal and {p = goal, untilT = os.clock() + 6, from = hrp.Position, at = os.clock(), turn = rg and rg.turn} or nil
+							local out = ap and ap.Magnitude < e.anchorR + 80 and not (rg and rg.out and os.clock() - rg.at > 2)
+							st.restGoal = goal and {p = goal, untilT = os.clock() + (out and 20 or 6), from = hrp.Position, at = os.clock(), turn = rg and rg.turn, out = out} or nil
 							rg = st.restGoal
 						end
 						if inHealZone() then
