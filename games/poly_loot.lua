@@ -2194,7 +2194,15 @@ task.spawn(function()
 				-- a helper script (quest runner) is driving the character through st.api: hands off
 				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
 				if st.target then st.target = nil; lookAt = nil; endCombo(); stopMove() end
-				if controlsOff and not (e.lootAlways and mover.walk) then mover.walk = nil; setControls(true) end
+				-- check the real ControlModule state, not just our flag: a respawn / rejoin / older copy of the script can
+				-- leave it disabled while controlsOff says false -> the player can't walk ("ขาแข็ง")
+				local ctlDead = false
+				pcall(function() ctlDead = Controls and Controls.activeController and Controls.activeController.enabled == false end)
+				if (controlsOff or ctlDead) and not (e.lootAlways and mover.walk) then
+					mover.walk = nil
+					controlsOff = true
+					setControls(true)
+				end
 				local _, hrp, hum = char()
 				if hum and not hum.AutoRotate then hum.AutoRotate = true end
 				st.status = "ปิดอยู่"
@@ -2753,9 +2761,38 @@ L:Button({Name = "รีเฟรชรายชื่อมอน", Callback = 
 	pcall(function() mobDrop:ClearOptions(); mobDrop:InsertOptions(mobKinds()) end)
 end})
 L:Toggle({Name = "เฉพาะบอส (Tier = Boss)", Default = e.bossOnly, Callback = function(v) e.bossOnly = v; sv() end}, "PLBoss")
-L:Header({Text = "ล่าบอส"})
-L:Toggle({Name = "บอสเกิด → ไปตีบอสก่อน แล้วกลับมาฟาร์มต่อ", Default = e.bossHunt, Callback = function(v) e.bossHunt = v; sv() end}, "PLBossHunt")
-local bossDrop = L:Dropdown({Name = "└ บอสที่จะไปตี (ต้องเลือกชื่อ)", Multi = true, Required = false, Search = true, Options = bossKinds(),
+L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
+L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
+L:Header({Text = "จุดฟาร์ม (ตายแล้วกลับมาที่เดิม)"})
+L:Toggle({Name = "ฟาร์มเฉพาะรอบจุดฟาร์ม", Default = e.useAnchor, Callback = function(v) e.useAnchor = v; sv() end}, "PLAnchorOn")
+L:Slider({Name = "└ รัศมีรอบจุดฟาร์ม (stud)", Default = e.anchorR, Minimum = 30, Maximum = 600, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.anchorR = v; sv() end}, "PLAnchorR")
+L:Button({Name = "ตั้งจุดฟาร์ม = ตรงที่ยืนอยู่", Callback = function()
+	local _, hrp = char()
+	if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
+end})
+L:Button({Name = "ลบเส้นทางที่บันทึกไว้ (ให้บันทึกใหม่)", Callback = function()
+	route, routeI = nil, nil
+	pcall(function() if delfile and isfile(ROUTE_FILE) then delfile(ROUTE_FILE) end end)
+	log("ลบเส้นทางแล้ว")
+end})
+L:Button({Name = "ล้างจุดฟาร์ม (กลับไปใช้ระยะค้นหารอบตัว)", Callback = function() setAnchor(nil); log("ล้างจุดฟาร์มแล้ว") end})
+L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required = true, Options = TARGET_OPTS,
+	Default = idx(TARGET_OPTS, e.targetMode), Callback = function(v) e.targetMode = v; sv() end}, "PLTarget")
+
+local Rt = FarmTab:Section({Side = "Right"})
+Rt:Header({Text = "สถานะ"})
+local stLbl = Rt:Label({Text = "-"})
+-- Smart still learns every mob's hits in the background (e.learn); the table itself isn't shown any more
+Rt:Header({Text = "ล่าสุด"})
+local logLbl = Rt:Label({Text = "-"})
+
+local BossTab = TG:Tab({Name = "Boss", Image = "rbxassetid://10723346959"})
+local B = BossTab:Section({Side = "Left"})
+B:Header({Text = "ล่าบอส"})
+B:Toggle({Name = "บอสเกิด → ไปตีบอสก่อน แล้วกลับมาฟาร์มต่อ", Default = e.bossHunt, Callback = function(v) e.bossHunt = v; sv() end}, "PLBossHunt")
+local bossDrop = B:Dropdown({Name = "└ บอสที่จะไปตี (ต้องเลือกชื่อ)", Multi = true, Required = false, Search = true, Options = bossKinds(),
 	Default = (function() local d = {} for k in pairs(e.bossPick) do d[#d + 1] = k end return d end)(),
 	Callback = function(v)
 		local m = {}
@@ -2766,20 +2803,32 @@ local bossDrop = L:Dropdown({Name = "└ บอสที่จะไปตี (�
 		end
 		e.bossPick = m; sv()
 	end}, "PLBossPick")
-L:Button({Name = "รีเฟรชรายชื่อบอส", Callback = function()
+B:Button({Name = "รีเฟรชรายชื่อบอส", Callback = function()
 	pcall(function() bossDrop:ClearOptions(); bossDrop:InsertOptions(bossKinds()) end)
 end})
-L:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เกิน (stud จากตัว/จุดฟาร์ม)", Default = e.bossRange, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
+B:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เกิน (stud จากตัว/จุดฟาร์ม)", Default = e.bossRange, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
-L:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
-L:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้\nTripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
-local bossLbl   -- shown in the status column (replaces the Smart learn table there)
+B:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
+B:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้\nTripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
+local BR = BossTab:Section({Side = "Right"})
+BR:Header({Text = "เวลาเกิดบอส"})
+local bossLbl = BR:Label({Text = "-"})
+local function pickSet(v)
+	local m = {}
+	if type(v) == "table" then
+		for k, on in pairs(v) do
+			if type(k) == "string" and on == true then m[k] = true elseif type(on) == "string" then m[on] = true end
+		end
+	end
+	return m
+end
 -- Boss signs (tag "BossSign": attrs Boss, BossAlive, BossRespawnAt = server epoch) only exist while streamed in, so
 -- every time we see one we remember it (e.bossTimes, saved). A boss model alive near us = up right now. A boss we saw
 -- alive and then lost without a sign telling us more -> predicted from its RespawnSeconds (Animal_Engine.Config).
 if type(e.bossTimes) ~= "table" then e.bossTimes = {} end
 local bossLive = {}   -- kind -> {m = model, seen = os.clock()}
 if e.bossHud == nil then e.bossHud = true end
+if type(e.bossHudShow) ~= "table" then e.bossHudShow = {} end   -- empty = every boss
 -- on-screen box right above the game's coin counter (HUD.Holder.LeftList.YourCoins), follows it when the HUD rescales
 local HUD_NAME = "PolyLootBossHud"
 local hudGui, hudText
@@ -2930,7 +2979,8 @@ task.spawn(function()
 					short, col = "?", "#9A9A9A"
 				end
 				lines[#lines + 1] = ("%s%s: %s"):format(mark, k, txt)
-				hud[#hud + 1] = ('%s%s  <font color="%s">%s</font>'):format(mark, k, col, short)
+				local show = (next(e.bossHudShow) == nil or e.bossHudShow[k]) and not (e.bossHudHideUnknown and short == "?")
+				if show then hud[#hud + 1] = ('%s%s  <font color="%s">%s</font>'):format(mark, k, col, short) end
 			end
 			pcall(function() bossHud(e.bossHud and #hud > 0 and table.concat(hud, "\n") or nil) end)
 			bossLbl:UpdateName(#lines > 0 and table.concat(lines, "\n") or "ยังไม่มีข้อมูล · เดินผ่านป้ายบอสครั้งเดียวก็จำเวลาได้")
@@ -2938,35 +2988,22 @@ task.spawn(function()
 		task.wait(1)
 	end
 end)
-L:Toggle({Name = "แสดงเวลาเกิดบอสบนจอ (เหนือช่องเหรียญ)", Default = e.bossHud, Callback = function(v) e.bossHud = v; sv() end}, "PLBossHud")
-L:Toggle({Name = "รวมสัตว์ไม่โจมตี (Passives)", Default = e.passives, Callback = function(v) e.passives = v; sv() end}, "PLPassive")
-L:Slider({Name = "ระยะค้นหา (stud)", Default = e.radius, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
-	Callback = function(v) e.radius = v; sv() end}, "PLRadius")
-L:Header({Text = "จุดฟาร์ม (ตายแล้วกลับมาที่เดิม)"})
-L:Toggle({Name = "ฟาร์มเฉพาะรอบจุดฟาร์ม", Default = e.useAnchor, Callback = function(v) e.useAnchor = v; sv() end}, "PLAnchorOn")
-L:Slider({Name = "└ รัศมีรอบจุดฟาร์ม (stud)", Default = e.anchorR, Minimum = 30, Maximum = 600, DisplayMethod = "Round", Precision = 0,
-	Callback = function(v) e.anchorR = v; sv() end}, "PLAnchorR")
-L:Button({Name = "ตั้งจุดฟาร์ม = ตรงที่ยืนอยู่", Callback = function()
-	local _, hrp = char()
-	if hrp then setAnchor(hrp.Position); log("ตั้งจุดฟาร์มตรงนี้") end
+BR:Header({Text = "แสดงบนจอ (เหนือช่องเหรียญ)"})
+BR:Toggle({Name = "แสดงเวลาเกิดบอสบนจอ", Default = e.bossHud, Callback = function(v) e.bossHud = v; sv() end}, "PLBossHud")
+local function hudOpts()
+	local o, seen = {}, {}
+	for _, k in ipairs(bossKinds()) do if not seen[k] then seen[k] = true; o[#o + 1] = k end end
+	for k in pairs(e.bossTimes) do if not seen[k] then seen[k] = true; o[#o + 1] = k end end
+	table.sort(o)
+	return o
+end
+local hudDrop = BR:Dropdown({Name = "└ บอสที่แสดง (ไม่เลือก = ทุกตัว)", Multi = true, Required = false, Search = true, Options = hudOpts(),
+	Default = (function() local d = {} for k in pairs(e.bossHudShow) do d[#d + 1] = k end return d end)(),
+	Callback = function(v) e.bossHudShow = pickSet(v); sv() end}, "PLBossHudShow")
+BR:Button({Name = "└ รีเฟรชรายชื่อ", Callback = function()
+	pcall(function() hudDrop:ClearOptions(); hudDrop:InsertOptions(hudOpts()) end)
 end})
-L:Button({Name = "ลบเส้นทางที่บันทึกไว้ (ให้บันทึกใหม่)", Callback = function()
-	route, routeI = nil, nil
-	pcall(function() if delfile and isfile(ROUTE_FILE) then delfile(ROUTE_FILE) end end)
-	log("ลบเส้นทางแล้ว")
-end})
-L:Button({Name = "ล้างจุดฟาร์ม (กลับไปใช้ระยะค้นหารอบตัว)", Callback = function() setAnchor(nil); log("ล้างจุดฟาร์มแล้ว") end})
-L:Dropdown({Name = "การล็อกเป้า", Multi = false, Required = true, Options = TARGET_OPTS,
-	Default = idx(TARGET_OPTS, e.targetMode), Callback = function(v) e.targetMode = v; sv() end}, "PLTarget")
-
-local Rt = FarmTab:Section({Side = "Right"})
-Rt:Header({Text = "สถานะ"})
-local stLbl = Rt:Label({Text = "-"})
--- Smart still learns every mob's hits in the background (e.learn); the table itself isn't shown any more
-Rt:Header({Text = "เวลาเกิดบอส"})
-bossLbl = Rt:Label({Text = "-"})
-Rt:Header({Text = "ล่าสุด"})
-local logLbl = Rt:Label({Text = "-"})
+BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้เวลา (?)", Default = e.bossHudHideUnknown == true, Callback = function(v) e.bossHudHideUnknown = v; sv() end}, "PLBossHudHideUnk")
 
 local MoveTab = TG:Tab({Name = "Movement", Image = "rbxassetid://10723346959"})
 local M = MoveTab:Section({Side = "Left"})
