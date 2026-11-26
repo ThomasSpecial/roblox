@@ -3871,6 +3871,13 @@ end)()
 		if not hrp or hum.Health <= 0 or c:GetAttribute("Mounted") == true then return end
 		if os.clock() - lastTry < 6 or os.clock() < (st.mountBlockUntil or 0) or hum.FloorMaterial == Enum.Material.Air then return end
 		if flat(goal - hrp.Position).Magnitude < e.mountMin then return end
+		-- moving between mobs inside the farm circle / ores inside the gather circle: stay on foot (mounting and
+		-- dropping off every few seconds caused more trouble than it saved). Only trips into or out of the area ride.
+		local function inside(center, r)
+			return center and flat(goal - center).Magnitude <= r and flat(hrp.Position - center).Magnitude <= r
+		end
+		if e.farm and inside(anchorPos(), e.anchorR + 80) then return end
+		if e.gather and type(e.gatherAt) == "table" and inside(Vector3.new(e.gatherAt[1], e.gatherAt[2], e.gatherAt[3]), e.gatherR + 60) then return end
 		-- not in the middle of a fight
 		if st.target and mobAlive(st.target) and flat(mobPos(st.target) - hrp.Position).Magnitude < 25 then return end
 		local m = st.bestMount()
