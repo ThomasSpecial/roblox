@@ -261,10 +261,23 @@ local function pickTarget(hrp)
 	return best
 end
 
+local bossTargetScan
 -- boss hunt: a picked boss (Tier = Boss) alive within bossRange of us or of the farm spot takes over from the normal
 -- target until it dies; then the farm goes back to its mobs / spot. Every boss seen is remembered for the picker.
 local function bossTarget(hrp)
-	if not e.bossHunt then return nil end
+	if not e.bossHunt then st.bossLock = nil return nil end
+	-- keep the boss we already went for: re-deciding every tick at the edge of bossRange flipped boss <-> gathering
+	local lk = st.bossLock
+	if lk and mobAlive(lk) and e.bossPick[tostring(lk:GetAttribute("Animal") or "?")] then
+		local ok, p = pcall(function() return lk:GetPivot().Position end)
+		if ok and (p - hrp.Position).Magnitude <= e.bossRange + 250 then return lk end
+	end
+	st.bossLock = nil
+	local best = bossTargetScan(hrp)
+	st.bossLock = best
+	return best
+end
+bossTargetScan = function(hrp)
 	local anchor = anchorPos()
 	local best, bd
 	for _, f in ipairs({"Aggressors", "Passives"}) do
@@ -2339,6 +2352,13 @@ task.spawn(function()
 			end
 			local anchor = anchorPos()
 			local boss = bossTarget(hrp)
+			-- a mob standing on us (st.blocker) is finished first, the boss waits: swapping between them every tick
+			-- (Spider <-> Gargoyle) meant hitting neither
+			if boss and st.blocker and st.blocker ~= boss and mobAlive(st.blocker)
+				and flat(mobPos(st.blocker) - hrp.Position).Magnitude < e.reach + 12 then
+				boss = nil
+				t = st.blocker
+			end
 			st.bossActive = boss ~= nil
 			if boss then
 				if t ~= boss then
@@ -3164,6 +3184,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	if e.gatherPick == nil then e.gatherPick = true end
 	if e.gatherDefend == nil then e.gatherDefend = false end
 	if e.gatherFar == nil then e.gatherFar = true end
+	if type(e.gatherFarMax) ~= "number" then e.gatherFarMax = 400 end
 	local myTag = "," .. plr.UserId .. ","
 	local bad = setmetatable({}, {__mode = "k"})
 	local G = {status = "ปิดอยู่", fells = 0, mined = 0, picked = 0, saved = nil}
@@ -3360,6 +3381,58 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		return best, kind
 	end
 
+	-- picked ores / trees inside the circle that are broken / felled right now (they come back: Iron in 14 s)
+	local function regrowing(at)
+		local n = 0
+		if next(e.gatherOres) and MC then
+			for _, o in ipairs(CS:GetTagged(MC.TAG)) do
+				if e.gatherOres[oreKind(o)] and o:GetAttribute(MC.BROKEN_ATTR) then
+					local ok, p = pcall(function() return o:GetPivot().Position end)
+					if ok and flat(p - at).Magnitude <= e.gatherR then n += 1 end
+				end
+			end
+		end
+		if next(e.gatherTrees) and TC then
+			for _, t in ipairs(CS:GetTagged("ChoppableTree")) do
+				if e.gatherTrees[treeKind(t)] and t:GetAttribute("_Felled") and flat(trunkPos(t) - at).Magnitude <= e.gatherR then n += 1 end
+			end
+		end
+		return n
+	end
+	-- nothing here: the richest group of picked nodes within gatherFarMax of us (count within 60 studs, minus distance)
+	local function bestCluster()
+		local _, hrp = char()
+		if not hrp then return nil end
+		local pts = {}
+		if next(e.gatherOres) and MC then
+			for _, o in ipairs(CS:GetTagged(MC.TAG)) do
+				if e.gatherOres[oreKind(o)] and not bad[o] and not o:GetAttribute(MC.BROKEN_ATTR) then
+					local ok, p = pcall(function() return o:GetPivot().Position end)
+					if ok then pts[#pts + 1] = {n = o, p = p, k = "ore"} end
+				end
+			end
+		end
+		if next(e.gatherTrees) and TC then
+			for _, t in ipairs(CS:GetTagged("ChoppableTree")) do
+				if e.gatherTrees[treeKind(t)] and not bad[t] and not t:GetAttribute("_Felled") and not CS:HasTag(t, "NoChopTree")
+					and not t:GetAttribute("ChopInTown") then
+					pts[#pts + 1] = {n = t, p = trunkPos(t), k = "tree"}
+				end
+			end
+		end
+		local best, bs, bn
+		for _, a in ipairs(pts) do
+			local d = flat(a.p - hrp.Position).Magnitude
+			if d <= e.gatherFarMax then
+				local cnt = 0
+				for _, b in ipairs(pts) do if flat(b.p - a.p).Magnitude <= 60 then cnt += 1 end end
+				local score = cnt * 120 - d
+				if not bs or score > bs then best, bs, bn = a, score, cnt end
+			end
+		end
+		return best, bn
+	end
+
 	local function chop(t)
 		local tool = bestTool("axe")
 		if not tool then say("ไม่มีขวานในกระเป๋า (Basic Axe ดรอปจาก Sheep)"); task.wait(2) return end
@@ -3380,6 +3453,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		while not t:GetAttribute("_Felled") and t.Parent and os.clock() - t0 < 12 do
 			if interrupted() then return end
 			local _, h = char()
+			if h and flat(p - h.Position).Magnitude > 12 then return end
 			if h then face(h, p) end
 			local held = holding()
 			if held then pcall(function() held:Activate() end) end
@@ -3399,15 +3473,21 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		if not tool then say("ไม่มีอีเต้อในกระเป๋า (คราฟ Wooden Pickaxe: ไม้ 25 ที่ถ้ำคราฟ)"); task.wait(2) return end
 		local op = o:GetPivot().Position
 		local _, hrp = char()
-		-- stand where the game itself puts a miner (MiningStanceCFrame). The client only counts a swing when the ore's
-		-- surface is within CLIENT_MINE_DISTANCE (3.15) of MiningOrigin; our old spot was 3.47 away -> every swing missed
-		local okS, cf = pcall(MC.MiningStanceCFrame, o, hrp)
-		if not okS or typeof(cf) ~= "CFrame" then bad[o] = true return end
+		-- 1) walk up to the ore. 2) only THEN take the game's miner stance (MiningStanceCFrame): it only nudges from
+		-- where we stand (asked from 90 studs away it answered "right here" -> mine/walk loop forever).
+		-- The client counts a swing only when the ore surface is within CLIENT_MINE_DISTANCE (3.15) of MiningOrigin.
+		local cp0 = MC.ClosestPoint(o, hrp.Position)
+		local away = flat(hrp.Position - cp0)
+		away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
 		say(("เดินไปขุด %s"):format(oreKind(o)))
-		if not walk(cf.Position, 1.2, 60) then
+		if not walk(cp0 + away * 2.2, 1.6, 60) then
 			if not paused() and not (st.defend and mobAlive(st.defend)) then bad[o] = true end
 			return
 		end
+		local _, hrp2 = char()
+		if not hrp2 then return end
+		local okS, cf = pcall(MC.MiningStanceCFrame, o, hrp2)
+		if not okS or typeof(cf) ~= "CFrame" then cf = hrp2.CFrame end
 		local function surf()
 			local _, hh = char()
 			if not hh then return math.huge end
@@ -3425,20 +3505,45 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 			end
 		end
 		if not equipTool(tool) then return end
-		settle()
+		settle()   -- once: a PivotTo every swing (old loop) restarted the swing before it landed
 		local h0, t0 = o:GetAttribute("Health"), os.clock()
+		local lastHp, lastHit, nudged = h0, os.clock(), false
 		say(("ขุด %s ด้วย %s"):format(oreKind(o), tool.id))
-		while o.Parent and not o:GetAttribute(MC.BROKEN_ATTR) and os.clock() - t0 < 20 do
+		while o.Parent and not o:GetAttribute(MC.BROKEN_ATTR) and os.clock() - t0 < 25 do
 			if interrupted() then return end
-			if surf() > 3.0 then settle() end
-			local _, h = char()
-			if h then face(h, h.Position + cf.LookVector * 6) end
+			local sd = surf()
+			if sd > 8 then return end   -- something pulled us away (boss / player): don't swing at air
+			local c3, h, hm = char()
+			if not h then return end
+			local contact = MC.ClosestPoint(o, MC.MiningOrigin(h.Position))
+			if sd > 3.05 then
+				-- a little short of the client's 3.15 reach: step in, no teleport
+				local dir = flat(contact - h.Position)
+				if dir.Magnitude > 0.1 then moveTo(h.Position + dir.Unit * math.min(sd - 2.2, 2), true) end
+				task.wait(0.25)
+				stopMove()
+			end
+			-- face the ore straight away (snap like the quest runner that mined 14 iron), smooth step keeps it
+			local want = flat(contact - h.Position)
+			if want.Magnitude > 0.1 then
+				if h.CFrame.LookVector:Dot(want.Unit) < 0.95 then h.CFrame = CFrame.lookAt(h.Position, h.Position + want) end
+				face(h, contact)
+			end
 			local held = holding()
 			if held then pcall(function() held:Activate() end) end
 			task.wait(0.35)
+			local hp = o:GetAttribute("Health")
+			if hp ~= lastHp then lastHp, lastHit = hp, os.clock() end
+			if os.clock() - lastHit > 5 then
+				if nudged then break end
+				-- 5 s without a dent: re-approach from the game's stance once more
+				nudged, lastHit = true, os.clock()
+				settle()
+			end
 		end
 		if o.Parent and not o:GetAttribute(MC.BROKEN_ATTR) then
-			if o:GetAttribute("Health") == h0 then bad[o] = true end
+			if o:GetAttribute("Health") == h0 or os.clock() - lastHit > 5 then bad[o] = true end
+			log(("Gather: ขุด %s ไม่เข้า (เลือด %s → %s) ข้ามก้อนนี้"):format(oreKind(o), tostring(h0), tostring(o:GetAttribute("Health"))))
 			return
 		end
 		G.mined += 1
@@ -3475,13 +3580,22 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 			if hrp then pickup(hrp.Position, 60) end
 		end
 		local node, kind = nextNode(at)
-		if not node and e.gatherFar then
-			node, kind = nextNode(at, true)
-			if node then
-				local ok, p = pcall(function() return node:GetPivot().Position end)
-				if ok then
-					setCenter(p)
-					log(("Gather: ในรัศมีไม่มี → ย้ายจุดเก็บไปที่ %s ที่ใกล้สุด (%.0f stud)"):format(kind == "tree" and treeKind(node) or oreKind(node), flat(p - at).Magnitude))
+		if not node then
+			-- broken ones in the circle come back soon: wait here instead of walking off
+			local back = regrowing(at)
+			if back > 0 then
+				local _, hrp = char()
+				if hrp and flat(hrp.Position - at).Magnitude > e.gatherR then walk(at, 8, 60) else stopMove() end
+				say(("ในรัศมีหมดชั่วคราว · รอเกิดใหม่ %d ก้อน/ต้น"):format(back))
+				task.wait(1)
+				return
+			end
+			if e.gatherFar then
+				local cl, cnt = bestCluster()
+				if cl then
+					setCenter(cl.p)
+					log(("Gather: ในรัศมีไม่มีเลย → ย้ายไปจุดที่มี %d ก้อน/ต้น (ห่าง %.0f stud)"):format(cnt, flat(cl.p - at).Magnitude))
+					node, kind = cl.n, cl.k
 				end
 			end
 		end
@@ -3492,7 +3606,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 				walk(at, 6, 90)
 			else
 				stopMove()
-				say(("รอต้นไม้/แร่เกิดใหม่ในรัศมี %d stud"):format(e.gatherR))
+				say(("ไม่มีของที่เลือกในรัศมี %d และในระยะย้ายจุด %d stud · รออยู่ที่นี่"):format(e.gatherR, e.gatherFarMax))
 				task.wait(1)
 			end
 			return
@@ -3572,7 +3686,9 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		local _, hrp = char()
 		if hrp then setCenter(hrp.Position); log("ตั้งจุดเก็บของตรงนี้") end
 	end})
-	GL:Toggle({Name = "ในรัศมีไม่มี → เดินไปหาตัวที่ใกล้สุดที่มองเห็น (แล้วย้ายจุดเก็บไปที่นั่น)", Default = e.gatherFar, Callback = function(v) e.gatherFar = v; sv() end}, "PLGatherFar")
+	GL:Toggle({Name = "ในรัศมีไม่มีเลย → ย้ายไปจุดที่มีเยอะสุด (ถ้าแค่หมดชั่วคราว = รอเกิด)", Default = e.gatherFar, Callback = function(v) e.gatherFar = v; sv() end}, "PLGatherFar")
+	GL:Slider({Name = "└ ย้ายจุดได้ไกลสุด (stud)", Default = e.gatherFarMax, Minimum = 100, Maximum = 1500, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.gatherFarMax = v; sv() end}, "PLGatherFarMax")
 	GL:Toggle({Name = "เก็บของที่ดรอป (ไม้ · แร่ · ผลไม้)", Default = e.gatherPick, Callback = function(v) e.gatherPick = v; sv() end}, "PLGatherPick")
 	GL:Toggle({Name = "สู้กลับมอนที่เข้ามาตีระหว่างเก็บ", Default = e.gatherDefend, Callback = function(v) e.gatherDefend = v; sv() end}, "PLGatherDefend")
 
