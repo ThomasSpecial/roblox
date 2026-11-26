@@ -354,7 +354,7 @@ do
 		Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
 	manualInput = function()
 		if UIS:GetFocusedTextBox() then return false end
-		local okV, mv = pcall(function() return Controls and Controls:GetMoveVector() end)
+		local okV, mv = pcall(function() return st.realMoveVector and st.realMoveVector() or (Controls and Controls:GetMoveVector()) end)
 		if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then return true end
 		for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
 		for _, gp in ipairs(UIS:GetConnectedGamepads()) do
@@ -1319,8 +1319,10 @@ local function moveTo(goal, free)
 	local c, hrp, hum = char()
 	if not hrp then return end
 	if not free then goal = clampHeal(goal) end
+	st.travelGoal = goal
 	-- far trip: the game's World Map warp first (st.tryWarp, defined with the Movement tab), then walk the rest
 	if e.moveMode == "Walk" and st.tryWarp and st.tryWarp(goal) then return end
+	if e.moveMode == "Walk" and st.mountFor then st.mountFor(goal) end
 	-- short repositioning (combat): the spot must have floor under it, else hold position
 	if e.moveMode == "Walk" and flat(goal - hrp.Position).Magnitude < 20 and not groundOk(c, feetOf(hrp, hum), goal) then
 		mover.walk = nil
@@ -1387,6 +1389,42 @@ RunService:BindToRenderStep(st.walkStep, Enum.RenderPriority.Character.Value + 5
 	if not hrp then return end
 	if mover.walk then
 		local d = flat(mover.walk - hrp.Position)
+		-- riding: the mount reads ControlModule:GetMoveVector() (MountLocomotion), not Humanoid:Move -> steer it there
+		if c:GetAttribute("Mounted") == true then
+			-- a flying mount (ClassicDragon / BoneDragon: hold jump = climb, let go = glide): far from the real goal ->
+			-- fly straight at it over whatever is in the way, glide down for the last 50 studs
+			local fg = st.travelGoal
+			local fd = fg and flat(fg - hrp.Position).Magnitude or 0
+			if st.canFly and st.canFly(c) and fg and fd > 50 and os.clock() > (st.noFlyUntil or 0) then
+				st.mountSteer, st.mountSteerAt = flat(fg - hrp.Position).Unit, os.clock()
+				if not st.flyHeld and st.flyJump then st.flyJump(true) end
+			else
+				if st.flyHeld and st.flyJump then st.flyJump(false) end
+				if d.Magnitude > 2 then st.mountSteer, st.mountSteerAt = d.Unit, os.clock() else st.mountSteer = nil end
+			end
+			-- riding into a wall: the foot unstick watches Humanoid.MoveDirection (0 while riding) -> no progress for
+			-- 2.5 s = get off (draw the weapon) and walk around on foot for a while
+			local mp = st.mountProg
+			if not mp or (hrp.Position - mp.p).Magnitude > 4 then
+				st.mountProg = {p = hrp.Position, t = os.clock()}
+			elseif os.clock() - mp.t > 2.5 and st.flyHeld then
+				-- flew into rock (cave roof, cliff): ride the path on the ground for a while instead
+				st.mountProg = nil
+				st.noFlyUntil = os.clock() + 20
+				if st.flyJump then st.flyJump(false) end
+				log("บินชนสิ่งกีดขวาง → วิ่งบนพาหนะตามทางแทน 20 วิ")
+			elseif os.clock() - mp.t > 2.5 then
+				st.mountProg = nil
+				st.mountBlockUntil = os.clock() + 15
+				st.mountSteer = nil
+				if st.dismount then st.dismount() end
+				log("ขี่แล้วติด → ลงเดินอ้อม 15 วิ")
+			end
+			return
+		end
+		st.mountProg = nil
+		st.mountSteer = nil
+		if st.flyHeld and st.flyJump then st.flyJump(false) end   -- off the mount: nothing to hold
 		if d.Magnitude > 0.8 then
 			local dir = d.Unit
 			hum:Move(dir)
@@ -1417,6 +1455,7 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	lastPosSkip = false
 	if manualInput() then
 		if not manual() then st.manualAt = os.clock() end
+		if st.flyHeld and st.flyJump then st.flyJump(false) end
 		manualUntil = os.clock() + 4
 		mover.walk, mover.goal = nil, nil
 		setControls(true)
@@ -3720,6 +3759,88 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	end)
 end)()
 
+-- ------------------------------------------------------------------ mounts
+-- Mount items (Materials with MountId, ItemRegistry Speed): EquipRequest(serial) = get on; drawing a weapon / tool =
+-- get off (the game does it). Holding a tool blocks mounting ("ToolBlocked") -> UnequipTools first.
+-- While riding, MountLocomotion takes its direction from ControlModule:GetMoveVector() (camera space), so we override
+-- that on the ControlModule object and feed it our walk direction; the player's own keys still win (manual()).
+;(function()
+	if not Controls then return end
+	local origGMV = Controls.GetMoveVector
+	st.realMoveVector = function() return origGMV(Controls) end
+	Controls.GetMoveVector = function(self, ...)
+		local w = st.mountSteer
+		if w and os.clock() - (st.mountSteerAt or 0) < 0.4 and not manual() then
+			local cam = workspace.CurrentCamera
+			if cam then
+				local fwd, right = flat(cam.CFrame.LookVector), flat(cam.CFrame.RightVector)
+				if fwd.Magnitude > 0.01 and right.Magnitude > 0.01 then
+					fwd, right = fwd.Unit, right.Unit
+					return Vector3.new(w:Dot(right), 0, -w:Dot(fwd))
+				end
+			end
+		end
+		return origGMV(self, ...)
+	end
+	st.unmountSteer = function() pcall(function() rawset(Controls, "GetMoveVector", nil) end) end
+
+	if e.mountOn == nil then e.mountOn = true end
+	if type(e.mountMin) ~= "number" then e.mountMin = 120 end
+	local Reg
+	pcall(function() Reg = require(RS.Inventory_Engine.Modules.ItemRegistry) end)
+	local lastTry = 0
+	-- fastest owned mount
+	st.bestMount = function()
+		local d = invData()
+		local best, bs
+		for _, cat in pairs(d and d.Inventory or {}) do
+			if type(cat) == "table" then
+				for serial, it in pairs(cat) do
+					local def = type(it) == "table" and Reg and Reg[it.Id]
+					if def and def.MountId and (not bs or (tonumber(def.Speed) or 0) > bs) then
+						best, bs = {serial = serial, id = it.Id, speed = tonumber(def.Speed) or 0}, tonumber(def.Speed) or 0
+					end
+				end
+			end
+		end
+		return best
+	end
+	-- flying mounts: hold the mount's jump action (ContextAction "Poly.Mount.Jump") = climb to the flight ceiling
+	local CAS = game:GetService("ContextActionService")
+	local MP
+	pcall(function() MP = require(RS.Mount_Engine.MountProtocol) end)
+	local jumpName = MP and MP.JumpActionName or "Poly.Mount.Jump"
+	local ceilAttr = MP and MP.Attributes and MP.Attributes.FlightCeiling or "MountFlightCeiling"
+	local climbAttr = MP and MP.Attributes and MP.Attributes.FlightClimbSpeed or "MountFlightClimbSpeed"
+	st.canFly = function(c) return c:GetAttribute(ceilAttr) ~= nil or c:GetAttribute(climbAttr) ~= nil end
+	st.flyJump = function(on)
+		st.flyHeld = on
+		pcall(function() CAS:CallFunction(jumpName, on and Enum.UserInputState.Begin or Enum.UserInputState.End, nil) end)
+	end
+	-- get off = draw the fighting weapon (the game drops you off the mount)
+	st.dismount = function()
+		if st.flyHeld then st.flyJump(false) end
+		local w = st.weaponSerial
+		pcall(function() w = w or invData().Equipped.Weapon end)
+		if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+	end
+	st.mountFor = function(goal)
+		if not e.mountOn or manual() then return end
+		local c, hrp, hum = char()
+		if not hrp or hum.Health <= 0 or c:GetAttribute("Mounted") == true then return end
+		if os.clock() - lastTry < 6 or os.clock() < (st.mountBlockUntil or 0) or hum.FloorMaterial == Enum.Material.Air then return end
+		if flat(goal - hrp.Position).Magnitude < e.mountMin then return end
+		-- not in the middle of a fight
+		if st.target and mobAlive(st.target) and flat(mobPos(st.target) - hrp.Position).Magnitude < 25 then return end
+		local m = st.bestMount()
+		if not m then lastTry = os.clock() + 60 return end
+		lastTry = os.clock()
+		pcall(function() hum:UnequipTools() end)
+		pcall(function() InvRemotes.EquipRequest:FireServer(m.serial) end)
+		log(("ขี่ %s (ความเร็ว %s) เดินทาง %.0f stud"):format(m.id, tostring(m.speed), flat(goal - hrp.Position).Magnitude))
+	end
+end)()
+
 -- ------------------------------------------------------------------ World Map warp
 -- Map_Engine: Travel:FireServer(destId) while HOLDING the Map tool (else TravelResult {ok=false, reason="nomap"}),
 -- "here" = closer than MIN_TRIP. Only discovered destinations (player attr MapDiscovered), cooldown in MapTravelReadyAt
@@ -3791,6 +3912,9 @@ local M = MoveTab:Section({Side = "Left"})
 M:Header({Text = "การเคลื่อนที่"})
 M:Dropdown({Name = "วิธีเดินทาง", Multi = false, Required = true, Options = MOVE_OPTS,
 	Default = idx(MOVE_OPTS, e.moveMode), Callback = function(v) e.moveMode = v; stopMove(); sv() end}, "PLMove")
+M:Toggle({Name = "ขี่พาหนะตอนเดินทาง (เลือกตัวที่เร็วสุดเอง)", Default = e.mountOn ~= false, Callback = function(v) e.mountOn = v; sv() end}, "PLMountOn")
+M:Slider({Name = "└ ไกลเกินกี่ stud ถึงขี่", Default = e.mountMin or 120, Minimum = 40, Maximum = 600, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.mountMin = v; sv() end}, "PLMountMin")
 M:Toggle({Name = "วาร์ปด้วยแผนที่ (World Map) ถ้าต้องเดินไกล", Default = e.warpOn ~= false, Callback = function(v) e.warpOn = v; sv() end}, "PLWarpOn")
 M:Slider({Name = "└ ไกลเกินกี่ stud ถึงวาร์ป", Default = e.warpMin or 500, Minimum = 200, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.warpMin = v; sv() end}, "PLWarpMin")
@@ -4079,6 +4203,7 @@ task.spawn(function()
 	while alive() do task.wait(1) end
 	pcall(function() hbConn:Disconnect() end)
 	pcall(function() RunService:UnbindFromRenderStep(st.walkStep) end)
+	pcall(function() if st.unmountSteer then st.unmountSteer() end end)
 	pcall(function() idleConn:Disconnect() end)
 	mover.walk = nil
 	setControls(true)
