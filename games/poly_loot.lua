@@ -1039,7 +1039,9 @@ local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 local NAVR = {
 	regions = {
 		{name = "main"},
-		{name = "volcano", bounds = {x0 = -800, z0 = -3650, x1 = 900, z1 = -2300, top = 420, bot = 30}},
+		-- reaches up to Jungle Village: the only way up the volcano is a pass around x 300-390 that the first
+		-- (z <= -2300) map cut off, so plans ended against the mountain wall at (11, -2366)
+		{name = "volcano2", bounds = {x0 = -800, z0 = -3650, x1 = 1000, z1 = -1900, top = 420, bot = 30}},
 		{name = "beach", bounds = {x0 = 1850, z0 = -3350, x1 = 3550, z1 = -1250, top = 420, bot = 30}},
 	},
 	tried = {},
@@ -2299,6 +2301,7 @@ local function endCombo()
 end
 -- turn toward the target only when we're clearly off (rotating every frame froze the walk animation)
 local function swingNow(c)
+	st.combatAt = os.clock()   -- the map warp refuses for COMBAT_LOCK (8 s) after a fight
 	if e.attackMode == ATTACK_GAME then
 		local tool = c:FindFirstChildOfClass("Tool")
 		if tool then pcall(function() tool:Activate() end) end
@@ -4111,8 +4114,24 @@ end)()
 		end
 		return best
 	end
+	-- taking damage counts as combat too
+	local function hookHurt(c)
+		local hum = c:WaitForChild("Humanoid", 10)
+		if not hum then return end
+		local last = hum.Health
+		hum.HealthChanged:Connect(function(h)
+			if h < last - 1 then st.combatAt = os.clock() end
+			last = h
+		end)
+	end
+	if plr.Character then task.spawn(hookHurt, plr.Character) end
+	plr.CharacterAdded:Connect(hookHurt)
+	local LOCK = (tonumber(MapC.COMBAT_LOCK) or 8) + 0.7
 	st.tryWarp = function(goal)
 		if not e.warpOn or manual() then return false end
+		-- in combat: no warp yet (the trip keeps riding away meanwhile; riding never swings)
+		if os.clock() - (st.combatAt or 0) < LOCK then st.warpWaiting = true return false end
+		st.warpWaiting = nil
 		local now = os.clock()
 		if now - lastTry < 4 or now < quietUntil then return false end
 		local c, hrp, hum = char()
@@ -4185,8 +4204,9 @@ end)()
 			if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) else pcall(function() hum:UnequipTools() end) end
 		end
 		if not moved then
-			log(("วาร์ปไม่สำเร็จ (%s)"):format(type(lastRes) == "table" and tostring(lastRes.reason) or "ไม่มีคำตอบ"))
-			quietUntil = os.clock() + 30
+			local why = type(lastRes) == "table" and tostring(lastRes.reason) or "ไม่มีคำตอบ"
+			log(("วาร์ปไม่สำเร็จ (%s)"):format(why))
+			if why == "combat" then st.combatAt = os.clock() else quietUntil = os.clock() + 30 end
 			return false
 		end
 		return true
