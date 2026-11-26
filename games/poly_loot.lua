@@ -1033,28 +1033,58 @@ return Nav
 end)()
 -- [NAV END]
 local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
-local NAV_NAME = "main"
+-- NavMap regions: "main" (town, grass, cave, jungle, dark forest) only reached z -2380, so the Volcano (Pyrolisk farm,
+-- Inferno Rex) and the Beach (Skullcrab) fell back to Roblox Pathfinding and got stuck all the time. Each region has
+-- its own map file; the one we stand in is navMap. A region without a file is scanned once in the background.
+local NAVR = {
+	regions = {
+		{name = "main"},
+		{name = "volcano", bounds = {x0 = -800, z0 = -3650, x1 = 900, z1 = -2300, top = 420, bot = 30}},
+		{name = "beach", bounds = {x0 = 1850, z0 = -3350, x1 = 3550, z1 = -1250, top = 420, bot = 30}},
+	},
+	tried = {},
+}
 local navMap = nil
-local navTried = false
+function NAVR.at(p)
+	for _, r in ipairs(NAVR.regions) do
+		local b = r.bounds or Nav.BOUNDS
+		if p.X >= b.x0 and p.X <= b.x1 and p.Z >= b.z0 and p.Z <= b.z1 then return r end
+	end
+end
+function NAVR.scan(r, onStatus)
+	if st.navScanning or not alive() then return end
+	st.navScanning = true
+	local m2, info = Nav.scan({name = r.name, bounds = r.bounds, alive = alive, onStatus = onStatus or function(t) st.navWhy = t end})
+	if m2 and alive() then
+		Nav.maps[r.name] = m2
+		local _, hrp = char()
+		if hrp and NAVR.at(hrp.Position) == r then navMap = m2; path.wps = nil end
+	end
+	log(m2 and ("สแกน NavMap %s เสร็จ: %s"):format(r.name, tostring(info)) or ("สแกน NavMap %s ไม่สำเร็จ: %s"):format(r.name, tostring(info)))
+	st.navScanning = false
+end
 local function getNav()
-	if not navMap and not navTried then
-		navTried = true
-		local ok, m = pcall(Nav.load, NAV_NAME)
-		if ok then navMap = m end
-		if not navMap then
-			-- no map / made by an older scanner: scan once in the background (~40 s), Pathfinding meanwhile
+	local _, hrp = char()
+	local r = hrp and NAVR.at(hrp.Position)
+	if not r then navMap = nil return nil end   -- outside every map: Pathfinding
+	local m = Nav.maps[r.name]
+	if not m and not NAVR.tried[r.name] then
+		NAVR.tried[r.name] = true
+		local ok, mm = pcall(Nav.load, r.name)
+		if ok and mm then m = mm end
+		if not m then
+			-- no map for this region yet: scan it once in the background (1-2 min), Pathfinding meanwhile
 			task.spawn(function()
 				task.wait(5)
-				if st.navScanning or not alive() then return end
-				st.navScanning = true
-				local m2, info = Nav.scan({name = NAV_NAME, alive = alive, onStatus = function(t) st.navWhy = t end})
-				if m2 and alive() then navMap = m2; path.wps = nil end
-				log(m2 and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
-				st.navScanning = false
+				log(("NavMap: ยังไม่มีแผนที่พื้นที่ %s → สแกนเบื้องหลัง"):format(r.name))
+				NAVR.scan(r)
 			end)
 		end
 	end
-	return navMap
+	if m ~= navMap then path.wps = nil end
+	navMap = m
+	st.navRegion = r.name
+	return m
 end
 -- StreamingEnabled: parts of the map far from us weren't loaded during the scan. Every 8 s the unknown tiles within
 -- ~400 studs (streamed in now) are scanned into the map; the file is re-saved at most once a minute.
@@ -1062,7 +1092,7 @@ task.spawn(function()
 	local dirty, lastSave = 0, os.clock()
 	while alive() do
 		task.wait(8)
-		local m = navMap
+		local m = getNav()
 		local _, hrp = char()
 		if m and hrp and not st.navScanning then
 			local okV, stale = pcall(Nav.verifyNear, m, hrp.Position, 3)
@@ -4012,7 +4042,9 @@ end)()
 				end
 				local p = Vector3.new(bt.pos[1], bt.pos[2], bt.pos[3])
 				local d = flat(p - hrp.Position).Magnitude
-				if not lethal and d <= e.bossTrip then
+				-- reachable = ride straight, or warp to the nearest town and ride from there (whichever is shorter)
+				local dEff = math.min(d, st.warpReach and st.warpReach(p) or math.huge)
+				if not lethal and dEff <= e.bossTrip then
 					if d < 100 then
 						near[kind] = near[kind] or os.clock()
 						if os.clock() - near[kind] > 25 then
@@ -4050,6 +4082,17 @@ end)()
 	end)
 	local NAMES = {}
 	for id, d in pairs(MapC.Destinations or {}) do NAMES[id] = d.name or id end
+	-- how far `goal` is from the nearest discovered warp point (boss trips count warp + ride, not a straight ride)
+	st.warpReach = function(goal)
+		if not e.warpOn then return math.huge end
+		local disc = {}
+		for id in tostring(plr:GetAttribute(MapC.DISCOVERED_ATTR) or ""):gmatch("[^,%s]+") do disc[id] = true end
+		local best = math.huge
+		for id, dest in pairs(MapC.Destinations or {}) do
+			if disc[id] and typeof(dest.pos) == "Vector3" then best = math.min(best, flat(dest.pos - goal).Magnitude) end
+		end
+		return best
+	end
 	st.tryWarp = function(goal)
 		if not e.warpOn or manual() then return false end
 		local now = os.clock()
@@ -4147,9 +4190,9 @@ M:Header({Text = "NavMap (แผนที่ทางเดิน)"})
 local navLbl = M:Label({Text = "-"})
 local function navText()
 	local m = getNav()
-	if not m then return "NavMap: ยังไม่มี → ใช้ Pathfinding ของ Roblox\nกดสแกนด้านล่าง (ยืนที่ไหนก็ได้ ~1-2 นาที)" end
+	if not m then return ("NavMap: พื้นที่นี้ (%s) ยังไม่มี → ใช้ Pathfinding ของ Roblox ระหว่างสแกน"):format(tostring(st.navRegion or "นอกแผนที่")) end
 	local c = Nav.tileCounts(m)
-	return ("NavMap: %dx%d ช่อง · %d จุดยืน · ครบ %d/%d ส่วน (เติมระหว่างเล่นแล้ว %d)\nวางเส้นทางไปแล้ว %d ครั้ง (%s)"):format(
+	return ("NavMap [" .. tostring(st.navRegion) .. "]: %dx%d ช่อง · %d จุดยืน · ครบ %d/%d ส่วน (เติมระหว่างเล่นแล้ว %d)\nวางเส้นทางไปแล้ว %d ครั้ง (%s)"):format(
 		m.w, m.h, m.nodes or 0, c["1"] + c["2"], m.tx * m.tz, st.navFilled or 0, st.navPlans or 0, tostring(st.navWhy or "-"))
 end
 pcall(function() navLbl:UpdateName(navText()) end)
@@ -4159,15 +4202,11 @@ task.spawn(function()
 		pcall(function() navLbl:UpdateName(navText()) end)
 	end
 end)
-M:Button({Name = "สแกน NavMap ใหม่ (เมือง ทุ่ง ถ้ำ)", Callback = function()
-	if st.navScanning then return end
-	st.navScanning = true
-	task.spawn(function()
-		local m, info = Nav.scan({name = NAV_NAME, alive = alive, onStatus = function(t) pcall(function() navLbl:UpdateName(t) end) end})
-		if m then navMap, navTried = m, true; path.wps = nil end
-		log(m and ("สแกน NavMap เสร็จ: " .. tostring(info)) or ("สแกน NavMap ไม่สำเร็จ: " .. tostring(info)))
-		st.navScanning = false
-	end)
+M:Button({Name = "สแกน NavMap ใหม่ (พื้นที่ที่ยืนอยู่: main / volcano / beach)", Callback = function()
+	local _, hrp = char()
+	local r = hrp and NAVR.at(hrp.Position)
+	if not r then log("ตรงนี้อยู่นอกทุกพื้นที่ของ NavMap") return end
+	task.spawn(function() NAVR.scan(r, function(t) pcall(function() navLbl:UpdateName(t) end) end) end)
 end})
 M:Label({Text = "Walk = เดินจริง (Pathfinding) ปลอดภัยสุด\nTween/Teleport: เกมมีกันโกงเช็กตำแหน่งทุก 0.2 วิ\n· Tween 28+ ทะลุตึกโดนดึงกลับ · 60 ตัวละครตาย\n· Teleport เกินระยะที่ตั้งจะ Tween แทน\nตัวเลข 'โดนดึงกลับ' ในสถานะขึ้น = ลดความเร็ว"})
 
