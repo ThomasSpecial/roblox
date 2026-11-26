@@ -545,6 +545,27 @@ do
 		return best
 	end
 
+	-- hazards (lava pools, Lava_Engine.Zones.Surfaces(): touching one throws you and burns every 0.5 s; the scan saw
+	-- them as plain floor and trips to Rex walked straight through). Nav.hazards = {{cf = CFrame, half = Vector3}},
+	-- filled by the main script; a floor inside one is never stepped ONTO (stepping out of one is fine)
+	Nav.hazards = {}
+	local function hazardAt(m, k2, l2, ni, nj)
+		if #Nav.hazards == 0 then return false end
+		m.hz = m.hz or {}
+		local key = k2 * MAXL + l2
+		local v = m.hz[key]
+		if v == nil then
+			v = false
+			local p = Vector3.new(m.x0 + ni * CELL, m.hts[l2][k2], m.z0 + nj * CELL)
+			for _, h in ipairs(Nav.hazards) do
+				local lp = h.cf:PointToObjectSpace(p)
+				if math.abs(lp.X) <= h.half.X and math.abs(lp.Z) <= h.half.Z and math.abs(lp.Y) <= h.half.Y then v = true break end
+			end
+			m.hz[key] = v
+		end
+		return v
+	end
+
 	-- legal step from floor (i,j,l) in direction (di,dj)? -> neighbour layer, isJump
 	local step
 	step = function(m, i, j, l, di, dj, walkOnly)
@@ -557,6 +578,7 @@ do
 		local k2 = nj * m.w + ni + 1
 		local l2 = layerTo(m, k2, y, diag and WALK_UP * 1.42 or JUMP_UP)
 		if not l2 then return nil end
+		if hazardAt(m, k2, l2, ni, nj) then return nil end
 		local n = DIRN[di * 3 + dj]
 		if bit32.band(m.wall[l][k] or 0, bit32.lshift(1, n - 1)) ~= 0 then return nil end
 		local bt = m.bad[((k - 1) * MAXL + l - 1) * 8 + n]
@@ -1119,6 +1141,16 @@ end
 return Nav
 end)()
 -- [NAV END]
+-- lava pools for the NavMap (Nav.hazards): the game's own list of lava surfaces
+pcall(function()
+	local LZ = require(RS:WaitForChild("Lava_Engine", 10):WaitForChild("Zones", 10))
+	for _, p in ipairs(LZ.Surfaces() or {}) do
+		if typeof(p) == "Instance" and p:IsA("BasePart") and p.Size.X < 1000 then
+			table.insert(Nav.hazards, {cf = p.CFrame, half = p.Size / 2 + Vector3.new(3, 4, 3)})
+		end
+	end
+	st.navHazards = #Nav.hazards
+end)
 local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 -- NavMap regions: "main" (town, grass, cave, jungle, dark forest) only reached z -2380, so the Volcano (Pyrolisk farm,
 -- Inferno Rex) and the Beach (Skullcrab) fell back to Roblox Pathfinding and got stuck all the time. Each region has
