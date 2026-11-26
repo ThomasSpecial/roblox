@@ -2652,6 +2652,13 @@ task.spawn(function()
 			-- burst: a mob we kill in a couple of swings is not worth backing off from. Retreating / side-stepping a Pyrolisk
 			-- (ranged 46, every hit lethal) only handed it free shots while ours never landed
 			local burst = mobHp(t) <= math.max((st.dps or 0) * 3, (e.bigHit or 0) * 2.5)
+			-- a long-range attacker (Inferno Rex: 260 studs) can't be outrun: backing off only stops our own hits
+			if not burst then
+				pcall(function()
+					local cfg = AnimalCfg.Get(tostring(t:GetAttribute("Animal")))
+					if (tonumber(cfg.AttackRange) or 0) >= 60 then burst = true end
+				end)
+			end
 			st.burst = burst
 			-- low HP: back off and let AreaHeal / regen work
 			if burst then
@@ -4185,7 +4192,8 @@ end)()
 		local c, hrp = char()
 		if not hrp or c:GetAttribute("Mounted") ~= true or os.clock() - lastOff < 1.5 then return end
 		local t = st.target
-		if t and mobAlive(t) and flat(mobPos(t) - goal).Magnitude < 15 and flat(goal - hrp.Position).Magnitude < 30 then
+		-- fighting range of the current target: on foot (we circled Inferno Rex on the dragon and never hit it)
+		if t and mobAlive(t) and flat(mobPos(t) - hrp.Position).Magnitude < 120 then
 			lastOff = os.clock()
 			st.dismount()
 		end
@@ -4204,7 +4212,7 @@ end)()
 		if e.farm and inside(anchorPos(), e.anchorR + 80) then return end
 		if e.gather and type(e.gatherAt) == "table" and inside(Vector3.new(e.gatherAt[1], e.gatherAt[2], e.gatherAt[3]), e.gatherR + 60) then return end
 		-- not in the middle of a fight
-		if st.target and mobAlive(st.target) and flat(mobPos(st.target) - hrp.Position).Magnitude < 25 then return end
+		if st.target and mobAlive(st.target) and flat(mobPos(st.target) - hrp.Position).Magnitude < 150 then return end
 		local m = st.bestMount()
 		if not m then lastTry = os.clock() + 60 return end
 		lastTry = os.clock()
@@ -4359,10 +4367,14 @@ end)()
 		for id in tostring(plr:GetAttribute(MapC.DISCOVERED_ATTR) or ""):gmatch("[^,%s]+") do disc[id] = true end
 		local best, bd
 		for id, dest in pairs(MapC.Destinations or {}) do
-			if disc[id] and typeof(dest.pos) == "Vector3" and flat(dest.pos - hrp.Position).Magnitude > (MapC.MIN_TRIP or 45) + 5 then
+			-- not back to the town we just warped to: riding out of Jungle Village toward the volcano pass first goes
+			-- away from Rex, and we warped straight back again and again
+			local recent = st.warpedTo and st.warpedTo.id == id and os.clock() - st.warpedTo.at < 120
+			if disc[id] and not recent and typeof(dest.pos) == "Vector3" and flat(dest.pos - hrp.Position).Magnitude > (MapC.MIN_TRIP or 45) + 5 then
 				local dd = flat(dest.pos - goal).Magnitude
 				-- only worth it when it cuts the walk a lot
-				if (force or dd < d - 300) and (not bd or dd < bd) then best, bd = id, dd end
+				-- warps are free (30 s cooldown): worth it once they save 150 studs (riding around cliffs costs more)
+				if (force or dd < d - 150) and (not bd or dd < bd) then best, bd = id, dd end
 			end
 		end
 		if not best then quietUntil = now + 15 return false end
@@ -4392,6 +4404,7 @@ end)()
 		lastRes = nil
 		local p0 = hrp.Position
 		pcall(function() MapR.Travel:FireServer(best) end)
+		st.warpedTo = {id = best, at = os.clock()}
 		log(("วาร์ปด้วยแผนที่ → %s (เดินเองไกล %.0f stud · จากจุดวาร์ปเหลือ %.0f)"):format(NAMES[best], d, bd))
 		st.status = ("วาร์ปไป %s"):format(NAMES[best])
 		local t0, moved = os.clock(), false
