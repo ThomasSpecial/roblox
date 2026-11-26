@@ -1045,11 +1045,23 @@ local NAVR = {
 	tried = {},
 }
 local navMap = nil
-function NAVR.at(p)
+local function inB(b, p) return p.X >= b.x0 and p.X <= b.x1 and p.Z >= b.z0 and p.Z <= b.z1 end
+-- region for a position; with a goal: the region that holds both, else the one that gets us closest to the goal
+-- (regions overlap ~80 studs, so walking to the edge of one puts us inside the next)
+function NAVR.at(p, goal)
+	local best, bd
 	for _, r in ipairs(NAVR.regions) do
 		local b = r.bounds or Nav.BOUNDS
-		if p.X >= b.x0 and p.X <= b.x1 and p.Z >= b.z0 and p.Z <= b.z1 then return r end
+		if inB(b, p) then
+			if not goal then return r end
+			if inB(b, goal) then return r end
+			local cx = math.clamp(goal.X, b.x0, b.x1)
+			local cz = math.clamp(goal.Z, b.z0, b.z1)
+			local d = Vector2.new(goal.X - cx, goal.Z - cz).Magnitude
+			if not bd or d < bd then best, bd = r, d end
+		end
 	end
+	return best
 end
 function NAVR.scan(r, onStatus)
 	if st.navScanning or not alive() then return end
@@ -1063,9 +1075,9 @@ function NAVR.scan(r, onStatus)
 	log(m2 and ("สแกน NavMap %s เสร็จ: %s"):format(r.name, tostring(info)) or ("สแกน NavMap %s ไม่สำเร็จ: %s"):format(r.name, tostring(info)))
 	st.navScanning = false
 end
-local function getNav()
+local function getNav(goal)
 	local _, hrp = char()
-	local r = hrp and NAVR.at(hrp.Position)
+	local r = hrp and NAVR.at(hrp.Position, goal)
 	if not r then navMap = nil return nil end   -- outside every map: Pathfinding
 	local m = Nav.maps[r.name]
 	if not m and not NAVR.tried[r.name] then
@@ -1156,9 +1168,15 @@ local function feetOf(hrp, hum)
 end
 local function computePath(hrp, goal)
 	path.goal, path.at, path.wps, path.i, path.nav = goal, os.clock(), nil, 2, false
-	local m = getNav()
-	if m and Nav.inside(m, hrp.Position) and Nav.inside(m, goal) then
-		local ok, pts, why = pcall(Nav.plan, m, hrp.Position, goal, true, function() task.wait() end)
+	local m = getNav(goal)
+	-- goal in another region: plan to the point of this map closest to it (the overlap), the next region takes over
+	local navGoal = goal
+	if m and not Nav.inside(m, goal) then
+		local c = m.cell or 3
+		navGoal = Vector3.new(math.clamp(goal.X, m.x0 + 2 * c, m.x0 + (m.w - 3) * c), goal.Y, math.clamp(goal.Z, m.z0 + 2 * c, m.z0 + (m.h - 3) * c))
+	end
+	if m and Nav.inside(m, hrp.Position) and Nav.inside(m, navGoal) then
+		local ok, pts, why = pcall(Nav.plan, m, hrp.Position, navGoal, true, function() task.wait() end)
 		if ok and pts and #pts >= 2 then
 			local wps = {}
 			for _, q in ipairs(pts) do
@@ -4125,6 +4143,15 @@ end)()
 		if not best then quietUntil = now + 15 return false end
 		lastTry = now
 		stopMove()
+		-- riding blocks the warp (the first try from the dragon did nothing and cost a 30 s retry): get off first
+		if c:GetAttribute("Mounted") == true and st.dismount then
+			st.dismount()
+			for _ = 1, 15 do
+				task.wait(0.1)
+				if c:GetAttribute("Mounted") ~= true then break end
+			end
+			task.wait(0.3)
+		end
 		local held = c:FindFirstChildOfClass("Tool")
 		if map then
 			if held ~= map then pcall(function() hum:EquipTool(map) end) task.wait(0.4) end
