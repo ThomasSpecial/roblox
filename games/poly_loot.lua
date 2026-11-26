@@ -2788,14 +2788,33 @@ task.spawn(function()
 						-- back to the last spot out of every aggressor's reach (stepping straight away pinned us on a wall at
 						-- 1 % while a Pyrolisk kept hitting); nav walks the way we came. Already there and still chased ->
 						-- step away from them
+						-- The goal is FIXED for a few seconds: "30 studs away from here", recomputed every tick, moved with us
+						-- and the bot stood still at 26 % -> 10 % under a Pyrolisk 15 studs off (death). No progress for
+						-- 2 s (wall / cliff) -> turn the escape direction 70 degrees and try again
 						local sp = st.safeSpot
+						local rg = st.restGoal
+						if rg and (hrp.Position - rg.from).Magnitude > 4 then rg.from, rg.at = hrp.Position, os.clock() end
+						if n > 0 and (not rg or os.clock() > rg.untilT or flat(rg.p - hrp.Position).Magnitude < 6 or os.clock() - rg.at > 2) then
+							local goal
+							if sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 and not (rg and rg.p == sp) then
+								goal = sp
+							elseif away.Magnitude > 0.1 then
+								local dir = away.Unit
+								if rg and os.clock() - rg.at > 2 then
+									rg.turn = (rg.turn or 0) + 1
+									dir = CFrame.Angles(0, math.rad(70 * rg.turn * (rg.turn % 2 == 0 and 1 or -1)), 0):VectorToWorldSpace(dir)
+								end
+								goal = hrp.Position + dir * 60
+							end
+							st.restGoal = goal and {p = goal, untilT = os.clock() + 6, from = hrp.Position, at = os.clock(), turn = rg and rg.turn} or nil
+							rg = st.restGoal
+						end
 						if inHealZone() then
 							moveTo(healZone.c)
-						elseif n > 0 and sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 then
-							moveTo(sp)
-						elseif n > 0 and away.Magnitude > 0.1 then
-							moveTo(hrp.Position + away.Unit * 30)
+						elseif n > 0 and rg then
+							moveTo(rg.p)
 						else
+							st.restGoal = nil
 							stopMove()
 						end
 						st.status = ("พักรอเลือด %d%% → %d%% (ไม่เข้าตีตอนเลือดน้อย)"):format(hp, e.resumeAt)
