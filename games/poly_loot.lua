@@ -1603,14 +1603,6 @@ faceUntil = 0
 st.walkStep = "PolyLootWalk_" .. HS:GenerateGUID(false)
 RunService:BindToRenderStep(st.walkStep, Enum.RenderPriority.Character.Value + 5, function(dt)
 	if not alive() then return end
-	-- knocked back by a boss: hands off (no walking, no turning) until the knockback is over. Walking against it made
-	-- our reported path (Movement_Engine MovementPath) disagree with the server's knockback, the server kept us where
-	-- it threw us (bosses aimed ~55 studs off), and no swing counted again until a warp / death re-synced us
-	if os.clock() < (st.kbFreezeUntil or 0) then
-		local _, _, hum = char()
-		if hum then hum:Move(Vector3.zero) end
-		return
-	end
 	pcall(function()
 		local _, hrp, hum = char()
 		if not hrp then return end
@@ -1683,11 +1675,7 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	do
 		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
 		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
-		-- and never on a boss trip / for 8 s after a knockback: the server's movement check (MovementPath) refuses a path
-		-- faster than its own WalkSpeed (our multiplier is a client attribute it never sees) and then judges our swings
-		-- from where it last accepted us
-		local want = ((e.farm or st.bossActive or st.defend) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)
-			and not st.bossActive and os.clock() > (st.kbFreezeUntil or 0) + 8) and e.speedMult or nil
+		local want = ((e.farm or st.bossActive or st.defend) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
 		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
 		-- Cancel it only, so we run at the normal 20, never faster than a player can
 		if (e.farm or st.bossActive or st.defend) and os.clock() < (st.evadeUntil or 0) then
@@ -2473,7 +2461,7 @@ local function face(hrp, pos)
 	local dir = flat(pos - hrp.Position)
 	if dir.Magnitude < 0.5 then return end
 	faceGoal, faceUntil = pos, os.clock() + 0.4
-	if hrp.CFrame.LookVector:Dot(dir.Unit) < 0.3 and os.clock() >= (st.kbFreezeUntil or 0) then
+	if hrp.CFrame.LookVector:Dot(dir.Unit) < 0.3 then
 		hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
 	end
 end
@@ -4383,26 +4371,6 @@ end)()
 		while alive() do
 			task.wait(1)
 			if st.fixHeld then st.fixHeld() end
-		end
-	end)
-	-- knockback watch: the server stamps Humanoid._ServerKnockbackUntil when a mob throws us -> st.kbFreezeUntil
-	-- (walk step + face() keep their hands off); still airborne from it -> keep waiting until we land
-	local function hookKb(c)
-		local hum = c:WaitForChild("Humanoid", 10)
-		if not hum then return end
-		hum:GetAttributeChangedSignal("_ServerKnockbackUntil"):Connect(function()
-			if alive() then st.kbFreezeUntil, st.kbAt = os.clock() + 1.2, os.clock() end
-		end)
-	end
-	if plr.Character then task.spawn(hookKb, plr.Character) end
-	plr.CharacterAdded:Connect(function(c) task.spawn(hookKb, c) end)
-	task.spawn(function()
-		while alive() do
-			task.wait(0.1)
-			local _, _, hum = char()
-			if hum and os.clock() - (st.kbAt or -99) < 4 and hum.FloorMaterial == Enum.Material.Air then
-				st.kbFreezeUntil = math.max(st.kbFreezeUntil or 0, os.clock() + 0.3)
-			end
 		end
 	end)
 end)()
