@@ -321,45 +321,47 @@ local controlsOff = false
 -- a respawn brings the ControlModule back (it zeroes Humanoid:Move every frame) -> disable it again next walk
 plr.CharacterAdded:Connect(function() controlsOff = false end)
 local controlsAt = 0
--- Manual override. Walk mode switches the game's ControlModule off (it zeroes Humanoid:Move every frame), so while the
--- bot drove, the player's own keys did nothing ("ขาแข็ง"). Now any movement key / left stick = the player takes over:
--- controls on at once, the bot stops steering until MANUAL_HOLD s after the last input.
-local UIS = game:GetService("UserInputService")
-local MOVE_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
-local MANUAL_HOLD = 4
+local faceGoal, faceUntil   -- smooth facing target (see face / the walk render step)
+-- Manual override: any movement key / left stick / touch stick = the player takes over, the bot stops steering until
+-- 4 s after the last input. (Before, Walk mode switched the ControlModule off and the player's keys did nothing.)
 local manualUntil = 0
-local function manualInput()
-	if UIS:GetFocusedTextBox() then return false end
-	local okV, mv = pcall(function() return Controls and Controls:GetMoveVector() end)
-	if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then return true end
-	for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
-	for _, gp in ipairs(UIS:GetConnectedGamepads()) do
-		for _, s in ipairs(UIS:GetGamepadState(gp)) do
-			if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.35 then return true end
+local manualInput, manual, setControls
+do
+	local UIS = game:GetService("UserInputService")
+	local MOVE_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+		Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
+	manualInput = function()
+		if UIS:GetFocusedTextBox() then return false end
+		local okV, mv = pcall(function() return Controls and Controls:GetMoveVector() end)
+		if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then return true end
+		for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
+		for _, gp in ipairs(UIS:GetConnectedGamepads()) do
+			for _, s in ipairs(UIS:GetGamepadState(gp)) do
+				if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.35 then return true end
+			end
 		end
+		return false
 	end
-	return false
-end
-local function manual() return os.clock() < manualUntil end
-local function mountedNow()
-	local c = plr.Character
-	return c ~= nil and c:GetAttribute("Mounted") == true
-end
-local function ctlEnabled()
-	local ok, v = pcall(function() return Controls.activeController == nil or Controls.activeController.enabled ~= false end)
-	return not ok or v
-end
--- The ControlModule is never switched off any more (that was the "ขาแข็ง": keys dead while the bot walked, and stuck
--- dead after a respawn / rejoin / old copy unloading). Our walking runs in a render step bound right AFTER the
--- ControlModule's own step, so our Humanoid:Move wins the frame while the player's keys stay live.
--- setControls(...) is kept for helper scripts; any call only repairs a ControlModule that something else left off.
-local function setControls(_)
-	if not Controls or os.clock() - controlsAt < 0.5 then return end
-	controlsAt = os.clock()
-	if controlsOff or (not ctlEnabled() and not mountedNow()) then
-		controlsOff = false
-		pcall(function() Controls:Enable() end)
+	manual = function() return os.clock() < manualUntil end
+	local function mountedNow()
+		local c = plr.Character
+		return c ~= nil and c:GetAttribute("Mounted") == true
+	end
+	local function ctlEnabled()
+		local ok, v = pcall(function() return Controls.activeController == nil or Controls.activeController.enabled ~= false end)
+		return not ok or v
+	end
+	-- The ControlModule is never switched off any more (that was the "ขาแข็ง": keys dead while the bot walked, and
+	-- stuck dead after a respawn / rejoin / old copy unloading). Our walking runs in a render step bound right AFTER the
+	-- ControlModule's own step, so our Humanoid:Move wins the frame while the player's keys stay live.
+	-- setControls(...) is kept for helper scripts; any call only repairs a ControlModule something else left off.
+	setControls = function(_)
+		if not Controls or os.clock() - controlsAt < 0.5 then return end
+		controlsAt = os.clock()
+		if controlsOff or (not ctlEnabled() and not mountedNow()) then
+			controlsOff = false
+			pcall(function() Controls:Enable() end)
+		end
 	end
 end
 -- [NAV BEGIN] generated from polyloot_nav.lua by sync_plnav.py -- edit that file, not this block
@@ -1334,10 +1336,27 @@ local rp = RaycastParams.new()
 rp.FilterType = Enum.RaycastFilterType.Exclude
 local lastPos
 -- walking: after the ControlModule's render step (Input priority) so its Move(zero) doesn't cancel ours
-local WALK_STEP = "PolyLootWalk"
-pcall(function() RunService:UnbindFromRenderStep(WALK_STEP) end)
-RunService:BindToRenderStep(WALK_STEP, Enum.RenderPriority.Character.Value + 5, function()
-	if not alive() or manual() or not mover.walk then return end
+faceUntil = 0
+pcall(function() RunService:UnbindFromRenderStep("PolyLootWalk") end)
+RunService:BindToRenderStep("PolyLootWalk", Enum.RenderPriority.Character.Value + 5, function(dt)
+	if not alive() then return end
+	pcall(function()
+		local _, hrp, hum = char()
+		if not hrp then return end
+		if faceGoal and os.clock() < faceUntil and not manual() then
+			if hum.AutoRotate then hum.AutoRotate = false end
+			local want = flat(faceGoal - hrp.Position)
+			local cur = flat(hrp.CFrame.LookVector)
+			if want.Magnitude > 0.5 and cur.Magnitude > 0.1 and cur.Unit:Dot(want.Unit) < 0.999 then
+				local look = cur.Unit:Lerp(want.Unit, math.min(1, dt * 14))
+				if look.Magnitude > 0.05 then hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + look) end
+			end
+		elseif faceGoal then
+			faceGoal = nil
+			if not hum.AutoRotate then hum.AutoRotate = true end
+		end
+	end)
+	if manual() or not mover.walk then return end
 	local c, hrp, hum = char()
 	if not hrp then return end
 	if mover.walk then
@@ -1372,7 +1391,7 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	lastPosSkip = false
 	if manualInput() then
 		if not manual() then st.manualAt = os.clock() end
-		manualUntil = os.clock() + MANUAL_HOLD
+		manualUntil = os.clock() + 4
 		mover.walk, mover.goal = nil, nil
 		setControls(true)
 		if not hum.AutoRotate then hum.AutoRotate = true end
@@ -2163,10 +2182,14 @@ local function swingNow(c)
 		pcall(function() WeaponAttack:FireServer(combo) end)
 	end
 end
+-- Facing: the old 10 Hz CFrame snap fought Humanoid.AutoRotate (which turns us toward where we walk) -> the body
+-- flicked back and forth while circling a mob ("กระตุก"). Now AutoRotate is off while we face something and the turn
+-- is eased every frame in the walk render step; only a big turn right before a swing still snaps (hitbox is in front).
 local function face(hrp, pos)
 	local dir = flat(pos - hrp.Position)
 	if dir.Magnitude < 0.5 then return end
-	if hrp.CFrame.LookVector:Dot(dir.Unit) < 0.94 then
+	faceGoal, faceUntil = pos, os.clock() + 0.4
+	if hrp.CFrame.LookVector:Dot(dir.Unit) < 0.3 then
 		hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
 	end
 end
@@ -2314,14 +2337,15 @@ task.spawn(function()
 					and (mobPos(t) - hrp.Position).Magnitude > NEAR_R + 20 then t = nil
 				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
 			end
-			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) then t = nil end
+			if st.blocker and not mobAlive(st.blocker) then st.blocker = nil end
+			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) and t ~= st.blocker then t = nil end
 			-- non-lock modes re-check twice a second: a mob that (re)spawned closer / weaker takes over,
 			-- with a margin so two similar mobs don't flip-flop
 			-- a mob we already hurt is finished first: our hits knock it back out of reach, and re-evaluating then
 			-- swapped a half-dead Cobra (177k/300k) for a full one 100 studs away, back and forth
 			local committed = t and mobAlive(t) and mobHp(t) < (tonumber(t:GetAttribute("MaxHealth")) or math.huge) * 0.97
 				and flat(mobPos(t) - hrp.Position).Magnitude < 45
-			if t and not committed and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
+			if t and not committed and t ~= st.blocker and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and os.clock() - (st.reevalAt or 0) > 0.5 then
 				st.reevalAt = os.clock()
 				local cand, candV, pool = pickTarget(hrp)
 				if cand and cand ~= t then
@@ -2451,6 +2475,28 @@ task.spawn(function()
 				lookAt = tp
 				st.status = "หลบท่า"
 			elseif dist > math.max(e.standDist, e.orbitRadius) + 8 then
+				-- an aggressor standing on us while we walk elsewhere: it blocks the way (we pushed into a Chupacabra
+				-- for 12 s, 45 unstick tries, walking to a Specter 265 studs off) and hits our back -> fight it first
+				local blk, bd
+				local folder = AnimalLive:FindFirstChild("Aggressors")
+				for _, m in ipairs(folder and folder:GetChildren() or {}) do
+					if m ~= t and mobAlive(m) then
+						local mp = mobPos(m)
+						-- distance to its body, not its centre: a Med/Large mob is 6-10 studs wide
+						local ok, sz = pcall(function() return m:GetExtentsSize() end)
+						local rad = ok and math.min(math.max(sz.X, sz.Z) / 2, 12) or 2
+						local d = flat(mp - hrp.Position).Magnitude - rad
+						local lethal = (tonumber(m:GetAttribute("Damage")) or 0) >= hum.MaxHealth * 0.9
+						if d <= e.reach + 2 and math.abs(mp.Y - hrp.Position.Y) < 10 and not lethal and (not bd or d < bd) then blk, bd = m, d end
+					end
+				end
+				if blk then
+					st.blocker = blk
+					st.target = blk
+					lockStart = os.clock()
+					log(("%s ขวางทาง/ประชิดตัว → ตีก่อนแล้วค่อยไปต่อ"):format(tostring(blk:GetAttribute("Animal"))))
+					return
+				end
 				lookAt = nil
 				if not aura(c, hrp) then endCombo() end
 				moveTo(e.moveMode == "Walk" and tp or Vector3.new(tp.X, hrp.Position.Y, tp.Z))
@@ -3373,7 +3419,7 @@ end)
 task.spawn(function()
 	while alive() do task.wait(1) end
 	pcall(function() hbConn:Disconnect() end)
-	pcall(function() RunService:UnbindFromRenderStep(WALK_STEP) end)
+	pcall(function() RunService:UnbindFromRenderStep("PolyLootWalk") end)
 	pcall(function() idleConn:Disconnect() end)
 	mover.walk = nil
 	setControls(true)
