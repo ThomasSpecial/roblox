@@ -533,7 +533,7 @@ do
 	end
 
 	-- nearest standable floor to a world point (root-part height, or a mob pivot) within r cells
-	function Nav.snap(m, p, r)
+	function Nav.snap(m, p, r, loose)
 		local ci = math.floor((p.X - m.x0) / CELL + 0.5)
 		local cj = math.floor((p.Z - m.z0) / CELL + 0.5)
 		local best, bi, bj, bl = math.huge
@@ -546,7 +546,7 @@ do
 						local h = m.hts[l][k]
 						if not h then break end
 						local dy = h + 3 - p.Y
-						if dy > -14 and dy < 7 then
+						if (dy > -14 and dy < 7) or (loose and dy > -45 and dy < 30) then
 							local d = di * di + dj * dj + dy * dy * 0.3
 							if d < best then
 								local enter = false
@@ -698,8 +698,12 @@ do
 	-- from / to world points -> {{pos = Vector3, jump = bool}, ...} (first = where we stand) or nil, reason
 	function Nav.plan(m, from, to, partial, yieldFn)
 		local si, sj, sl = Nav.snap(m, from, 3)
+		if not si then si, sj, sl = Nav.snap(m, from, 8) end
 		if not si then return nil, "start-off-map" end
 		local gi, gj, gl = Nav.snap(m, to, 6)
+		-- a goal that isn't standing ground itself (a gather centre in mid-air, a boss on a ledge): nearest floor
+		-- within ~60 studs instead of giving the trip to Roblox Pathfinding
+		if not gi then gi, gj, gl = Nav.snap(m, to, 20, true) end
 		if not gi then return nil, "goal-off-map" end
 		local cells, part = Nav.astar(m, si, sj, sl, gi, gj, gl, partial, yieldFn)
 		if not cells then return nil, "no-path" end
@@ -3551,6 +3555,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	if e.gatherPick == nil then e.gatherPick = true end
 	if e.gatherDefend == nil then e.gatherDefend = false end
 	if e.gatherFar == nil then e.gatherFar = true end
+	if e.gatherReroll == nil then e.gatherReroll = true end
 	if type(e.gatherPrio) ~= "table" then e.gatherPrio = {} end
 	if type(e.craftGoals) ~= "table" then e.craftGoals = {} end
 	if type(e.gatherFarMax) ~= "number" then e.gatherFarMax = 400 end
@@ -3765,6 +3770,26 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 			end
 		end
 		return best, kind
+	end
+
+	-- nothing picked is up: the cheapest ore of ANY kind in the circle (Coal 21 HP, Iron 40): breaking it makes that
+	-- spawn place roll a new ore (a Crystal 5 % of the time). Waiting never rolls anything
+	local function rerollOre(at)
+		if not MC then return nil end
+		local _, hrp = char()
+		if not hrp then return nil end
+		local best, bs
+		for _, o in ipairs(CS:GetTagged(MC.TAG)) do
+			if not bad[o] and not o:GetAttribute(MC.BROKEN_ATTR) then
+				local ok, p = pcall(function() return o:GetPivot().Position end)
+				if ok and flat(p - at).Magnitude <= e.gatherR then
+					local hp = tonumber(o:GetAttribute("Health")) or oreHp(oreKind(o))
+					local score = flat(p - hrp.Position).Magnitude + hp * 0.3
+					if not bs or score < bs then best, bs = o, score end
+				end
+			end
+		end
+		return best
 	end
 
 	-- picked ores / trees inside the circle that are broken / felled right now (they come back: Iron in 14 s)
@@ -4039,6 +4064,16 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 			if hrp then pickup(hrp.Position, 60) end
 		end
 		local node, kind = nextNode(at)
+		if not node and e.gatherReroll and next(e.gatherOres) then
+			local o = rerollOre(at)
+			if o then
+				say(("ยังไม่มี %s เกิด → ขุด %s ให้จุดเกิดสุ่มใหม่"):format(
+					(function() local t = {} for k in pairs(e.gatherPrio) do t[#t + 1] = k end if #t == 0 then for k in pairs(e.gatherOres) do t[#t + 1] = k end end return table.concat(t, "/") end)(),
+					oreKind(o)))
+				mine(o)
+				return
+			end
+		end
 		if not node then
 			-- broken ones in the circle come back soon: wait here instead of walking off
 			local back = regrowing(at)
@@ -4180,6 +4215,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	GL:Toggle({Name = "ในรัศมีไม่มีเลย → ย้ายไปจุดที่มีเยอะสุด (ถ้าแค่หมดชั่วคราว = รอเกิด)", Default = e.gatherFar, Callback = function(v) e.gatherFar = v; sv() end}, "PLGatherFar")
 	GL:Slider({Name = "└ ย้ายจุดได้ไกลสุด (stud)", Default = e.gatherFarMax, Minimum = 100, Maximum = 1500, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.gatherFarMax = v; sv() end}, "PLGatherFarMax")
+	GL:Toggle({Name = "ระหว่างรอแร่ที่เลือก ขุดแร่ก้อนเล็กให้จุดเกิดสุ่มใหม่", Default = e.gatherReroll, Callback = function(v) e.gatherReroll = v; sv() end}, "PLGatherReroll")
 	GL:Toggle({Name = "เก็บของที่ดรอป (ไม้ · แร่ · ผลไม้)", Default = e.gatherPick, Callback = function(v) e.gatherPick = v; sv() end}, "PLGatherPick")
 	GL:Toggle({Name = "สู้กลับมอนที่เข้ามาตีระหว่างเก็บ", Default = e.gatherDefend, Callback = function(v) e.gatherDefend = v; sv() end}, "PLGatherDefend")
 
