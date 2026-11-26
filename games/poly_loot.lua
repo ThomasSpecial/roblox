@@ -459,6 +459,15 @@ do
 		return m
 	end
 
+	-- has the scan tile under p been scanned (not still "0" = never loaded)?
+	function Nav.tileReady(m, p)
+		local i = math.floor((p.X - m.x0) / CELL + 0.5)
+		local j = math.floor((p.Z - m.z0) / CELL + 0.5)
+		if i < 0 or j < 0 or i >= m.w or j >= m.h then return false end
+		local t = (j // TILE) * m.tx + i // TILE + 1
+		return (m.tiles[t] or "0") ~= "0"
+	end
+
 	function Nav.inside(m, p)
 		local i = math.floor((p.X - m.x0) / CELL + 0.5)
 		local j = math.floor((p.Z - m.z0) / CELL + 0.5)
@@ -941,7 +950,14 @@ do
 						end)
 						local ts = os.clock()
 						while not streamed and os.clock() - ts < 8 do task.wait(0.1) end
-						if not streamed then streamStuck = true end
+						if not streamed then
+							-- the request is stuck and blocks the queue: give it time to come back, then keep streaming
+							-- (giving up at once left 73/288 tiles of the whole-island map unscanned)
+							say(("สแกนพื้น %d/%d · รอโหลดพื้นที่"):format(t, total))
+							local ts2 = os.clock()
+							while not streamed and os.clock() - ts2 < 30 do task.wait(0.2) end
+							if not streamed then streamStuck = true end
+						end
 					end
 					if opts.alive and not opts.alive() then error("cancelled") end
 					say(("สแกนพื้น %d/%d"):format(t, total))
@@ -1046,6 +1062,10 @@ local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 -- its own map file; the one we stand in is navMap. A region without a file is scanned once in the background.
 local NAVR = {
 	regions = {
+		-- the whole island in two big maps (200-stud overlap at x 1100..1300): no seams through the jungle / volcano
+		-- pass any more. The older partial maps below only answer for spots these don't cover.
+		{name = "west", bounds = {x0 = -950, z0 = -3800, x1 = 1300, z1 = 700, top = 420, bot = 30}},
+		{name = "east", bounds = {x0 = 1100, z0 = -3800, x1 = 3550, z1 = 700, top = 420, bot = 30}},
 		{name = "main"},
 		-- reaches up to Jungle Village: the only way up the volcano is a pass around x 300-390 that the first
 		-- (z <= -2300) map cut off, so plans ended against the mountain wall at (11, -2366)
@@ -1092,28 +1112,88 @@ st.navScanRegion = function(name)
 	end
 	return false
 end
-local function getNav(goal)
-	local _, hrp = char()
-	local r = hrp and NAVR.at(hrp.Position, goal)
-	if not r then navMap = nil return nil end   -- outside every map: Pathfinding
+-- scan several regions one after the other (background)
+st.navScanAll = function(names, fillOnly)
+	task.spawn(function()
+		for _, n in ipairs(names) do
+			for _, r in ipairs(NAVR.regions) do
+				if r.name == n then
+					while st.navScanning and alive() do task.wait(1) end
+					if not alive() then return end
+					NAVR.tried[n] = true
+					if not (fillOnly and (Nav.maps[n] or Nav.load(n))) then NAVR.scan(r) end
+					-- then re-scan only the parts that are still missing (far tiles whose streaming timed out), while
+					-- that keeps finding more
+					local last = math.huge
+					for pass = 1, 4 do
+						local m = Nav.maps[n]
+						if not (m and alive()) then break end
+						local miss = Nav.tileCounts(m)["0"] or 0
+						if miss == 0 or miss >= last then break end
+						last = miss
+						st.navScanning = true
+						local m2, info = Nav.scan({name = n, bounds = r.bounds, missingOnly = true, alive = alive,
+							onStatus = function(t) st.navWhy = ("[%s เติมรอบ %d] %s"):format(n, pass, t) end})
+						st.navScanning = false
+						log(("NavMap %s เติมส่วนที่ขาด รอบ %d: %s"):format(n, pass, tostring(info)))
+						if m2 then Nav.maps[n] = m2 end
+					end
+				end
+			end
+		end
+	end)
+end
+function NAVR.load(r)
 	local m = Nav.maps[r.name]
 	if not m and not NAVR.tried[r.name] then
 		NAVR.tried[r.name] = true
 		local ok, mm = pcall(Nav.load, r.name)
 		if ok and mm then m = mm end
-		if not m then
-			-- no map for this region yet: scan it once in the background (1-2 min), Pathfinding meanwhile
+	end
+	return m
+end
+local function getNav(goal)
+	local _, hrp = char()
+	if not hrp then return navMap end
+	local p = hrp.Position
+	-- 1) the first map (whole-island maps come first) that has REALLY scanned the ground under us and under the
+	--    goal: the big maps still miss the volcano centre / Dark Forest (too heavy to stream from afar), the
+	--    smaller maps scanned while standing there have them
+	local pick, pickR
+	for _, r in ipairs(NAVR.regions) do
+		local b = r.bounds or Nav.BOUNDS
+		if inB(b, p) and (not goal or inB(b, goal)) then
+			local m = NAVR.load(r)
+			if m and Nav.tileReady(m, p) and (not goal or Nav.tileReady(m, goal)) then pick, pickR = m, r break end
+		end
+	end
+	-- 2) else the region rule (holds both / closest edge toward the goal), scanning it if it has no file yet
+	if not pick then
+		local r = NAVR.at(p, goal)
+		if not r then navMap = nil return nil end   -- outside every map: Pathfinding
+		local m = NAVR.load(r)
+		if not m and not st.navScanning then
 			task.spawn(function()
 				task.wait(5)
 				log(("NavMap: ยังไม่มีแผนที่พื้นที่ %s → สแกนเบื้องหลัง"):format(r.name))
 				NAVR.scan(r)
 			end)
 		end
+		if not m then
+			for _, r2 in ipairs(NAVR.regions) do
+				local b = r2.bounds or Nav.BOUNDS
+				if r2 ~= r and inB(b, p) then
+					local m2 = NAVR.load(r2)
+					if m2 then m, r = m2, r2 break end
+				end
+			end
+		end
+		pick, pickR = m, r
 	end
-	if m ~= navMap then path.wps = nil end
-	navMap = m
-	st.navRegion = r.name
-	return m
+	if pick ~= navMap then path.wps = nil end
+	navMap = pick
+	st.navRegion = pickR and pickR.name
+	return pick
 end
 -- StreamingEnabled: parts of the map far from us weren't loaded during the scan. Every 8 s the unknown tiles within
 -- ~400 studs (streamed in now) are scanned into the map; the file is re-saved at most once a minute.
@@ -1130,6 +1210,17 @@ task.spawn(function()
 				log(("NavMap: พื้นในแผนที่ไม่ตรงของจริง %d ส่วน -> สแกนใหม่"):format(stale))
 			end
 			local n = Nav.fillNear(m, hrp.Position, 2, function() task.wait() end)
+			for _, big in ipairs({"west", "east"}) do
+				local bm = Nav.maps[big]
+				if bm and bm ~= m and Nav.inside(bm, hrp.Position) then
+					local nb = Nav.fillNear(bm, hrp.Position, 2, function() task.wait() end)
+					if nb > 0 then
+						st.navFilled = (st.navFilled or 0) + nb
+						st.bigDirty = (st.bigDirty or 0) + nb
+						if os.clock() - (st.bigSaveAt or 0) > 60 then st.bigSaveAt = os.clock(); pcall(Nav.save, bm); st.bigDirty = 0 end
+					end
+				end
+			end
 			if n > 0 then
 				dirty += n
 				st.navFilled = (st.navFilled or 0) + n
@@ -4492,7 +4583,10 @@ task.spawn(function()
 		pcall(function() navLbl:UpdateName(navText()) end)
 	end
 end)
-M:Button({Name = "สแกน NavMap ใหม่ (พื้นที่ที่ยืนอยู่: main / volcano / beach)", Callback = function()
+M:Button({Name = "สแกน NavMap ทั้งเกาะใหม่ (west + east · ~5-6 นาที เบื้องหลัง)", Callback = function()
+	st.navScanAll({"west", "east"})
+end})
+M:Button({Name = "สแกน NavMap ใหม่ (เฉพาะพื้นที่ที่ยืนอยู่)", Callback = function()
 	local _, hrp = char()
 	local r = hrp and NAVR.at(hrp.Position)
 	if not r then log("ตรงนี้อยู่นอกทุกพื้นที่ของ NavMap") return end
