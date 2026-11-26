@@ -3186,6 +3186,41 @@ task.spawn(function()
 					end
 				end
 			end
+			-- the World Map knows every boss everywhere: Map_Engine.Landmarks = Vector3Values (position) with Boss=true,
+			-- BossAlive, BossRespawnAt (server epoch); Id = the boss name without spaces ("InfernoRex")
+			pcall(function()
+				local lm = RS.Map_Engine:FindFirstChild("Landmarks")
+				if not lm then return end
+				if not st.bossIdMap then
+					st.bossIdMap = {}
+					pcall(function()
+						for _, n in ipairs(AnimalCfg.AnimalNames()) do
+							local d = AnimalCfg.Get(n)
+							if type(d) == "table" and d.Tier == "Boss" then st.bossIdMap[(n:gsub("%s", ""))] = n end
+						end
+					end)
+				end
+				for _, v in ipairs(lm:GetChildren()) do
+					if v:GetAttribute("Boss") == true and v:IsA("Vector3Value") then
+						local id = tostring(v:GetAttribute("Id") or v.Name:gsub("_%d+$", ""))
+						local kind = st.bossIdMap[id] or st.bossIdMap[(tostring(v:GetAttribute("Name") or ""):gsub("%s", ""))]
+						if kind then
+							local at = tonumber(v:GetAttribute("BossRespawnAt")) or 0
+							local up = v:GetAttribute("BossAlive") == true
+							local p = v.Value
+							local pos = {math.floor(p.X), math.floor(p.Y), math.floor(p.Z)}
+							local old = e.bossTimes[kind]
+							if not old or old.at ~= at or old.alive ~= up then
+								e.bossTimes[kind] = {at = at, alive = up, seen = now, src = "map", pos = pos}
+								changed = true
+							else
+								old.seen = now
+								if not old.pos then old.pos = pos; changed = true end
+							end
+						end
+					end
+				end
+			end)
 			-- live boss models in range of streaming
 			local liveNow = {}
 			for _, f in ipairs({"Aggressors", "Passives"}) do
