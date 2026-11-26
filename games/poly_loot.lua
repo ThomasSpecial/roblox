@@ -2679,6 +2679,45 @@ task.spawn(function()
 			if dist < 30 then st.fightUntil = os.clock() + 2 end
 			local dy = math.abs(tp.Y - hrp.Position.Y)
 			if dy > 8 then dist = math.max(dist, math.max(e.standDist, e.orbitRadius) + 9 + dy) end
+			-- low HP: never walk into a NEW fight. Burst mode doesn't retreat, so at 8 % we walked into the next Pyrolisk
+			-- and at 5 % into TripleCobra (2 deaths in 3 min). Regen is ~1 %/s out of combat -> rest out of aggro range
+			-- until resumeAt. A mob we're already hitting (hurt + in reach) gets finished.
+			if e.retreat then
+				local hp = math.floor(hpPct())
+				if hp >= e.resumeAt then
+					st.resting = nil
+				elseif st.resting and os.clock() - st.resting > 90 then
+					st.resting, st.restOff = nil, os.clock() + 60   -- no regen for some reason: don't stand here forever
+				elseif hp <= e.retreatAt and not st.resting and os.clock() > (st.restOff or 0) then
+					st.resting = os.clock()
+					log(("เลือดเหลือ %d%% → พักรอเลือด %d%% ก่อนตีตัวต่อไป"):format(hp, e.resumeAt))
+				end
+				if st.resting and not ((e.usePotion or e.useFood) and healAvailable()) then
+					local hurt = mobHp(t) < (tonumber(t:GetAttribute("MaxHealth")) or math.huge) * 0.97
+					if not (hurt and flat(tp - hrp.Position).Magnitude <= e.reach + 4) then
+						endCombo(); lookAt = nil
+						-- don't let the progress watchdogs count the rest as "stuck" (they'd skip the boss for 2 min)
+						st.tprog, st.travelProg, noProg.t = nil, nil, nil
+						local away, n = Vector3.zero, 0
+						local folder = AnimalLive:FindFirstChild("Aggressors")
+						for _, m in ipairs(folder and folder:GetChildren() or {}) do
+							if mobAlive(m) then
+								local v = flat(hrp.Position - mobPos(m))
+								if v.Magnitude > 0.1 and v.Magnitude < 70 then away += v.Unit * (70 - v.Magnitude); n += 1 end
+							end
+						end
+						if inHealZone() then
+							moveTo(healZone.c)
+						elseif n > 0 and away.Magnitude > 0.1 then
+							moveTo(hrp.Position + away.Unit * 30)
+						else
+							stopMove()
+						end
+						st.status = ("พักรอเลือด %d%% → %d%% (ไม่เข้าตีตอนเลือดน้อย)"):format(hp, e.resumeAt)
+						return
+					end
+				end
+			end
 			-- in reach but its HP doesn't move for 8 s -> we can't actually hit it: skip it for 45 s
 			do
 				local h = mobHp(t)
