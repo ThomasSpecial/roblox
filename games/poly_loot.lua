@@ -1312,10 +1312,10 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	do
 		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
 		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
-		local want = (e.farm and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
+		local want = ((e.farm or st.bossActive) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
 		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
 		-- Cancel it only, so we run at the normal 20, never faster than a player can
-		if e.farm and os.clock() < (st.evadeUntil or 0) then
+		if (e.farm or st.bossActive) and os.clock() < (st.evadeUntil or 0) then
 			local sw = tonumber(hum:GetAttribute("_WSMultC_WeaponSwing")) or 1
 			want = sw > 0 and sw < 1 and math.min(1 / sw, 2) or nil
 		end
@@ -2190,23 +2190,44 @@ task.spawn(function()
 					return
 				end
 			end
-			if not e.farm then
+			-- Auto Boss on its own (Auto Farm off): fight only a picked boss that is up in range, otherwise hands off
+			local bossOnly = not e.farm and e.bossHunt and next(e.bossPick) ~= nil
+			local bossNow
+			if bossOnly and not st.extBusy then
+				local _, bh = char()
+				bossNow = bh and bossTarget(bh)
+			end
+			if not e.farm and not bossNow then
 				-- a helper script (quest runner) is driving the character through st.api: hands off
 				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
+				st.bossActive = false
+				if bossOnly and st.target and not mobAlive(st.target) then
+					st.kills += 1
+					log(("ฆ่าบอส %s (รวม %d)"):format(tostring(st.target:GetAttribute("Animal")), st.kills))
+				end
 				if st.target then st.target = nil; lookAt = nil; endCombo(); stopMove() end
 				-- check the real ControlModule state, not just our flag: a respawn / rejoin / older copy of the script can
 				-- leave it disabled while controlsOff says false -> the player can't walk ("ขาแข็ง")
 				local ctlDead = false
-				pcall(function() ctlDead = Controls and Controls.activeController and Controls.activeController.enabled == false end)
-				if (controlsOff or ctlDead) and not (e.lootAlways and mover.walk) then
+				-- (riding a mount the game may switch its own controller off: leave that alone)
+				pcall(function() ctlDead = Controls and Controls.activeController and Controls.activeController.enabled == false
+					and plr.Character and plr.Character:GetAttribute("Mounted") ~= true end)
+				if (controlsOff or ctlDead) and not ((e.lootAlways or (bossOnly and e.loot)) and mover.walk) then
 					mover.walk = nil
 					controlsOff = true
 					setControls(true)
 				end
 				local _, hrp, hum = char()
 				if hum and not hum.AutoRotate then hum.AutoRotate = true end
-				st.status = "ปิดอยู่"
-				if hrp and e.lootAlways then lootStep(hrp) end
+				if bossOnly then
+					local names = {}
+					for k in pairs(e.bossPick) do names[#names + 1] = k end
+					table.sort(names)
+					st.status = ("Auto Boss: รอบอสเกิด (%s · ระยะ %d)"):format(table.concat(names, ", "), e.bossRange)
+				else
+					st.status = "ปิดอยู่"
+				end
+				if hrp and (e.lootAlways or (bossOnly and e.loot)) then lootStep(hrp) end
 				return
 			end
 			local c, hrp, hum = char()
@@ -2273,13 +2294,14 @@ task.spawn(function()
 				end
 			end
 			end -- boss
-			if not t then
+			if not t and e.farm then
 				t = pickTarget(hrp)
 				if t then lockStart = os.clock(); log(("ล็อก %s/%s HP %s"):format(tostring(t:GetAttribute("Animal")), tostring(t:GetAttribute("Tier")), tostring(t:GetAttribute("Health")))) end
 			end
 			st.target = t
 			if not t then
 				endCombo(); lookAt = nil
+				if not e.farm then stopMove(); return end
 				if anchor and flat(anchor - hrp.Position).Magnitude > 12 then
 					-- nothing to hit near the farm spot from here (e.g. just respawned in town): walk back
 					if not aura(c, hrp) then endCombo() end
@@ -2534,7 +2556,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.25)
 		-- while a regeneration item works, eat again only in an emergency
-		if e.farm and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
+		if (e.farm or st.bossActive) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
 			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= 25) then
 			pcall(useHeal)
 		end
@@ -2791,7 +2813,7 @@ local logLbl = Rt:Label({Text = "-"})
 local BossTab = TG:Tab({Name = "Boss", Image = "rbxassetid://10723346959"})
 local B = BossTab:Section({Side = "Left"})
 B:Header({Text = "ล่าบอส"})
-B:Toggle({Name = "บอสเกิด → ไปตีบอสก่อน แล้วกลับมาฟาร์มต่อ", Default = e.bossHunt, Callback = function(v) e.bossHunt = v; sv() end}, "PLBossHunt")
+B:Toggle({Name = "Auto Boss (เปิดคู่ Auto Farm = ตีบอสก่อนแล้วฟาร์มต่อ · เปิดอย่างเดียว = ตีแต่บอส)", Default = e.bossHunt, Callback = function(v) e.bossHunt = v; sv() end}, "PLBossHunt")
 local bossDrop = B:Dropdown({Name = "└ บอสที่จะไปตี (ต้องเลือกชื่อ)", Multi = true, Required = false, Search = true, Options = bossKinds(),
 	Default = (function() local d = {} for k in pairs(e.bossPick) do d[#d + 1] = k end return d end)(),
 	Callback = function(v)
