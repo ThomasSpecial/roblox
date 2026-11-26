@@ -1196,8 +1196,17 @@ local function walkTo(hrp, hum, goal)
 	end
 	local target = goal
 	if not direct and path.wps then
+		-- riding (~70 studs/s) a 2.5-stud "reached" circle is overshot every tick -> the mount swung back and forth
+		-- around one waypoint. Mounted: reached at 12 studs, and jump to the furthest waypoint already that close
+		local mounted = hrp.Parent and hrp.Parent:GetAttribute("Mounted") == true
+		local reachR = mounted and 12 or 2.5
+		if mounted then
+			for j = math.min(#path.wps, path.i + 6), path.i + 1, -1 do
+				if flat(path.wps[j].Position - hrp.Position).Magnitude < reachR then path.i = j break end
+			end
+		end
 		local w = path.wps[path.i]
-		while w and flat(w.Position - hrp.Position).Magnitude < 2.5 do
+		while w and flat(w.Position - hrp.Position).Magnitude < reachR do
 			path.i += 1
 			w = path.wps[path.i]
 		end
@@ -1289,7 +1298,8 @@ local function followRoute(hrp, hum)
 		routeI = best
 	end
 	local q = r.pts[routeI]
-	while q and flat(Vector3.new(q[1], q[2], q[3]) - p).Magnitude < 3 do
+	local reachR = hrp.Parent and hrp.Parent:GetAttribute("Mounted") == true and 12 or 3   -- riding overshoots 3 studs
+	while q and flat(Vector3.new(q[1], q[2], q[3]) - p).Magnitude < reachR do
 		routeI += 1
 		q = r.pts[routeI]
 	end
