@@ -321,12 +321,46 @@ local controlsOff = false
 -- a respawn brings the ControlModule back (it zeroes Humanoid:Move every frame) -> disable it again next walk
 plr.CharacterAdded:Connect(function() controlsOff = false end)
 local controlsAt = 0
-local function setControls(on)
-	if not Controls then return end
-	-- "off" is re-asserted every 2 s: a respawn or an older copy of this script unloading can switch it back on
-	if controlsOff == not on and (on or os.clock() - controlsAt < 2) then return end
-	controlsOff, controlsAt = not on, os.clock()
-	pcall(function() if on then Controls:Enable() else Controls:Disable() end end)
+-- Manual override. Walk mode switches the game's ControlModule off (it zeroes Humanoid:Move every frame), so while the
+-- bot drove, the player's own keys did nothing ("ขาแข็ง"). Now any movement key / left stick = the player takes over:
+-- controls on at once, the bot stops steering until MANUAL_HOLD s after the last input.
+local UIS = game:GetService("UserInputService")
+local MOVE_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
+local MANUAL_HOLD = 4
+local manualUntil = 0
+local function manualInput()
+	if UIS:GetFocusedTextBox() then return false end
+	local okV, mv = pcall(function() return Controls and Controls:GetMoveVector() end)
+	if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then return true end
+	for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
+	for _, gp in ipairs(UIS:GetConnectedGamepads()) do
+		for _, s in ipairs(UIS:GetGamepadState(gp)) do
+			if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.35 then return true end
+		end
+	end
+	return false
+end
+local function manual() return os.clock() < manualUntil end
+local function mountedNow()
+	local c = plr.Character
+	return c ~= nil and c:GetAttribute("Mounted") == true
+end
+local function ctlEnabled()
+	local ok, v = pcall(function() return Controls.activeController == nil or Controls.activeController.enabled ~= false end)
+	return not ok or v
+end
+-- The ControlModule is never switched off any more (that was the "ขาแข็ง": keys dead while the bot walked, and stuck
+-- dead after a respawn / rejoin / old copy unloading). Our walking runs in a render step bound right AFTER the
+-- ControlModule's own step, so our Humanoid:Move wins the frame while the player's keys stay live.
+-- setControls(...) is kept for helper scripts; any call only repairs a ControlModule that something else left off.
+local function setControls(_)
+	if not Controls or os.clock() - controlsAt < 0.5 then return end
+	controlsAt = os.clock()
+	if controlsOff or (not ctlEnabled() and not mountedNow()) then
+		controlsOff = false
+		pcall(function() Controls:Enable() end)
+	end
 end
 -- [NAV BEGIN] generated from polyloot_nav.lua by sync_plnav.py -- edit that file, not this block
 local Nav = (function()
@@ -1299,28 +1333,13 @@ local lookAt = nil   -- position the character keeps facing while farming
 local rp = RaycastParams.new()
 rp.FilterType = Enum.RaycastFilterType.Exclude
 local lastPos
-local hbConn = RunService.Heartbeat:Connect(function(dt)
-	if not alive() then return end
+-- walking: after the ControlModule's render step (Input priority) so its Move(zero) doesn't cancel ours
+local WALK_STEP = "PolyLootWalk"
+pcall(function() RunService:UnbindFromRenderStep(WALK_STEP) end)
+RunService:BindToRenderStep(WALK_STEP, Enum.RenderPriority.Character.Value + 5, function()
+	if not alive() or manual() or not mover.walk then return end
 	local c, hrp, hum = char()
-	if not hrp then lastPos = nil return end
-	-- snap-back counter (the server pulled us somewhere we did not go)
-	if lastPos and (hrp.Position - lastPos).Magnitude > 20 and not (mover.goal and mover.mode == "tp") and not lastPosSkip then
-		st.snaps += 1
-	end
-	if not lastPosSkip then pcall(trailTick, hrp, hum) end
-	lastPosSkip = false
-	do
-		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
-		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
-		local want = ((e.farm or st.bossActive) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
-		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
-		-- Cancel it only, so we run at the normal 20, never faster than a player can
-		if (e.farm or st.bossActive) and os.clock() < (st.evadeUntil or 0) then
-			local sw = tonumber(hum:GetAttribute("_WSMultC_WeaponSwing")) or 1
-			want = sw > 0 and sw < 1 and math.min(1 / sw, 2) or nil
-		end
-		if hum:GetAttribute("_WSMultC_PolyLoot") ~= want then hum:SetAttribute("_WSMultC_PolyLoot", want) end
-	end
+	if not hrp then return end
 	if mover.walk then
 		local d = flat(mover.walk - hrp.Position)
 		if d.Magnitude > 0.8 then
@@ -1339,6 +1358,41 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 		else
 			hum:Move(Vector3.zero)
 		end
+	end
+end)
+local hbConn = RunService.Heartbeat:Connect(function(dt)
+	if not alive() then return end
+	local c, hrp, hum = char()
+	if not hrp then lastPos = nil return end
+	-- snap-back counter (the server pulled us somewhere we did not go)
+	if lastPos and (hrp.Position - lastPos).Magnitude > 20 and not (mover.goal and mover.mode == "tp") and not lastPosSkip then
+		st.snaps += 1
+	end
+	if not lastPosSkip then pcall(trailTick, hrp, hum) end
+	lastPosSkip = false
+	if manualInput() then
+		if not manual() then st.manualAt = os.clock() end
+		manualUntil = os.clock() + MANUAL_HOLD
+		mover.walk, mover.goal = nil, nil
+		setControls(true)
+		if not hum.AutoRotate then hum.AutoRotate = true end
+	end
+	if manual() then
+		mover.walk, mover.goal = nil, nil
+		lastPos = hrp.Position
+		return
+	end
+	do
+		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
+		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
+		local want = ((e.farm or st.bossActive) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
+		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
+		-- Cancel it only, so we run at the normal 20, never faster than a player can
+		if (e.farm or st.bossActive) and os.clock() < (st.evadeUntil or 0) then
+			local sw = tonumber(hum:GetAttribute("_WSMultC_WeaponSwing")) or 1
+			want = sw > 0 and sw < 1 and math.min(1 / sw, 2) or nil
+		end
+		if hum:GetAttribute("_WSMultC_PolyLoot") ~= want then hum:SetAttribute("_WSMultC_PolyLoot", want) end
 	end
 	if mover.goal then
 		local goal = mover.goal
@@ -2141,6 +2195,15 @@ task.spawn(function()
 	while alive() do
 		local dt = 0.1
 		local ok, err = pcall(function()
+			if manual() then
+				backtrack.i = nil
+				if st.target or path.wps then st.target = nil; lookAt = nil; endCombo(); path.wps = nil end
+				setControls(true)
+				local _, _, hum = char()
+				if hum and not hum.AutoRotate then hum.AutoRotate = true end
+				st.status = ("คุณบังคับเดินเอง · บอทพัก (ต่อเองใน %.0f วิหลังปล่อยปุ่ม)"):format(math.max(0, manualUntil - os.clock()))
+				return
+			end
 			if backtrack.i and os.clock() < backtrack.untilT then
 				local c, hrp, hum = char()
 				if not hrp then backtrack.i = nil return end
@@ -2208,13 +2271,8 @@ task.spawn(function()
 				if st.target then st.target = nil; lookAt = nil; endCombo(); stopMove() end
 				-- check the real ControlModule state, not just our flag: a respawn / rejoin / older copy of the script can
 				-- leave it disabled while controlsOff says false -> the player can't walk ("ขาแข็ง")
-				local ctlDead = false
-				-- (riding a mount the game may switch its own controller off: leave that alone)
-				pcall(function() ctlDead = Controls and Controls.activeController and Controls.activeController.enabled == false
-					and plr.Character and plr.Character:GetAttribute("Mounted") ~= true end)
-				if (controlsOff or ctlDead) and not ((e.lootAlways or (bossOnly and e.loot)) and mover.walk) then
-					mover.walk = nil
-					controlsOff = true
+				if not ((e.lootAlways or (bossOnly and e.loot)) and mover.walk) then
+					if controlsOff then mover.walk = nil end
 					setControls(true)
 				end
 				local _, hrp, hum = char()
@@ -2617,7 +2675,7 @@ task.spawn(function()
 		pcall(function()
 			local now = os.clock()
 			if st.kills ~= wd.kills then wd.kills, wd.killAt = st.kills, now end
-			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive then
+			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive or manual() then
 				wd.best, wd.at = nil, now
 				if not e.farm then wd.killAt = now end
 				return
@@ -3315,6 +3373,7 @@ end)
 task.spawn(function()
 	while alive() do task.wait(1) end
 	pcall(function() hbConn:Disconnect() end)
+	pcall(function() RunService:UnbindFromRenderStep(WALK_STEP) end)
 	pcall(function() idleConn:Disconnect() end)
 	mover.walk = nil
 	setControls(true)
