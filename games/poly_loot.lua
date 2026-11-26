@@ -143,7 +143,28 @@ end
 local function mobAlive(m)
 	return m and m.Parent and (tonumber(m:GetAttribute("Health")) or 0) > 0
 end
-local function mobPos(m) return m:GetPivot().Position end
+-- where the SERVER has the mob: the motion attributes (_MoveStartPos/_MoveTargetPos/_MoveStartTime/_MoveSpeed/_State),
+-- same as the weapon Hitbox module. The client model can lag far behind (Skullcrab's model stood 12.6 studs from its
+-- real spot, Cursed Owl leaps at speed 80): we faced and swung at the model and never landed a hit on a boss
+local mobPos
+do
+	local MS
+	pcall(function() MS = require(RS:WaitForChild("Animal_Engine"):WaitForChild("MotionSnapshot")) end)
+	mobPos = function(m)
+		if MS then
+			local ok, p = pcall(MS.ReadPosition, m)
+			if ok and typeof(p) == "Vector3" then return p end
+		end
+		return m:GetPivot().Position
+	end
+	st.mobCF = function(m)
+		if MS then
+			local ok, cf = pcall(MS.ReadCFrame, m)
+			if ok and typeof(cf) == "CFrame" then return cf end
+		end
+		return m:GetPivot()
+	end
+end
 local function mobKinds()
 	local seen, list = {}, {}
 	for _, f in ipairs({"Aggressors", "Passives"}) do
@@ -269,7 +290,7 @@ local function bossTarget(hrp)
 	-- keep the boss we already went for: re-deciding every tick at the edge of bossRange flipped boss <-> gathering
 	local lk = st.bossLock
 	if lk and mobAlive(lk) and e.bossPick[tostring(lk:GetAttribute("Animal") or "?")] then
-		local ok, p = pcall(function() return lk:GetPivot().Position end)
+		local ok, p = pcall(function() return mobPos(lk) end)
 		if ok and (p - hrp.Position).Magnitude <= e.bossRange + 250 then return lk end
 	end
 	st.bossLock = nil
@@ -296,7 +317,7 @@ bossTargetScan = function(hrp)
 						tostring(m:GetAttribute("Damage")), hum.MaxHealth))
 				end
 				if e.bossPick[kind] and not lethal and not ((skipUntil[m] or 0) > os.clock()) then
-					local ok, p = pcall(function() return m:GetPivot().Position end)
+					local ok, p = pcall(function() return mobPos(m) end)
 					if ok then
 						local d = (p - hrp.Position).Magnitude
 						local da = anchor and flat(p - anchor).Magnitude or d
@@ -1656,7 +1677,7 @@ local function telegraphDamage(p)
 	local best, bd
 	local folder = AnimalLive:FindFirstChild("Aggressors")
 	for _, m in ipairs(folder and folder:GetChildren() or {}) do
-		local ok, pos = pcall(function() return m:GetPivot().Position end)
+		local ok, pos = pcall(function() return mobPos(m) end)
 		if ok then
 			local d = (pos - p.Position).Magnitude
 			if d < 20 and (not bd or d < bd) then best, bd = m, d end
@@ -1871,7 +1892,7 @@ local function fitAnchor()
 		local folder = AnimalLive:FindFirstChild(f)
 		for _, m in ipairs(folder and folder:GetChildren() or {}) do
 			if wanted(m) and (f == "Aggressors" or e.passives) then
-				local ok, p = pcall(function() return m:GetPivot().Position end)
+				local ok, p = pcall(function() return mobPos(m) end)
 				if ok then
 					if flat(p - a).Magnitude <= e.anchorR then return end   -- spot still has picked mobs
 					pts[#pts + 1] = p
@@ -2248,7 +2269,7 @@ task.spawn(function()
 				local stt = m:GetAttribute("_State")
 				local rec = mobState[m]
 				if stt == "ATTACK" or rec then
-					local ok, pos = pcall(function() return m:GetPivot().Position end)
+					local ok, pos = pcall(function() return mobPos(m) end)
 					if ok and (pos - hrp.Position).Magnitude < 45 then
 						if not rec then rec = {}; mobState[m] = rec end
 						if stt ~= rec.state then
@@ -2415,7 +2436,7 @@ local function aura(c, hrp)
 	local folder = AnimalLive:FindFirstChild("Aggressors")
 	for _, m in ipairs(folder and folder:GetChildren() or {}) do
 		if mobAlive(m) then
-			local ok, pos = pcall(function() return m:GetPivot().Position end)
+			local ok, pos = pcall(function() return mobPos(m) end)
 			if ok and flat(pos - hrp.Position).Magnitude <= e.reach and math.abs(pos.Y - hrp.Position.Y) < 12 then
 				st.fightUntil = os.clock() + 2
 				if ensureWeapon() then face(hrp, pos); swingNow(c) end
@@ -2684,20 +2705,33 @@ task.spawn(function()
 			-- until resumeAt. A mob we're already hitting (hurt + in reach) gets finished.
 			if e.retreat then
 				local hp = math.floor(hpPct())
-				-- aggressors around us (Pyrolisk: aggro 46, chases at 1.6x up to leash 110) + the last spot with none near
+				-- aggressors that can reach us: each species' own max(AttackRange, AggroRadius) + 20 (Pyrolisk 66, TripleCobra /
+				-- Skullcrab 280 -- we rested 82 studs from TripleCobra and it shot us dead) + the last spot none of them covers
 				local away, n = Vector3.zero, 0
 				do
-					local nearest = math.huge
+					local safe = true
+					st.threatR = st.threatR or {}
 					local folder = AnimalLive:FindFirstChild("Aggressors")
 					for _, m in ipairs(folder and folder:GetChildren() or {}) do
 						if mobAlive(m) then
+							local kind = tostring(m:GetAttribute("Animal"))
+							local R = st.threatR[kind]
+							if not R then
+								R = 66
+								pcall(function()
+									local cfg = AnimalCfg.Get(kind)
+									R = math.max(66, (tonumber(cfg.AttackRange) or 0) + 20, (tonumber(cfg.AggroRadius) or 0) + 20)
+								end)
+								st.threatR[kind] = R
+							end
 							local v = flat(hrp.Position - mobPos(m))
-							nearest = math.min(nearest, v.Magnitude)
-							if v.Magnitude > 0.1 and v.Magnitude < 80 then away += v.Unit * (80 - v.Magnitude); n += 1 end
+							if v.Magnitude < R then
+								safe = false
+								if v.Magnitude > 0.1 then away += v.Unit * ((R - v.Magnitude) / R); n += 1 end
+							end
 						end
 					end
-					-- 60 = past Pyrolisk aggro (46) / mortar (44) range; the volcano is too packed for anything farther
-					if nearest > 60 and hum.FloorMaterial ~= Enum.Material.Air then st.safeSpot = hrp.Position end
+					if safe and hum.FloorMaterial ~= Enum.Material.Air then st.safeSpot = hrp.Position end
 				end
 				if hp >= e.resumeAt then
 					st.resting = nil
@@ -2713,7 +2747,7 @@ task.spawn(function()
 						endCombo(); lookAt = nil
 						-- don't let the progress watchdogs count the rest as "stuck" (they'd skip the boss for 2 min)
 						st.tprog, st.travelProg, noProg.t = nil, nil, nil
-						-- back to the last spot with no aggressor within 60 (stepping straight away pinned us on a wall at
+						-- back to the last spot out of every aggressor's reach (stepping straight away pinned us on a wall at
 						-- 1 % while a Pyrolisk kept hitting); nav walks the way we came. Already there and still chased ->
 						-- step away from them
 						local sp = st.safeSpot
@@ -2913,7 +2947,7 @@ task.spawn(function()
 					local r = phase < 2 and e.standDist or e.standDist + 10
 					moveTo(tp + away * r)
 				else -- ยืนหลังมอน (Behind)
-					local look = t:GetPivot().LookVector
+					local look = st.mobCF(t).LookVector
 					local goal = tp - flat(look).Unit * e.standDist
 					if flat(goal - hrp.Position).Magnitude > 1.5 then moveTo(Vector3.new(goal.X, hrp.Position.Y, goal.Z)) end
 				end
@@ -3053,7 +3087,7 @@ local function bindDeath(c)
 		local around = {}
 		for m, rec in pairs(mobState) do
 			if m.Parent and hrp then
-				local ok, pos = pcall(function() return m:GetPivot().Position end)
+				local ok, pos = pcall(function() return mobPos(m) end)
 				if ok and (pos - hrp.Position).Magnitude < 25 then
 					around[#around + 1] = ("%s(%s)"):format(tostring(m:GetAttribute("Animal")), tostring(rec.state))
 				end
@@ -3466,7 +3500,7 @@ task.spawn(function()
 					if m:GetAttribute("Tier") == "Boss" and mobAlive(m) then
 						local kind = tostring(m:GetAttribute("Animal") or "?")
 						liveNow[kind] = m
-						local okP, bp = pcall(function() return m:GetPivot().Position end)
+						local okP, bp = pcall(function() return mobPos(m) end)
 						bossLive[kind] = {m = m, seen = os.clock(), pos = okP and bp or (bossLive[kind] and bossLive[kind].pos)}
 					end
 				end
@@ -4476,7 +4510,7 @@ end)()
 		end
 		local held = c:FindFirstChildOfClass("Tool")
 		if map then
-			if held ~= map then pcall(function() hum:EquipTool(map) end) task.wait(0.4) end
+			if held ~= map then pcall(function() hum:EquipTool(map) end) end
 		else
 			pcall(function() InvRemotes.EquipRequest:FireServer(mapSerial) end)
 			for _ = 1, 15 do
@@ -4486,18 +4520,30 @@ end)()
 			end
 			if not map then quietUntil = os.clock() + 30 return false end
 		end
-		lastRes = nil
 		local p0 = hrp.Position
-		pcall(function() MapR.Travel:FireServer(best) end)
 		st.warpedTo = {id = best, at = os.clock()}
 		log(("วาร์ปด้วยแผนที่ → %s (เดินเองไกล %.0f stud · จากจุดวาร์ปเหลือ %.0f)"):format(NAMES[best], d, bd))
 		st.status = ("วาร์ปไป %s"):format(NAMES[best])
-		local t0, moved = os.clock(), false
-		while os.clock() - t0 < 7 do
-			task.wait(0.25)
-			if type(lastRes) == "table" and lastRes.ok == false then break end
-			local _, h = char()
-			if h and (h.Position - p0).Magnitude > 100 then moved = true; task.wait(1.2) break end
+		local moved = false
+		-- "nomap": the server hadn't seen the Map in hand yet (a fixed 0.4 s wait, or something re-drew the weapon) and
+		-- the trip fell back to a 2000-stud walk -> wait until it's really held, and on "nomap" re-equip + try once more
+		for attempt = 1, 2 do
+			if map.Parent ~= c then pcall(function() hum:EquipTool(map) end) end
+			for _ = 1, 15 do
+				if map.Parent == c then break end
+				task.wait(0.1)
+			end
+			task.wait(attempt == 1 and 0.35 or 0.8)
+			lastRes = nil
+			pcall(function() MapR.Travel:FireServer(best) end)
+			local t0 = os.clock()
+			while os.clock() - t0 < 7 do
+				task.wait(0.25)
+				if type(lastRes) == "table" and lastRes.ok == false then break end
+				local _, h = char()
+				if h and (h.Position - p0).Magnitude > 100 then moved = true; task.wait(1.2) break end
+			end
+			if moved or not (type(lastRes) == "table" and lastRes.reason == "nomap") then break end
 		end
 		-- weapon back in hand (the main loop / gather re-equip their own tool anyway)
 		if held and held ~= map and held.Parent then pcall(function() hum:EquipTool(held) end)
