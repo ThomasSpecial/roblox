@@ -2739,8 +2739,8 @@ task.spawn(function()
 				-- no real progress toward this target for 25 s (wedged in a rock crevice next to TripleCobra's
 				-- plateau for minutes): skip it for 2 min, walk our footsteps back out
 				local tpr = st.tprog
-				if not tpr or tpr.t ~= t or dist < tpr.best - 10 then
-					st.tprog = {t = t, best = dist, at = os.clock()}
+				if not tpr or tpr.t ~= t or dist < tpr.best - 10 or (tpr.p and (hrp.Position - tpr.p).Magnitude > 40) then
+					st.tprog = {t = t, best = math.min(dist, tpr and tpr.t == t and tpr.best or math.huge), at = os.clock(), p = hrp.Position}
 				elseif os.clock() - tpr.at > 25 then
 					st.tprog = nil
 					skipUntil[t] = os.clock() + 120
@@ -3349,12 +3349,24 @@ task.spawn(function()
 					if m:GetAttribute("Tier") == "Boss" and mobAlive(m) then
 						local kind = tostring(m:GetAttribute("Animal") or "?")
 						liveNow[kind] = m
-						bossLive[kind] = {m = m, seen = os.clock()}
+						local okP, bp = pcall(function() return m:GetPivot().Position end)
+						bossLive[kind] = {m = m, seen = os.clock(), pos = okP and bp or (bossLive[kind] and bossLive[kind].pos)}
 					end
 				end
 			end
 			for kind, rec in pairs(bossLive) do
 				if not liveNow[kind] and (not rec.m.Parent or not mobAlive(rec.m)) then
+					-- a boss died near us (whoever landed the last hit, even while the player was steering): stay and pick
+					-- up its loot before Auto Boss / Gather move on (TripleCobra's drops were left on the ground)
+					local _, hrpL = char()
+					if rec.pos and hrpL and (rec.pos - hrpL.Position).Magnitude < 150 and (e.bossHunt or e.farm) then
+						local dd = 3
+						pcall(function() dd = tonumber(AnimalCfg.BOSS_DEATH_DURATION) or 3 end)
+						if not (st.lootHold and os.clock() < st.lootHold.untilT) then
+							st.lootHold = {untilT = os.clock() + dd + 5, at = rec.pos}
+							log(("%s ตาย → รอเก็บของบอส"):format(kind))
+						end
+					end
 					-- it died (or despawned) in front of us: no sign around -> predict from its respawn time
 					local bt = e.bossTimes[kind]
 					if not bt or bt.src ~= "sign" or (now - (bt.seen or 0)) > 5 then
@@ -4238,19 +4250,31 @@ end)()
 	st.tripMove = function(trip)
 		local now = os.clock()
 		local pr = prog[trip.kind]
-		if not pr or trip.d < pr.best - 15 then
-			prog[trip.kind] = {best = trip.d, at = now, n = pr and pr.n or 0}
+		local _, hh = char()
+		local here = hh and hh.Position or Vector3.zero
+		-- progress = actually travelling (40+ studs since the last check), not the straight distance: the way up the
+		-- volcano first goes east, away from Inferno Rex, and the old rule backed us off at the foot of the pass
+		if not pr or trip.d < pr.best - 15 or (pr.p and (here - pr.p).Magnitude > 40) then
+			prog[trip.kind] = {best = math.min(trip.d, pr and pr.best or math.huge), at = now, n = pr and pr.n or 0, p = here}
 		elseif now - pr.at > 30 then
 			pr.n += 1
-			pr.at, pr.best = now, trip.d
+			pr.at, pr.best, pr.p = now, trip.d, here
 			if pr.n == 1 then
 				backtrack.i = #trail
 				backtrack.stop = math.max(1, #trail - 25)
 				backtrack.untilT = now + 15
 				path.wps = nil
 				log(("ไปหา %s ไม่คืบหน้า → ถอยตามรอยเท้า"):format(trip.kind))
-			elseif pr.n == 2 and st.tryWarp and st.tryWarp(trip.pos, true) then
-				log(("ไปหา %s ยังติด → วาร์ปไปเมืองที่ใกล้บอสแล้วเริ่มใหม่"):format(trip.kind))
+			elseif pr.n >= 2 and pr.n <= 5 then
+				-- warp to the town nearest the boss and start over; in combat the warp is refused -> just wait and
+				-- try again on the next round instead of giving the boss up (we dropped Inferno Rex that way)
+				if st.tryWarp and st.tryWarp(trip.pos, true) then
+					pr.n = 0
+					log(("ไปหา %s ติด → วาร์ปไปเมืองที่ใกล้บอสแล้วเริ่มใหม่"):format(trip.kind))
+				else
+					pr.at = now - 20   -- re-check in ~10 s
+					log(("ไปหา %s ติด → รอวาร์ป (ยังติดสถานะต่อสู้)"):format(trip.kind))
+				end
 			else
 				prog[trip.kind] = nil
 				failed[trip.kind] = now + 180
