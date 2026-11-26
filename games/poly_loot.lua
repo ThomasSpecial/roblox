@@ -350,16 +350,17 @@ local manualUntil = 0
 local manualInput, manual, setControls
 do
 	local UIS = game:GetService("UserInputService")
-	local MOVE_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-		Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
+	-- WASD only: the arrow keys also turn the camera, and checking them paused the bot every time the player looked
+	-- around ("ยืนนิ่ง"). A real move by any input still shows up in the ControlModule's move vector below.
+	local MOVE_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D}
 	manualInput = function()
 		if UIS:GetFocusedTextBox() then return false end
 		local okV, mv = pcall(function() return st.realMoveVector and st.realMoveVector() or (Controls and Controls:GetMoveVector()) end)
-		if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then return true end
-		for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
+		if okV and typeof(mv) == "Vector3" and mv.Magnitude > 0.1 then st.manualWhy = "move" return true end
+		for _, k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then st.manualWhy = k.Name return true end end
 		for _, gp in ipairs(UIS:GetConnectedGamepads()) do
 			for _, s in ipairs(UIS:GetGamepadState(gp)) do
-				if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.35 then return true end
+				if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.35 then st.manualWhy = "stick" return true end
 			end
 		end
 		return false
@@ -1465,7 +1466,10 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	if not lastPosSkip then pcall(trailTick, hrp, hum) end
 	lastPosSkip = false
 	if manualInput() then
-		if not manual() then st.manualAt = os.clock() end
+		if not manual() then
+			st.manualAt = os.clock()
+			st.manualN = (st.manualN or 0) + 1
+		end
 		if st.flyHeld and st.flyJump then st.flyJump(false) end
 		manualUntil = os.clock() + 4
 		mover.walk, mover.goal = nil, nil
