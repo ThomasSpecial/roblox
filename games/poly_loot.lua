@@ -3400,9 +3400,12 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	if e.gatherPick == nil then e.gatherPick = true end
 	if e.gatherDefend == nil then e.gatherDefend = false end
 	if e.gatherFar == nil then e.gatherFar = true end
+	if type(e.gatherPrio) ~= "table" then e.gatherPrio = {} end
+	if type(e.craftGoals) ~= "table" then e.craftGoals = {} end
 	if type(e.gatherFarMax) ~= "number" then e.gatherFarMax = 400 end
 	local myTag = "," .. plr.UserId .. ","
 	local bad = setmetatable({}, {__mode = "k"})
+	local badPlace = setmetatable({}, {__mode = "k"})
 	local G = {status = "ปิดอยู่", fells = 0, mined = 0, picked = 0, saved = nil}
 
 	local function center()
@@ -3589,7 +3592,23 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 					local ok, p = pcall(function() return o:GetPivot().Position end)
 					if ok and flat(p - at).Magnitude <= R then
 						local d = flat(p - hrp.Position).Magnitude + math.abs(p.Y - hrp.Position.Y) * 2
+						if e.gatherPrio[oreKind(o)] then d = d * 0.25 end   -- "go first" ore (Crystal: only 5 % of cave spawns)
 						if not bd or d < bd then best, bd, kind = o, d, "ore" end
+					end
+				end
+			end
+		end
+		-- the game's spawn places know which ore stands where even before it streams in (a big cave: half of it was
+		-- out of sight and its Crystals never got picked) -> walk to a "go first" ore we can't see yet
+		if next(e.gatherPrio) and not (best and kind == "ore" and e.gatherPrio[oreKind(best)]) then
+			local sf = workspace:FindFirstChild("OreSpawnPlaces")
+			for _, pl in ipairs(sf and sf:GetChildren() or {}) do
+				local ao = pl:IsA("BasePart") and pl:GetAttribute("ActiveOre")
+				if ao and e.gatherPrio[ao] and os.clock() > (badPlace[pl] or 0) then
+					local p = pl.Position
+					if flat(p - at).Magnitude <= R then
+						local d = (flat(p - hrp.Position).Magnitude + math.abs(p.Y - hrp.Position.Y) * 2) * 0.25
+						if not bd or d < bd then best, bd, kind = pl, d, "place" end
 					end
 				end
 			end
@@ -3767,6 +3786,78 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		pickup(op, 25)
 	end
 
+	-- ---------------- auto craft: picked recipes are crafted at the nearest crafting station once we can afford them
+	local CC
+	pcall(function() CC = require(RS.Crafting_Engine.CraftingConfig) end)
+	local function have(id)
+		local d = invData()
+		local n = 0
+		for _, cat in pairs(d and d.Inventory or {}) do
+			if type(cat) == "table" then
+				for _, it in pairs(cat) do
+					if type(it) == "table" and it.Id == id then n += tonumber(it.Count) or 1 end
+				end
+			end
+		end
+		return n
+	end
+	G.have = have
+	local function affordable(rid)
+		local r = CC and CC.Recipes[rid]
+		if not r then return false end
+		for id, n in pairs(r.Cost or {}) do if have(id) < n then return false end end
+		return true
+	end
+	local function station()
+		local _, hrp = char()
+		local best, bd
+		local lm = RS.Map_Engine:FindFirstChild("Landmarks")
+		for _, v in ipairs(lm and lm:GetChildren() or {}) do
+			if v:IsA("Vector3Value") and v:GetAttribute("Id") == "Crafting" and hrp then
+				local d = (v.Value - hrp.Position).Magnitude
+				if not bd or d < bd then best, bd = v.Value, d end
+			end
+		end
+		return best
+	end
+	local CraftRemote
+	pcall(function() CraftRemote = RS.Crafting_Engine.Remotes.CraftRequest end)
+	local function craftStep()
+		if not (CC and CraftRemote) then return false end
+		for rid in pairs(e.craftGoals) do
+			local r = CC.Recipes[rid]
+			if not r then e.craftGoals[rid] = nil; sv()
+			elseif have(r.Output) > 0 then
+				e.craftGoals[rid] = nil; sv()
+				log(("คราฟ: มี %s อยู่แล้ว → เอาออกจากรายการ"):format(r.Output))
+			elseif affordable(rid) then
+				local pos = station()
+				if not pos then return false end
+				local _, hrp = char()
+				if hrp and (pos - hrp.Position).Magnitude > 9 then
+					say(("ของครบ → เดินไปโต๊ะคราฟ (%s)"):format(r.Output))
+					walk(pos, 5, 120)
+					return true
+				end
+				local before = have(r.Output)
+				pcall(function() CraftRemote:FireServer(rid) end)
+				for _ = 1, 20 do
+					task.wait(0.2)
+					if have(r.Output) > before then break end
+				end
+				if have(r.Output) > before then
+					log(("คราฟ %s สำเร็จ!"):format(r.Output))
+					e.craftGoals[rid] = nil; sv()
+				else
+					log(("คราฟ %s ไม่สำเร็จ (ลองใหม่ทีหลัง)"):format(r.Output))
+					task.wait(5)
+				end
+				return true
+			end
+		end
+		return false
+	end
+
 	local lastSweep, wasOn = 0, false
 	local function release() if st.extBusy == "gather" then st.extBusy = nil end end
 	local function step()
@@ -3790,6 +3881,7 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		st.extBusy = "gather"
 		local at = center()
 		if not at or interrupted() then return end
+		if next(e.craftGoals) and craftStep() then return end
 		if os.clock() - lastSweep > 30 then
 			lastSweep = os.clock()
 			local _, hrp = char()
@@ -3825,6 +3917,15 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 				say(("ไม่มีของที่เลือกในรัศมี %d และในระยะย้ายจุด %d stud · รออยู่ที่นี่"):format(e.gatherR, e.gatherFarMax))
 				task.wait(1)
 			end
+			return
+		end
+		if kind == "place" then
+			say(("ไปหา %s ที่เกิดอยู่ (ยังมองไม่เห็น) · %.0f stud"):format(tostring(node:GetAttribute("ActiveOre")),
+				(function() local _, h = char() return h and flat(node.Position - h.Position).Magnitude or 0 end)()))
+			local _, h = char()
+			-- close enough to stream it in: the next pass sees the real ore and mines it
+			if h and flat(node.Position - h.Position).Magnitude < 25 then badPlace[node] = os.clock() + 20 return end
+			if not walk(node.Position, 20, 90) then badPlace[node] = os.clock() + 60 end
 			return
 		end
 		if kind == "tree" then chop(node) else mine(node) end
@@ -3896,6 +3997,29 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 			e.gatherOres = m; sv()
 		end}, "PLGatherOres")
 	GL:Label({Text = "อีเต้อทุกอันขุดได้ทุกแร่ ต่างกันที่จำนวนที\nดาเมจ: Wooden 7 · Iron 12 · Gold 20 · Diamond 30 · Obsidian 45 · Uranium 60 · Titanium 80\n\"ขั้นต่ำแนะนำ\" = อันถูกสุดที่ขุดแตกภายใน 15 ที"})
+	GL:Dropdown({Name = "แร่ที่ไปขุดก่อน (เจอเมื่อไหร่ไปก่อน)", Multi = true, Required = false, Search = true, Options = names,
+		Default = (function() local d = {} for k in pairs(e.gatherPrio) do d[#d + 1] = k end return d end)(),
+		Callback = function(v) e.gatherPrio = pickSet(v); sv() end}, "PLGatherPrio")
+	local recipeOpts, recipeKey = {}, {}
+	pcall(function()
+		for rid, r in pairs(require(RS.Crafting_Engine.CraftingConfig).Recipes) do
+			local cost = {}
+			for id, n in pairs(r.Cost or {}) do cost[#cost + 1] = ("%s %d"):format(id, n) end
+			table.sort(cost)
+			local lab = ("%s ← %s"):format(tostring(r.Output), table.concat(cost, " + "))
+			recipeOpts[#recipeOpts + 1] = lab
+			recipeKey[lab] = rid
+			recipeKey[rid] = lab
+		end
+		table.sort(recipeOpts)
+	end)
+	GL:Dropdown({Name = "คราฟอัตโนมัติเมื่อของครบ (ไปโต๊ะคราฟเอง)", Multi = true, Required = false, Search = true, Options = recipeOpts,
+		Default = (function() local d = {} for k in pairs(e.craftGoals) do d[#d + 1] = recipeKey[k] or k end return d end)(),
+		Callback = function(v)
+			local m = {}
+			for lab in pairs(pickSet(v)) do if recipeKey[lab] then m[recipeKey[lab]] = true end end
+			e.craftGoals = m; sv()
+		end}, "PLCraftGoals")
 	GL:Slider({Name = "รัศมีรอบจุดเก็บ (stud)", Default = e.gatherR, Minimum = 30, Maximum = 600, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.gatherR = v; sv() end}, "PLGatherR")
 	GL:Button({Name = "ตั้งจุดเก็บ = ตรงที่ยืนอยู่", Callback = function()
@@ -3917,8 +4041,20 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 		while alive() do
 			pcall(function()
 				local at = e.gatherAt
-				gLbl:UpdateName(("%s\nตัดไป %d ต้น · ขุดไป %d ก้อน · เก็บของ %d ชิ้น\nจุดเก็บ: %s · รัศมี %d"):format(G.status, G.fells, G.mined, G.picked,
-					type(at) == "table" and ("%d, %d, %d"):format(at[1], at[2], at[3]) or "ยังไม่ตั้ง (ใช้ตรงที่ยืนตอนเปิด)", e.gatherR))
+				-- what the picked recipes still need
+				local need = {}
+				if CC then
+					local sum = {}
+					for rid in pairs(e.craftGoals) do
+						local r = CC.Recipes[rid]
+						for id, n in pairs(r and r.Cost or {}) do sum[id] = (sum[id] or 0) + n end
+					end
+					for id, n in pairs(sum) do need[#need + 1] = ("%s %d/%d"):format(id, have(id), n) end
+					table.sort(need)
+				end
+				gLbl:UpdateName(("%s\nตัดไป %d ต้น · ขุดไป %d ก้อน · เก็บของ %d ชิ้น\nจุดเก็บ: %s · รัศมี %d%s"):format(G.status, G.fells, G.mined, G.picked,
+					type(at) == "table" and ("%d, %d, %d"):format(at[1], at[2], at[3]) or "ยังไม่ตั้ง (ใช้ตรงที่ยืนตอนเปิด)", e.gatherR,
+					#need > 0 and ("\nของที่ต้องใช้คราฟ: " .. table.concat(need, " · ")) or ""))
 				local ax, pk = bestTool("axe"), bestTool("pick")
 				local hits = {}
 				local dmg = pk and WDefs and WDefs[pk.id] and tonumber(WDefs[pk.id].Damage)
