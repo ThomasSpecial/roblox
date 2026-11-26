@@ -105,6 +105,7 @@ local function ensureWeapon()
 	local held = c:FindFirstChildOfClass("Tool")
 	if isWeaponTool(held) then
 		st.weapon, st.weaponSerial = held.Name, held:GetAttribute("InventorySerial") or st.weaponSerial
+		if st.fixHeld then st.fixHeld() end
 		return true
 	end
 	if not e.equip or os.clock() < busyUntil then return false end
@@ -137,6 +138,28 @@ local function ensureWeapon()
 		if w then pcall(function() RS.Inventory_Engine.Remotes.EquipRequest:FireServer(w) end) task.wait(0.4) end
 	end
 	return isWeaponTool(c:FindFirstChildOfClass("Tool"))
+end
+-- A weapon in OUR hand isn't enough: the server swings with what IT thinks we hold (PlayerData Equipped.Held).
+-- After a map warp the weapon came back by a client-side EquipTool, Held stayed = Map, and every swing was ignored
+-- (Rex / Skullcrab / Owl / even Cobras at full HP, 20+ min) until the character died. Weapon in hand + Held = some
+-- non-weapon item (and we're not eating / mid-warp) -> put that item away the server way. Checked every second by
+-- a loop in the farm section, and before swings.
+st.fixHeld = function(force)
+	if not force and (os.clock() < busyUntil or st.warping or os.clock() - (st.heldCheckAt or 0) < 1) then return end
+	st.heldCheckAt = os.clock()
+	local c = plr.Character
+	if not (c and isWeaponTool(c:FindFirstChildOfClass("Tool"))) then return end
+	pcall(function()
+		local d = require(plr.PlayerScripts.Data_Client.PlayerData):WaitFor().Data
+		local h = d.Equipped and d.Equipped.Held
+		if h and not (d.Inventory and d.Inventory.Weapons and d.Inventory.Weapons[h]) then
+			RS.Inventory_Engine.Remotes.UnequipRequest:FireServer(h)
+			if os.clock() - (st.heldLogAt or 0) > 10 then
+				st.heldLogAt = os.clock()
+				log("เซิร์ฟเวอร์ยังคิดว่าถือของอื่น (แผนที่) อยู่ → เก็บเข้าตัว ไม่งั้นฟันไม่เข้า")
+			end
+		end
+	end)
 end
 
 -- ------------------------------------------------------------------ mobs
@@ -4327,6 +4350,14 @@ end)()
 		pcall(function() w = w or invData().Equipped.Weapon end)
 		if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
 	end
+	-- the server-side hand check (st.fixHeld) every second, not only right before a swing: after a warp the Map stayed
+	-- "held" for 15 s while we walked up to Skullcrab, and the first swings there were wasted
+	task.spawn(function()
+		while alive() do
+			task.wait(1)
+			if st.fixHeld then st.fixHeld() end
+		end
+	end)
 end)()
 
 -- ------------------------------------------------------------------ boss trips
@@ -4509,6 +4540,7 @@ end)()
 			task.wait(0.3)
 		end
 		local held = c:FindFirstChildOfClass("Tool")
+		st.warping = true   -- st.fixHeld must not put the Map away while we're about to use it
 		if map then
 			if held ~= map then pcall(function() hum:EquipTool(map) end) end
 		else
@@ -4518,7 +4550,7 @@ end)()
 				map = c:FindFirstChild("Map")
 				if map then break end
 			end
-			if not map then quietUntil = os.clock() + 30 return false end
+			if not map then st.warping = nil quietUntil = os.clock() + 30 return false end
 		end
 		local p0 = hrp.Position
 		st.warpedTo = {id = best, at = os.clock()}
@@ -4545,7 +4577,12 @@ end)()
 			end
 			if moved or not (type(lastRes) == "table" and lastRes.reason == "nomap") then break end
 		end
-		-- weapon back in hand (the main loop / gather re-equip their own tool anyway)
+		-- put the Map away the SERVER way first: re-drawing the weapon with only a client-side EquipTool left the server's
+		-- Equipped.Held = Map, and no swing counted again until we died. Then the weapon back in hand
+		-- (the travel's own character lock can still refuse this right after arriving: st.fixHeld's 1 s loop retries)
+		st.warping = nil
+		local ms = (map and map.Parent and map:GetAttribute("InventorySerial")) or mapSerial
+		if ms then pcall(function() InvRemotes.UnequipRequest:FireServer(ms) end) task.wait(0.3) end
 		if held and held ~= map and held.Parent then pcall(function() hum:EquipTool(held) end)
 		else
 			-- the weapon left the Backpack when the Map was equipped from the inventory: ask for it back
