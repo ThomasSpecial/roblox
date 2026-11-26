@@ -2377,7 +2377,8 @@ task.spawn(function()
 			-- Auto Gather: a mob came at us while gathering -> fight it here (st.defend), gathering waits
 			local defend = e.gather and not e.farm and st.defend and mobAlive(st.defend) and st.defend or nil
 			if defend then st.blocker = defend; if st.target ~= defend then st.target = defend end end
-			if not e.farm and not bossNow and not defend then
+			local holding = st.lootHold and os.clock() < st.lootHold.untilT   -- boss loot pick-up (also Auto Boss alone)
+			if not e.farm and not bossNow and not defend and not holding then
 				-- a helper script (quest runner) is driving the character through st.api: hands off
 				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
 				st.bossActive = false
@@ -2424,8 +2425,28 @@ task.spawn(function()
 			if t and not mobAlive(t) then
 				st.kills += 1
 				log(("ฆ่า %s (รวม %d)"):format(tostring(t:GetAttribute("Animal")), st.kills))
+				-- a boss drops its loot only after its death animation: stay and pick it all up before warping off
+				if t:GetAttribute("Tier") == "Boss" then
+					local dd = 3
+					pcall(function() dd = tonumber(AnimalCfg.BOSS_DEATH_DURATION) or 3 end)
+					local okP, p = pcall(mobPos, t)
+					st.lootHold = {untilT = os.clock() + dd + 4, at = okP and p or hrp.Position}
+				end
 				t = nil
+				st.target = nil
 			end
+			local lh = st.lootHold
+			if lh and os.clock() < lh.untilT then
+				endCombo(); lookAt = nil
+				if lootStep(hrp) then
+					lh.untilT = math.max(lh.untilT, os.clock() + 1.5)   -- still finding drops: keep going
+					return
+				end
+				if flat(lh.at - hrp.Position).Magnitude > 12 then moveTo(lh.at, true) else stopMove() end
+				st.status = ("รอของบอสดรอป · %.0f วิ"):format(lh.untilT - os.clock())
+				return
+			end
+			st.lootHold = nil
 			local anchor = anchorPos()
 			local boss = bossTarget(hrp)
 			-- a mob standing on us (st.blocker) is finished first, the boss waits: swapping between them every tick
@@ -4038,8 +4059,16 @@ end)()
 		local d = flat(goal - hrp.Position).Magnitude
 		if d < e.warpMin then return false end
 		if (tonumber(plr:GetAttribute(MapC.READY_ATTR)) or 0) > workspace:GetServerTimeNow() then return false end
+		-- the Map is an inventory item (Materials "Map"); it's only a Tool in the Backpack while it sits on the hotbar
 		local map = plr.Backpack:FindFirstChild("Map") or c:FindFirstChild("Map")
-		if not map then quietUntil = now + 60 return false end
+		local mapSerial
+		if not map then
+			local d = invData()
+			for serial, it in pairs(d and d.Inventory and d.Inventory.Materials or {}) do
+				if type(it) == "table" and it.Id == "Map" then mapSerial = serial break end
+			end
+			if not mapSerial then quietUntil = now + 60 return false end
+		end
 		local disc = {}
 		for id in tostring(plr:GetAttribute(MapC.DISCOVERED_ATTR) or ""):gmatch("[^,%s]+") do disc[id] = true end
 		local best, bd
@@ -4054,7 +4083,17 @@ end)()
 		lastTry = now
 		stopMove()
 		local held = c:FindFirstChildOfClass("Tool")
-		if held ~= map then pcall(function() hum:EquipTool(map) end) task.wait(0.4) end
+		if map then
+			if held ~= map then pcall(function() hum:EquipTool(map) end) task.wait(0.4) end
+		else
+			pcall(function() InvRemotes.EquipRequest:FireServer(mapSerial) end)
+			for _ = 1, 15 do
+				task.wait(0.1)
+				map = c:FindFirstChild("Map")
+				if map then break end
+			end
+			if not map then quietUntil = os.clock() + 30 return false end
+		end
 		lastRes = nil
 		local p0 = hrp.Position
 		pcall(function() MapR.Travel:FireServer(best) end)
@@ -4069,7 +4108,12 @@ end)()
 		end
 		-- weapon back in hand (the main loop / gather re-equip their own tool anyway)
 		if held and held ~= map and held.Parent then pcall(function() hum:EquipTool(held) end)
-		else pcall(function() hum:UnequipTools() end) end
+		else
+			-- the weapon left the Backpack when the Map was equipped from the inventory: ask for it back
+			local w = st.weaponSerial
+			pcall(function() w = w or invData().Equipped.Weapon end)
+			if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) else pcall(function() hum:UnequipTools() end) end
+		end
 		if not moved then
 			log(("วาร์ปไม่สำเร็จ (%s)"):format(type(lastRes) == "table" and tostring(lastRes.reason) or "ไม่มีคำตอบ"))
 			quietUntil = os.clock() + 30
