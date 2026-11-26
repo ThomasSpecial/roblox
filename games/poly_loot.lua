@@ -2364,6 +2364,15 @@ task.spawn(function()
 			if bossOnly and (not st.extBusy or st.extBusy == "gather") then
 				local _, bh = char()
 				bossNow = bh and bossTarget(bh)
+				local trip = not bossNow and bh and st.bossTrip and st.bossTrip(bh)
+				if trip then
+					st.bossActive = true
+					st.target, lookAt = nil, nil
+					endCombo()
+					moveTo(trip.pos)
+					st.status = ("Auto Boss: ไปหา %s (ป้ายบอกว่าเกิดแล้ว) · %.0f stud"):format(trip.kind, trip.d)
+					return
+				end
 			end
 			-- Auto Gather: a mob came at us while gathering -> fight it here (st.defend), gathering waits
 			local defend = e.gather and not e.farm and st.defend and mobAlive(st.defend) and st.defend or nil
@@ -2416,6 +2425,17 @@ task.spawn(function()
 				t = st.blocker
 			end
 			st.bossActive = boss ~= nil
+			if not boss and not (t and t == st.blocker and mobAlive(t)) and st.bossTrip then
+				local trip = st.bossTrip(hrp)
+				if trip then
+					st.bossActive = true
+					st.target, lookAt = nil, nil
+					endCombo()
+					moveTo(trip.pos)
+					st.status = ("ไปหาบอส %s (ป้ายบอกว่าเกิดแล้ว) · %.0f stud"):format(trip.kind, trip.d)
+					return
+				end
+			end
 			if boss then
 				if t ~= boss then
 					t = boss
@@ -3042,6 +3062,8 @@ B:Button({Name = "รีเฟรชรายชื่อบอส", Callback = 
 end})
 B:Slider({Name = "└ ไปตีบอสที่อยู่ไม่เกิน (stud จากตัว/จุดฟาร์ม)", Default = e.bossRange, Minimum = 50, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
 	Callback = function(v) e.bossRange = v; sv() end}, "PLBossRange")
+B:Slider({Name = "└ ป้ายบอกว่าบอสเกิด → ขี่ไปหาไกลสุด (stud)", Default = e.bossTrip or 1500, Minimum = 300, Maximum = 4000, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.bossTrip = v; sv() end}, "PLBossTrip")
 B:Toggle({Name = "└ ข้ามบอสที่ตีทีเดียวตาย (ดาเมจ ≥ 90% เลือดเต็ม)", Default = e.bossSafe, Callback = function(v) e.bossSafe = v; sv() end}, "PLBossSafe")
 B:Label({Text = "บอสตีแรง (Spider ~1,000/ที) · เปิด Smart หลบท่า + ถอยเลือดต่ำไว้\nTripleCobra เลือด ~1.4 ล้าน อย่าเลือกถ้าตีไม่ไหว"})
 local BR = BossTab:Section({Side = "Right"})
@@ -3141,11 +3163,15 @@ task.spawn(function()
 					local at = tonumber(s:GetAttribute("BossRespawnAt")) or 0
 					local up = s:GetAttribute("BossAlive") == true
 					local old = e.bossTimes[kind]
+					local sp
+					pcall(function() sp = s:IsA("Model") and s:GetPivot().Position or s.Position end)
+					local pos = sp and {math.floor(sp.X), math.floor(sp.Y), math.floor(sp.Z)} or (old and old.pos)
 					if not old or old.at ~= at or old.alive ~= up then
-						e.bossTimes[kind] = {at = at, alive = up, seen = now, src = "sign"}
+						e.bossTimes[kind] = {at = at, alive = up, seen = now, src = "sign", pos = pos}
 						changed = true
 					else
 						old.seen = now
+						if pos and not old.pos then old.pos = pos; changed = true end
 					end
 				end
 			end
@@ -3890,6 +3916,54 @@ end)()
 		pcall(function() hum:UnequipTools() end)
 		pcall(function() InvRemotes.EquipRequest:FireServer(m.serial) end)
 		log(("ขี่ %s (ความเร็ว %s) เดินทาง %.0f stud"):format(m.id, tostring(m.speed), flat(goal - hrp.Position).Magnitude))
+	end
+end)()
+
+-- ------------------------------------------------------------------ boss trips
+-- A boss far away isn't streamed in (no model to target), but its sign was seen saying "alive" (e.bossTimes[kind] with
+-- the sign position). Picked + alive + within bossTrip studs -> ride there; once close the model streams in and
+-- bossTarget() takes over. Nothing there 25 s after arriving (someone killed it) -> forget that sign for 3 min.
+;(function()
+	if type(e.bossTrip) ~= "number" then e.bossTrip = 1500 end
+	local AC
+	pcall(function() AC = require(RS.Animal_Engine.Config) end)
+	local near, failed = {}, {}
+	st.bossTrip = function(hrp)
+		if not e.bossHunt then return nil end
+		local best
+		for kind in pairs(e.bossPick) do
+			local bt = e.bossTimes and e.bossTimes[kind]
+			-- alive by the sign, or its respawn time has passed (the far sign may not have updated yet): go and look
+			local due = bt and (bt.alive or ((tonumber(bt.at) or 0) > 0 and bt.at <= workspace:GetServerTimeNow()))
+			if due and type(bt.pos) == "table" and os.clock() > (failed[kind] or 0) then
+				local lethal = false
+				if e.bossSafe and AC then
+					pcall(function()
+						local _, _, hum = char()
+						lethal = (tonumber(AC.Get(kind).Damage) or 0) >= (hum and hum.MaxHealth or 1) * 0.9
+					end)
+				end
+				local p = Vector3.new(bt.pos[1], bt.pos[2], bt.pos[3])
+				local d = flat(p - hrp.Position).Magnitude
+				if not lethal and d <= e.bossTrip then
+					if d < 100 then
+						near[kind] = near[kind] or os.clock()
+						if os.clock() - near[kind] > 25 then
+							failed[kind], near[kind] = os.clock() + 180, nil
+							bt.alive = false
+							if (tonumber(bt.at) or 0) <= workspace:GetServerTimeNow() then bt.at = workspace:GetServerTimeNow() + 180 end
+							log(("ไปถึงป้าย %s แล้วไม่เจอบอส (คนอื่นตีไปแล้ว?) → ข้าม 3 นาที"):format(kind))
+						elseif not best or d < best.d then
+							best = {pos = p, kind = kind, d = d}
+						end
+					else
+						near[kind] = nil
+						if not best or d < best.d then best = {pos = p, kind = kind, d = d} end
+					end
+				end
+			end
+		end
+		return best
 	end
 end)()
 
