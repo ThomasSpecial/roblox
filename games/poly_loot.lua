@@ -2262,6 +2262,8 @@ end
 -- long-range aura is impossible)
 local function aura(c, hrp)
 	if not (e.aura and e.attack) or os.clock() < busyUntil then return false end
+	-- riding past: drawing the weapon would throw us off the mount (5 re-mounts in 30 s on the way back)
+	if c:GetAttribute("Mounted") == true then return false end
 	local folder = AnimalLive:FindFirstChild("Aggressors")
 	for _, m in ipairs(folder and folder:GetChildren() or {}) do
 		if mobAlive(m) then
@@ -2553,7 +2555,12 @@ task.spawn(function()
 				-- an aggressor standing on us while we walk elsewhere: it blocks the way (we pushed into a Chupacabra
 				-- for 12 s, 45 unstick tries, walking to a Specter 265 studs off) and hits our back -> fight it first
 				local blk, bd
-				local folder = AnimalLive:FindFirstChild("Aggressors")
+				-- only when it really holds us up: on foot and no progress for 1.5 s. Riding / flying past a Gorilla
+				-- next to the path is not "blocked" (we dropped off the dragon twice to hit one)
+				local tpg = st.travelProg
+				if not tpg or (hrp.Position - tpg.p).Magnitude > 4 then tpg = {p = hrp.Position, t = os.clock()}; st.travelProg = tpg end
+				local heldUp = os.clock() - tpg.t > 1.5 and c:GetAttribute("Mounted") ~= true
+				local folder = heldUp and AnimalLive:FindFirstChild("Aggressors")
 				for _, m in ipairs(folder and folder:GetChildren() or {}) do
 					if m ~= t and mobAlive(m) then
 						local mp = mobPos(m)
