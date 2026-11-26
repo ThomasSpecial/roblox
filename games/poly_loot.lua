@@ -2407,6 +2407,17 @@ task.spawn(function()
 			end
 			local c, hrp, hum = char()
 			if not c then st.status = "รอตัวละครเกิด"; st.target = nil; endCombo() return end
+			-- thousands of studs from the farm spot = another area (dungeon, tower, event island): don't try to ride
+			-- back across the map (we tried a 9,800-stud trip while the player was in a dungeon)
+			do
+				local a0 = anchorPos()
+				if e.farm and a0 and flat(a0 - hrp.Position).Magnitude > 3000 then
+					if st.target then st.target = nil; lookAt = nil; endCombo() end
+					stopMove()
+					st.status = ("อยู่คนละพื้นที่กับจุดฟาร์ม (ห่าง %.0f stud) · พักไว้ กลับเข้าพื้นที่แล้วจะฟาร์มต่อเอง"):format(flat(a0 - hrp.Position).Magnitude)
+					return
+				end
+			end
 
 			-- target: keep the locked one until it dies / leaves range (lock mode never switches early)
 			local t = st.target
