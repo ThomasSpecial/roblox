@@ -96,7 +96,8 @@ local function flat(v) return Vector3.new(v.X, 0, v.Z) end
 -- keep the weapon in hand (the server swings whatever tool is equipped)
 -- weapon tools carry WeaponId / InventorySerial attributes; food and potions don't. The old check took "holding any
 -- tool" as armed, so an Apple left in hand after eating stayed there and the farm never swung again.
-local function isWeaponTool(t) return t ~= nil and t:IsA("Tool") and t:GetAttribute("WeaponId") ~= nil end
+-- pickaxes are weapon tools too, but a 7-damage Wooden Pickaxe left in hand by Auto Gather is not what we fight with
+local function isWeaponTool(t) return t ~= nil and t:IsA("Tool") and t:GetAttribute("WeaponId") ~= nil and not t.Name:find("Pickaxe") end
 local busyUntil = 0     -- the farm loop doesn't swing / re-equip while we eat
 local function ensureWeapon()
 	local c, _, hum = char()
@@ -119,12 +120,20 @@ local function ensureWeapon()
 		-- the item in hand replaced the weapon tool: ask the server for the weapon back (same as the hotbar)
 		st.reequipAt = os.clock()
 		local w = st.weaponSerial
-		if not w then
-			pcall(function()
-				local d = require(plr.PlayerScripts.Data_Client.PlayerData):WaitFor().Data
-				w = d.Equipped and d.Equipped.Weapon
-			end)
-		end
+		pcall(function()
+			local d = require(plr.PlayerScripts.Data_Client.PlayerData):WaitFor().Data
+			local inv = d.Inventory and d.Inventory.Weapons or {}
+			w = w or (d.Equipped and d.Equipped.Weapon)
+			-- last equipped = a pickaxe (Auto Gather): fight with the strongest real weapon instead
+			if not w or not inv[w] or tostring(inv[w].Id):find("Pickaxe") then
+				local WD = require(RS.Weapon_Engine.Modules.WeaponDefs)
+				local bv
+				for serial, it in pairs(inv) do
+					local def = WD[it.Id]
+					if def and def.Type ~= "Pickaxe" and (not bv or (tonumber(def.Damage) or 0) > bv) then w, bv = serial, tonumber(def.Damage) or 0 end
+				end
+			end
+		end)
 		if w then pcall(function() RS.Inventory_Engine.Remotes.EquipRequest:FireServer(w) end) task.wait(0.4) end
 	end
 	return isWeaponTool(c:FindFirstChildOfClass("Tool"))
@@ -1297,6 +1306,8 @@ local function moveTo(goal, free)
 	local c, hrp, hum = char()
 	if not hrp then return end
 	if not free then goal = clampHeal(goal) end
+	-- far trip: the game's World Map warp first (st.tryWarp, defined with the Movement tab), then walk the rest
+	if e.moveMode == "Walk" and st.tryWarp and st.tryWarp(goal) then return end
 	-- short repositioning (combat): the spot must have floor under it, else hold position
 	if e.moveMode == "Walk" and flat(goal - hrp.Position).Magnitude < 20 and not groundOk(c, feetOf(hrp, hum), goal) then
 		mover.walk = nil
@@ -1337,8 +1348,10 @@ rp.FilterType = Enum.RaycastFilterType.Exclude
 local lastPos
 -- walking: after the ControlModule's render step (Input priority) so its Move(zero) doesn't cancel ours
 faceUntil = 0
-pcall(function() RunService:UnbindFromRenderStep("PolyLootWalk") end)
-RunService:BindToRenderStep("PolyLootWalk", Enum.RenderPriority.Character.Value + 5, function(dt)
+-- unique name per load: the old copy unloads AFTER the new one started and its UnbindFromRenderStep("PolyLootWalk")
+-- removed the NEW walk step -> the bot "walked" (status said so) without moving at all
+st.walkStep = "PolyLootWalk_" .. HS:GenerateGUID(false)
+RunService:BindToRenderStep(st.walkStep, Enum.RenderPriority.Character.Value + 5, function(dt)
 	if not alive() then return end
 	pcall(function()
 		local _, hrp, hum = char()
@@ -1404,10 +1417,10 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	do
 		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
 		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
-		local want = ((e.farm or st.bossActive) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
+		local want = ((e.farm or st.bossActive or st.defend) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
 		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
 		-- Cancel it only, so we run at the normal 20, never faster than a player can
-		if (e.farm or st.bossActive) and os.clock() < (st.evadeUntil or 0) then
+		if (e.farm or st.bossActive or st.defend) and os.clock() < (st.evadeUntil or 0) then
 			local sw = tonumber(hum:GetAttribute("_WSMultC_WeaponSwing")) or 1
 			want = sw > 0 and sw < 1 and math.min(1 / sw, 2) or nil
 		end
@@ -2279,11 +2292,14 @@ task.spawn(function()
 			-- Auto Boss on its own (Auto Farm off): fight only a picked boss that is up in range, otherwise hands off
 			local bossOnly = not e.farm and e.bossHunt and next(e.bossPick) ~= nil
 			local bossNow
-			if bossOnly and not st.extBusy then
+			if bossOnly and (not st.extBusy or st.extBusy == "gather") then
 				local _, bh = char()
 				bossNow = bh and bossTarget(bh)
 			end
-			if not e.farm and not bossNow then
+			-- Auto Gather: a mob came at us while gathering -> fight it here (st.defend), gathering waits
+			local defend = e.gather and not e.farm and st.defend and mobAlive(st.defend) and st.defend or nil
+			if defend then st.blocker = defend; if st.target ~= defend then st.target = defend end end
+			if not e.farm and not bossNow and not defend then
 				-- a helper script (quest runner) is driving the character through st.api: hands off
 				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
 				st.bossActive = false
@@ -2660,7 +2676,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.25)
 		-- while a regeneration item works, eat again only in an emergency
-		if (e.farm or st.bossActive) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
+		if (e.farm or st.bossActive or st.defend) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
 			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= 25) then
 			pcall(useHeal)
 		end
@@ -3131,11 +3147,538 @@ BR:Button({Name = "└ รีเฟรชรายชื่อ", Callback = func
 end})
 BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้เวลา (?)", Default = e.bossHudHideUnknown == true, Callback = function(v) e.bossHudHideUnknown = v; sv() end}, "PLBossHudHideUnk")
 
+-- ------------------------------------------------------------------ Auto Gather (tab "Gather")
+-- Chops picked trees / mines picked ores around a gather spot with the best axe / pickaxe in the bag, picks up our own
+-- drops (WorldBits, wbFast lists the owners), fights back a mob that comes at us, and gives the weapon back after.
+-- Runs while Auto Farm is OFF (farm has the character otherwise). Auto Boss still wins: a picked boss in range pauses it.
+-- Drives the character the same way the quest runner did: st.extBusy = "gather" hands the main loop off.
+-- (a function, not a do-block: the main chunk is at Luau's 200-local register limit, a function gets its own)
+;(function()
+	local TC, MC, WDefs
+	pcall(function() TC = require(RS.TreeChop_Engine.Config) end)
+	pcall(function() MC = require(RS.Mining_Engine.Config) end)
+	pcall(function() WDefs = require(RS.Weapon_Engine.Modules.WeaponDefs) end)
+	if type(e.gatherTrees) ~= "table" then e.gatherTrees = {} end
+	if type(e.gatherOres) ~= "table" then e.gatherOres = {} end
+	if type(e.gatherR) ~= "number" then e.gatherR = 200 end
+	if e.gatherPick == nil then e.gatherPick = true end
+	if e.gatherDefend == nil then e.gatherDefend = false end
+	if e.gatherFar == nil then e.gatherFar = true end
+	local myTag = "," .. plr.UserId .. ","
+	local bad = setmetatable({}, {__mode = "k"})
+	local G = {status = "ปิดอยู่", fells = 0, mined = 0, picked = 0, saved = nil}
+
+	local function center()
+		local c = e.gatherAt
+		if type(c) == "table" and c[1] then return Vector3.new(c[1], c[2], c[3]) end
+		local _, hrp = char()
+		return hrp and hrp.Position
+	end
+	local function setCenter(p) e.gatherAt = {math.floor(p.X), math.floor(p.Y), math.floor(p.Z)}; sv() end
+	local function holding() local c = plr.Character return c and c:FindFirstChildOfClass("Tool") end
+	local function say(s) G.status = s; st.extStatus = "Auto Gather: " .. s end
+
+	-- best tool of a kind in the bag: axe (Axe / GreatAxe / TwinbladeAxe, one GreatAxe swing = 2 chops) or pickaxe
+	local function bestTool(kind)
+		local d = invData()
+		local best, bv
+		for serial, it in pairs(d and d.Inventory and d.Inventory.Weapons or {}) do
+			local w = WDefs and WDefs[it.Id]
+			local ty = w and w.Type
+			local ok = ty and ((kind == "axe" and TC and TC.IsAxeType(ty)) or (kind == "pick" and ty == "Pickaxe"))
+			if ok then
+				local v = (tonumber(w.Damage) or 0) + (ty == "GreatAxe" and 1e9 or 0)
+				if not bv or v > bv then best, bv = {serial = serial, id = it.Id}, v end
+			end
+		end
+		return best
+	end
+	local function equipTool(t)
+		local h = holding()
+		if h and h.Name == t.id then return true end
+		-- remember the fighting weapon once: ensureWeapon() would otherwise adopt the axe as "the" weapon.
+		-- Unknown (fresh load while a tool was in hand) -> the strongest non-pickaxe weapon in the bag
+		if not G.saved then
+			local wName, wSerial = st.weapon, st.weaponSerial
+			if not wSerial or (wName and wName:find("Pickaxe")) then
+				local d = invData()
+				local bv
+				for serial, it in pairs(d and d.Inventory and d.Inventory.Weapons or {}) do
+					local w = WDefs and WDefs[it.Id]
+					if w and w.Type ~= "Pickaxe" and (not bv or (tonumber(w.Damage) or 0) > bv) then
+						wName, wSerial, bv = it.Id, serial, tonumber(w.Damage) or 0
+					end
+				end
+			end
+			G.saved = {weapon = wName, serial = wSerial}
+		end
+		pcall(function() InvRemotes.EquipRequest:FireServer(t.serial) end)
+		for _ = 1, 15 do
+			task.wait(0.1)
+			h = holding()
+			if h and h.Name == t.id then return true end
+		end
+		return false
+	end
+	local function giveBack()
+		local s = G.saved
+		if not s then return end
+		G.saved = nil
+		if not s.serial then return end
+		st.weapon, st.weaponSerial = s.weapon, s.serial
+		pcall(function() InvRemotes.EquipRequest:FireServer(s.serial) end)
+	end
+
+	-- a mob on us -> the main loop fights it (st.defend), we wait
+	local function threat()
+		if not e.gatherDefend then return nil end
+		local _, hrp, hum = char()
+		if not hrp then return nil end
+		local best, bd
+		local folder = AnimalLive:FindFirstChild("Aggressors")
+		for _, m in ipairs(folder and folder:GetChildren() or {}) do
+			if mobAlive(m) then
+				local mp = mobPos(m)
+				local ok, sz = pcall(function() return m:GetExtentsSize() end)
+				local rad = ok and math.min(math.max(sz.X, sz.Z) / 2, 12) or 2
+				local d = flat(mp - hrp.Position).Magnitude - rad
+				local lethal = (tonumber(m:GetAttribute("Damage")) or 0) >= hum.MaxHealth * 0.9
+				if d <= e.reach + 4 and math.abs(mp.Y - hrp.Position.Y) < 10 and not lethal and (not bd or d < bd) then best, bd = m, d end
+			end
+		end
+		return best
+	end
+	local function paused()
+		return not alive() or not e.gather or e.farm or st.bossActive or manual() or (st.defend and mobAlive(st.defend))
+	end
+	local function interrupted()
+		if paused() then
+			if st.bossActive or e.farm or (st.defend and mobAlive(st.defend)) then giveBack() end
+			return true
+		end
+		local m = threat()
+		if m then
+			giveBack()
+			st.defend, st.blocker, st.target = m, m, m
+			st.extBusy = nil
+			log(("Gather: %s เข้ามาตี → สู้ก่อน"):format(tostring(m:GetAttribute("Animal"))))
+			return true
+		end
+		return false
+	end
+
+	local function walk(pos, tol, timeout)
+		local t0, lastD, lastT = os.clock(), math.huge, os.clock()
+		while true do
+			if interrupted() then stopMove() return false end
+			local _, hrp = char()
+			if not hrp then task.wait(0.5) else
+				local d = flat(pos - hrp.Position).Magnitude
+				local dy = math.abs(hrp.Position.Y - pos.Y)
+				if d <= tol and dy < 8 then stopMove() return true end
+				if os.clock() - t0 > timeout then stopMove() return false end
+				local d3 = (hrp.Position - pos).Magnitude
+				if d3 < lastD - 1 then lastD, lastT = d3, os.clock() end
+				if os.clock() - lastT > 12 then stopMove() return false end
+				moveTo(pos, d < 20 and dy < 6)
+				task.wait(0.15)
+			end
+		end
+	end
+
+	-- our own drops around a spot
+	local function pickup(at, radius)
+		if not e.gatherPick then return end
+		local wb = workspace:FindFirstChild("WorldBits")
+		if not wb then return end
+		for _ = 1, 40 do
+			if interrupted() then return end
+			local _, hrp = char()
+			if not hrp then return end
+			local best, bd, bp
+			for _, m in ipairs(wb:GetChildren()) do
+				local fast = m:GetAttribute("wbFast")
+				local id = m:GetAttribute("wbId")
+				if id and id ~= "_skip" and (type(fast) ~= "string" or fast == "" or fast:find(myTag, 1, true)) then
+					local ok, p = pcall(function() return m:GetPivot().Position end)
+					if ok and flat(p - at).Magnitude <= radius then
+						local d = (p - hrp.Position).Magnitude
+						if not bd or d < bd then best, bd, bp = m, d, p end
+					end
+				end
+			end
+			if not best then return end
+			say(("เก็บของที่ดรอป · %s"):format(tostring(best:GetAttribute("wbId"))))
+			if bd > 4.5 then walk(bp, 3, 15) end
+			local pr = best:FindFirstChildWhichIsA("ProximityPrompt", true)
+			if pr then pcall(function() fireproximityprompt(pr) end) end
+			for _ = 1, 10 do
+				if not best.Parent then break end
+				task.wait(0.1)
+			end
+			if best.Parent then best:SetAttribute("wbId", "_skip") else G.picked += 1 end
+		end
+	end
+
+	local function treeKind(t) return t:GetAttribute("ChopKind") or t.Name end
+	local function trunkPos(t)
+		local tr
+		pcall(function() tr = TC.TrunkOf(t) end)
+		return tr and tr.Position or t:GetPivot().Position
+	end
+	local function oreKind(o) return o:GetAttribute("OreType") or o:GetAttribute("Ore") or o.Name end
+	local function oreHp(n) return tonumber(MC and MC.ORE_SPECS[n] and MC.ORE_SPECS[n].Health) or 0 end
+	-- nearest picked tree / ore inside the gather circle (height counts double: a ledge above costs a detour)
+	local function nextNode(at, anywhere)
+		local _, hrp = char()
+		if not hrp then return nil end
+		local R = anywhere and math.huge or e.gatherR
+		local best, bd, kind
+		if next(e.gatherTrees) and TC then
+			for _, t in ipairs(CS:GetTagged("ChoppableTree")) do
+				if e.gatherTrees[treeKind(t)] and not bad[t] and not CS:HasTag(t, "NoChopTree") and not t:GetAttribute("ChopInTown")
+					and not t:GetAttribute("_Felled") then
+					local p = trunkPos(t)
+					if flat(p - at).Magnitude <= R then
+						local d = flat(p - hrp.Position).Magnitude + math.abs(p.Y - hrp.Position.Y) * 2
+						if not bd or d < bd then best, bd, kind = t, d, "tree" end
+					end
+				end
+			end
+		end
+		if next(e.gatherOres) and MC then
+			for _, o in ipairs(CS:GetTagged(MC.TAG)) do
+				if e.gatherOres[oreKind(o)] and not bad[o] and not o:GetAttribute(MC.BROKEN_ATTR) then
+					local ok, p = pcall(function() return o:GetPivot().Position end)
+					if ok and flat(p - at).Magnitude <= R then
+						local d = flat(p - hrp.Position).Magnitude + math.abs(p.Y - hrp.Position.Y) * 2
+						if not bd or d < bd then best, bd, kind = o, d, "ore" end
+					end
+				end
+			end
+		end
+		return best, kind
+	end
+
+	local function chop(t)
+		local tool = bestTool("axe")
+		if not tool then say("ไม่มีขวานในกระเป๋า (Basic Axe ดรอปจาก Sheep)"); task.wait(2) return end
+		local p = trunkPos(t)
+		local _, hrp = char()
+		local away = flat(hrp.Position - p)
+		away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
+		local g = p + away * 3.6
+		say(("เดินไปตัด %s"):format(treeKind(t)))
+		-- the trunk centre is ~11 studs up a tall pine: stand at our own height
+		if not walk(Vector3.new(g.X, hrp.Position.Y, g.Z), 2.5, 60) then
+			if not paused() and not (st.defend and mobAlive(st.defend)) then bad[t] = true end
+			return
+		end
+		if not equipTool(tool) then return end
+		local before, t0 = t:GetAttribute("_ChopsLeft"), os.clock()
+		say(("ตัด %s ด้วย %s"):format(treeKind(t), tool.id))
+		while not t:GetAttribute("_Felled") and t.Parent and os.clock() - t0 < 12 do
+			if interrupted() then return end
+			local _, h = char()
+			if h then face(h, p) end
+			local held = holding()
+			if held then pcall(function() held:Activate() end) end
+			task.wait(0.35)
+		end
+		if not t:GetAttribute("_Felled") then
+			if t:GetAttribute("_ChopsLeft") == before then bad[t] = true end
+			return
+		end
+		G.fells += 1
+		task.wait(1.6)   -- logs / fruit pop out and roll along the fallen trunk
+		pickup(p, 45)
+	end
+
+	local function mine(o)
+		local tool = bestTool("pick")
+		if not tool then say("ไม่มีอีเต้อในกระเป๋า (คราฟ Wooden Pickaxe: ไม้ 25 ที่ถ้ำคราฟ)"); task.wait(2) return end
+		local op = o:GetPivot().Position
+		local _, hrp = char()
+		-- stand where the game itself puts a miner (MiningStanceCFrame). The client only counts a swing when the ore's
+		-- surface is within CLIENT_MINE_DISTANCE (3.15) of MiningOrigin; our old spot was 3.47 away -> every swing missed
+		local okS, cf = pcall(MC.MiningStanceCFrame, o, hrp)
+		if not okS or typeof(cf) ~= "CFrame" then bad[o] = true return end
+		say(("เดินไปขุด %s"):format(oreKind(o)))
+		if not walk(cf.Position, 1.2, 60) then
+			if not paused() and not (st.defend and mobAlive(st.defend)) then bad[o] = true end
+			return
+		end
+		local function surf()
+			local _, hh = char()
+			if not hh then return math.huge end
+			local org = MC.MiningOrigin(hh.Position)
+			return (MC.ClosestPoint(o, org) - org).Magnitude
+		end
+		local function settle()
+			local c2, hh = char()
+			if not hh then return end
+			local ok2, cf2 = pcall(MC.MiningStanceCFrame, o, hh)
+			if ok2 and typeof(cf2) == "CFrame" then
+				cf = cf2
+				-- last step onto the stance: a hop of a few studs passes the server's movement check
+				if surf() > 2.9 and (cf.Position - hh.Position).Magnitude < 6 then pcall(function() c2:PivotTo(cf) end) end
+			end
+		end
+		if not equipTool(tool) then return end
+		settle()
+		local h0, t0 = o:GetAttribute("Health"), os.clock()
+		say(("ขุด %s ด้วย %s"):format(oreKind(o), tool.id))
+		while o.Parent and not o:GetAttribute(MC.BROKEN_ATTR) and os.clock() - t0 < 20 do
+			if interrupted() then return end
+			if surf() > 3.0 then settle() end
+			local _, h = char()
+			if h then face(h, h.Position + cf.LookVector * 6) end
+			local held = holding()
+			if held then pcall(function() held:Activate() end) end
+			task.wait(0.35)
+		end
+		if o.Parent and not o:GetAttribute(MC.BROKEN_ATTR) then
+			if o:GetAttribute("Health") == h0 then bad[o] = true end
+			return
+		end
+		G.mined += 1
+		task.wait(0.8)
+		pickup(op, 25)
+	end
+
+	local lastSweep, wasOn = 0, false
+	local function release() if st.extBusy == "gather" then st.extBusy = nil end end
+	local function step()
+		if not e.gather then
+			if wasOn then wasOn = false; if st.extBusy == "gather" then st.extBusy = nil; stopMove() end; giveBack() end
+			G.status = "ปิดอยู่"
+			return
+		end
+		wasOn = true
+		if st.defend and not mobAlive(st.defend) then st.defend = nil end
+		-- whenever something else takes over, hand the fighting weapon back first (we fought King Chicken with a pickaxe)
+		if e.farm then release(); giveBack(); G.status = "พัก: Auto Farm เปิดอยู่ (ปิด Auto Farm ก่อน ถึงจะเก็บของ)" return end
+		if st.bossActive or manual() or st.defend then
+			release()
+			giveBack()
+			G.status = st.bossActive and "พัก: ไปตีบอสก่อน" or st.defend and "พัก: สู้มอนที่เข้ามาตี" or "พัก: คุณบังคับเดินเอง"
+			return
+		end
+		if not next(e.gatherTrees) and not next(e.gatherOres) then release(); G.status = "ยังไม่ได้เลือกต้นไม้หรือแร่" return end
+		if st.extBusy and st.extBusy ~= "gather" then G.status = "พัก: สคริปต์อื่นกำลังคุมตัวละคร" return end
+		st.extBusy = "gather"
+		local at = center()
+		if not at or interrupted() then return end
+		if os.clock() - lastSweep > 30 then
+			lastSweep = os.clock()
+			local _, hrp = char()
+			if hrp then pickup(hrp.Position, 60) end
+		end
+		local node, kind = nextNode(at)
+		if not node and e.gatherFar then
+			node, kind = nextNode(at, true)
+			if node then
+				local ok, p = pcall(function() return node:GetPivot().Position end)
+				if ok then
+					setCenter(p)
+					log(("Gather: ในรัศมีไม่มี → ย้ายจุดเก็บไปที่ %s ที่ใกล้สุด (%.0f stud)"):format(kind == "tree" and treeKind(node) or oreKind(node), flat(p - at).Magnitude))
+				end
+			end
+		end
+		if not node then
+			local _, hrp = char()
+			if hrp and flat(hrp.Position - at).Magnitude > 15 then
+				say(("ไม่มีของให้เก็บใกล้ตัว · เดินกลับจุดเก็บ (%.0f stud)"):format(flat(hrp.Position - at).Magnitude))
+				walk(at, 6, 90)
+			else
+				stopMove()
+				say(("รอต้นไม้/แร่เกิดใหม่ในรัศมี %d stud"):format(e.gatherR))
+				task.wait(1)
+			end
+			return
+		end
+		if kind == "tree" then chop(node) else mine(node) end
+	end
+	task.spawn(function()
+		while alive() do
+			local ok, err = pcall(step)
+			if not ok then log("Gather error: " .. tostring(err)); task.wait(2) end
+			task.wait(0.15)
+		end
+		pcall(giveBack)
+		release()
+	end)
+
+	-- ---------------- UI
+	local GatherTab = TG:Tab({Name = "Gather", Image = "rbxassetid://10723346959"})
+	local GL = GatherTab:Section({Side = "Left"})
+	GL:Header({Text = "Auto Gathering"})
+	GL:Toggle({Name = "Auto Gather (ตัดไม้ · ขุดแร่ · เก็บของที่ดรอป)", Default = e.gather == true, Callback = function(v)
+		e.gather = v
+		-- turning it on = gather around where you stand now
+		if v then
+			local _, hrp = char()
+			if hrp then setCenter(hrp.Position) end
+		end
+		sv()
+	end}, "PLGather")
+	GL:Label({Text = "ทำงานตอนปิด Auto Farm · เปิด Auto Boss คู่ได้ (บอสเกิด = ไปตีก่อน แล้วกลับมาเก็บต่อ)"})
+	local treeOpts = {}
+	for n in pairs(TC and TC.CHOPPABLE_NAMES or {}) do treeOpts[#treeOpts + 1] = n end
+	table.sort(treeOpts)
+	GL:Dropdown({Name = "ต้นไม้ที่จะตัด", Multi = true, Required = false, Options = treeOpts,
+		Default = (function() local d = {} for k in pairs(e.gatherTrees) do d[#d + 1] = k end return d end)(),
+		Callback = function(v) e.gatherTrees = pickSet(v); sv() end}, "PLGatherTrees")
+	GL:Label({Text = "Pine / Tall Pine = Wood · Jungle tree = Jungle Wood · Banana tree = Jungle Wood + กล้วย · Palm Tree = มะพร้าว"})
+	-- The game has no "minimum pickaxe" rule: any pickaxe hits any ore, damage vs the ore's HP decides how many swings.
+	-- Each option shows the ore's HP and the cheapest pickaxe that breaks it in <= 15 swings (~5 s).
+	local picks = {}
+	for n, w in pairs(WDefs or {}) do
+		if type(w) == "table" and w.Type == "Pickaxe" then picks[#picks + 1] = {name = n, dmg = tonumber(w.Damage) or 1} end
+	end
+	table.sort(picks, function(a, b) return a.dmg < b.dmg end)
+	local function suggest(n)
+		local hp = oreHp(n)
+		for _, pk in ipairs(picks) do
+			if math.ceil(hp / pk.dmg) <= 15 then return pk end
+		end
+		return picks[#picks]
+	end
+	local oreOpts, optKey = {}, {}
+	local names = {}
+	for n in pairs(MC and MC.ORE_SPECS or {}) do names[#names + 1] = n end
+	table.sort(names, function(a, b)
+		if oreHp(a) ~= oreHp(b) then return oreHp(a) < oreHp(b) end
+		return a < b
+	end)
+	for _, n in ipairs(names) do
+		local pk = suggest(n)
+		local lab = ("%s · HP %d · %s+"):format(n, oreHp(n), pk and (pk.name:gsub(" Pickaxe", "")) or "?")
+		oreOpts[#oreOpts + 1] = lab
+		optKey[lab] = n
+		optKey[n] = lab
+	end
+	GL:Dropdown({Name = "แร่ที่จะขุด (HP แร่ · อีเต้อขั้นต่ำที่แนะนำ)", Multi = true, Required = false, Search = true, Options = oreOpts,
+		Default = (function() local d = {} for k in pairs(e.gatherOres) do d[#d + 1] = optKey[k] or k end return d end)(),
+		Callback = function(v)
+			local m = {}
+			for lab in pairs(pickSet(v)) do m[optKey[lab] or lab] = true end
+			e.gatherOres = m; sv()
+		end}, "PLGatherOres")
+	GL:Label({Text = "อีเต้อทุกอันขุดได้ทุกแร่ ต่างกันที่จำนวนที\nดาเมจ: Wooden 7 · Iron 12 · Gold 20 · Diamond 30 · Obsidian 45 · Uranium 60 · Titanium 80\n\"ขั้นต่ำแนะนำ\" = อันถูกสุดที่ขุดแตกภายใน 15 ที"})
+	GL:Slider({Name = "รัศมีรอบจุดเก็บ (stud)", Default = e.gatherR, Minimum = 30, Maximum = 600, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.gatherR = v; sv() end}, "PLGatherR")
+	GL:Button({Name = "ตั้งจุดเก็บ = ตรงที่ยืนอยู่", Callback = function()
+		local _, hrp = char()
+		if hrp then setCenter(hrp.Position); log("ตั้งจุดเก็บของตรงนี้") end
+	end})
+	GL:Toggle({Name = "ในรัศมีไม่มี → เดินไปหาตัวที่ใกล้สุดที่มองเห็น (แล้วย้ายจุดเก็บไปที่นั่น)", Default = e.gatherFar, Callback = function(v) e.gatherFar = v; sv() end}, "PLGatherFar")
+	GL:Toggle({Name = "เก็บของที่ดรอป (ไม้ · แร่ · ผลไม้)", Default = e.gatherPick, Callback = function(v) e.gatherPick = v; sv() end}, "PLGatherPick")
+	GL:Toggle({Name = "สู้กลับมอนที่เข้ามาตีระหว่างเก็บ", Default = e.gatherDefend, Callback = function(v) e.gatherDefend = v; sv() end}, "PLGatherDefend")
+
+	local GR = GatherTab:Section({Side = "Right"})
+	GR:Header({Text = "สถานะ"})
+	local gLbl = GR:Label({Text = "-"})
+	GR:Header({Text = "เครื่องมือที่จะใช้"})
+	local tLbl = GR:Label({Text = "-"})
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local at = e.gatherAt
+				gLbl:UpdateName(("%s\nตัดไป %d ต้น · ขุดไป %d ก้อน · เก็บของ %d ชิ้น\nจุดเก็บ: %s · รัศมี %d"):format(G.status, G.fells, G.mined, G.picked,
+					type(at) == "table" and ("%d, %d, %d"):format(at[1], at[2], at[3]) or "ยังไม่ตั้ง (ใช้ตรงที่ยืนตอนเปิด)", e.gatherR))
+				local ax, pk = bestTool("axe"), bestTool("pick")
+				local hits = {}
+				local dmg = pk and WDefs and WDefs[pk.id] and tonumber(WDefs[pk.id].Damage)
+				if dmg and dmg > 0 then
+					local sel = {}
+					for n in pairs(e.gatherOres) do sel[#sel + 1] = n end
+					table.sort(sel, function(a, b) return oreHp(a) < oreHp(b) end)
+					for _, n in ipairs(sel) do hits[#hits + 1] = ("%s %d ที"):format(n, math.ceil(oreHp(n) / dmg)) end
+				end
+				tLbl:UpdateName(("ขวาน: %s\nอีเต้อ: %s%s\n(เลือกอันที่แรงสุดในกระเป๋าเอง · เสร็จแล้วคืนอาวุธเดิมให้)"):format(ax and ax.id or "ไม่มี",
+					pk and pk.id or "ไม่มี", #hits > 0 and ("\nต่อก้อน (ก่อนอัปแรงก์): " .. table.concat(hits, " · ")) or ""))
+			end)
+			task.wait(1)
+		end
+	end)
+end)()
+
+-- ------------------------------------------------------------------ World Map warp
+-- Map_Engine: Travel:FireServer(destId) while HOLDING the Map tool (else TravelResult {ok=false, reason="nomap"}),
+-- "here" = closer than MIN_TRIP. Only discovered destinations (player attr MapDiscovered), cooldown in MapTravelReadyAt
+-- (server epoch). A long walk (> warpMin studs) whose goal is much nearer a destination than we are -> warp there.
+;(function()
+	local MapC, MapR
+	pcall(function() MapC = require(RS.Map_Engine.Config); MapR = RS.Map_Engine.Remotes end)
+	if not (MapC and MapR) then return end
+	if e.warpOn == nil then e.warpOn = true end
+	if type(e.warpMin) ~= "number" then e.warpMin = 500 end
+	local lastTry, quietUntil, lastRes = 0, 0, nil
+	pcall(function()
+		MapR.TravelResult.OnClientEvent:Connect(function(a) lastRes = a end)
+	end)
+	local NAMES = {}
+	for id, d in pairs(MapC.Destinations or {}) do NAMES[id] = d.name or id end
+	st.tryWarp = function(goal)
+		if not e.warpOn or manual() then return false end
+		local now = os.clock()
+		if now - lastTry < 4 or now < quietUntil then return false end
+		local c, hrp, hum = char()
+		if not hrp or hum.Health <= 0 then return false end
+		local d = flat(goal - hrp.Position).Magnitude
+		if d < e.warpMin then return false end
+		if (tonumber(plr:GetAttribute(MapC.READY_ATTR)) or 0) > workspace:GetServerTimeNow() then return false end
+		local map = plr.Backpack:FindFirstChild("Map") or c:FindFirstChild("Map")
+		if not map then quietUntil = now + 60 return false end
+		local disc = {}
+		for id in tostring(plr:GetAttribute(MapC.DISCOVERED_ATTR) or ""):gmatch("[^,%s]+") do disc[id] = true end
+		local best, bd
+		for id, dest in pairs(MapC.Destinations or {}) do
+			if disc[id] and typeof(dest.pos) == "Vector3" and flat(dest.pos - hrp.Position).Magnitude > (MapC.MIN_TRIP or 45) + 5 then
+				local dd = flat(dest.pos - goal).Magnitude
+				-- only worth it when it cuts the walk a lot
+				if dd < d - 300 and (not bd or dd < bd) then best, bd = id, dd end
+			end
+		end
+		if not best then quietUntil = now + 15 return false end
+		lastTry = now
+		stopMove()
+		local held = c:FindFirstChildOfClass("Tool")
+		if held ~= map then pcall(function() hum:EquipTool(map) end) task.wait(0.4) end
+		lastRes = nil
+		local p0 = hrp.Position
+		pcall(function() MapR.Travel:FireServer(best) end)
+		log(("วาร์ปด้วยแผนที่ → %s (เดินเองไกล %.0f stud · จากจุดวาร์ปเหลือ %.0f)"):format(NAMES[best], d, bd))
+		st.status = ("วาร์ปไป %s"):format(NAMES[best])
+		local t0, moved = os.clock(), false
+		while os.clock() - t0 < 7 do
+			task.wait(0.25)
+			if type(lastRes) == "table" and lastRes.ok == false then break end
+			local _, h = char()
+			if h and (h.Position - p0).Magnitude > 100 then moved = true; task.wait(1.2) break end
+		end
+		-- weapon back in hand (the main loop / gather re-equip their own tool anyway)
+		if held and held ~= map and held.Parent then pcall(function() hum:EquipTool(held) end)
+		else pcall(function() hum:UnequipTools() end) end
+		if not moved then
+			log(("วาร์ปไม่สำเร็จ (%s)"):format(type(lastRes) == "table" and tostring(lastRes.reason) or "ไม่มีคำตอบ"))
+			quietUntil = os.clock() + 30
+			return false
+		end
+		return true
+	end
+end)()
+
 local MoveTab = TG:Tab({Name = "Movement", Image = "rbxassetid://10723346959"})
 local M = MoveTab:Section({Side = "Left"})
 M:Header({Text = "การเคลื่อนที่"})
 M:Dropdown({Name = "วิธีเดินทาง", Multi = false, Required = true, Options = MOVE_OPTS,
 	Default = idx(MOVE_OPTS, e.moveMode), Callback = function(v) e.moveMode = v; stopMove(); sv() end}, "PLMove")
+M:Toggle({Name = "วาร์ปด้วยแผนที่ (World Map) ถ้าต้องเดินไกล", Default = e.warpOn ~= false, Callback = function(v) e.warpOn = v; sv() end}, "PLWarpOn")
+M:Slider({Name = "└ ไกลเกินกี่ stud ถึงวาร์ป", Default = e.warpMin or 500, Minimum = 200, Maximum = 2000, DisplayMethod = "Round", Precision = 0,
+	Callback = function(v) e.warpMin = v; sv() end}, "PLWarpMin")
+M:Label({Text = "ต้องมีไอเท็ม Map ในกระเป๋า · วาร์ปได้เฉพาะจุดที่เคยไปถึงแล้ว (Spawn / Jungle / Beach Town / Tower / Gold Mine)\nคูลดาวน์ 30 วิ · วาร์ปเฉพาะตอนที่จุดวาร์ปใกล้เป้ากว่าตัวเราเกิน 300 stud"})
 M:Toggle({Name = "ปรับความเร็ววิ่งตอนฟาร์ม", Default = e.speedOn, Callback = function(v) e.speedOn = v; sv() end}, "PLSpeedOn")
 M:Slider({Name = "└ ความเร็ว x เท่า (1.0 = ปกติ 20)", Default = e.speedMult, Minimum = 1, Maximum = 2, DisplayMethod = "Round", Precision = 2,
 	Callback = function(v) e.speedMult = v; sv() end}, "PLSpeedMult")
@@ -3419,7 +3962,7 @@ end)
 task.spawn(function()
 	while alive() do task.wait(1) end
 	pcall(function() hbConn:Disconnect() end)
-	pcall(function() RunService:UnbindFromRenderStep("PolyLootWalk") end)
+	pcall(function() RunService:UnbindFromRenderStep(st.walkStep) end)
 	pcall(function() idleConn:Disconnect() end)
 	mover.walk = nil
 	setControls(true)
