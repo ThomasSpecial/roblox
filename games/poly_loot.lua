@@ -1333,6 +1333,7 @@ local function moveTo(goal, free)
 	-- far trip: the game's World Map warp first (st.tryWarp, defined with the Movement tab), then walk the rest
 	if e.moveMode == "Walk" and st.tryWarp and st.tryWarp(goal) then return end
 	if e.moveMode == "Walk" and st.mountFor then st.mountFor(goal) end
+	if st.mountArrive then st.mountArrive(goal) end
 	-- short repositioning (combat): the spot must have floor under it, else hold position
 	if e.moveMode == "Walk" and flat(goal - hrp.Position).Magnitude < 20 and not groundOk(c, feetOf(hrp, hum), goal) then
 		mover.walk = nil
@@ -2508,7 +2509,11 @@ task.spawn(function()
 				if dpsStat.t == t then
 					if dist <= e.reach + 1 then
 						dpsStat.time += math.min(now - dpsStat.at, 0.5)
-						if h < dpsStat.h then dpsStat.dmg += dpsStat.h - h end
+						if h < dpsStat.h then
+							dpsStat.dmg += dpsStat.h - h
+							-- biggest single drop we've seen (saved): tells how few swings a mob needs
+							if dpsStat.h - h > (e.bigHit or 0) then e.bigHit = dpsStat.h - h; sv() end
+						end
 					end
 				else
 					dpsStat.t = t
@@ -2517,8 +2522,14 @@ task.spawn(function()
 				st.dps = myDps()
 			end
 
+			-- burst: a mob we kill in a couple of swings is not worth backing off from. Retreating / side-stepping a Pyrolisk
+			-- (ranged 46, every hit lethal) only handed it free shots while ours never landed
+			local burst = mobHp(t) <= math.max((st.dps or 0) * 3, (e.bigHit or 0) * 2.5)
+			st.burst = burst
 			-- low HP: back off and let AreaHeal / regen work
-			if e.retreat then
+			if burst then
+				retreating = false
+			elseif e.retreat then
 				-- retreat only when there's nothing worth eating: ranged mobs (Cobra spit) hit us while we wait anyway
 				if hpPct() <= e.retreatAt and not ((e.usePotion or e.useFood) and healAvailable()) then retreating = true end
 				if retreating and (e.usePotion or e.useFood) and healAvailable() and hpPct() > e.retreatAt then retreating = false end
@@ -2541,7 +2552,8 @@ task.spawn(function()
 			end
 
 			-- smart evade (heavy hitter winding up) > telegraph dodge > drops > fight
-			local ev, evName, evDmg = smartEvade(hrp, hum)
+			local ev, evName, evDmg
+			if not burst then ev, evName, evDmg = smartEvade(hrp, hum) end
 			if ev then
 				st.evades = (st.evades or 0) + 1
 				st.evadeUntil = os.clock() + 0.3
@@ -2550,7 +2562,7 @@ task.spawn(function()
 				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
 				return
 			end
-			local dp = e.dodge and dodgePoint(hrp, hum)
+			local dp = e.dodge and not burst and dodgePoint(hrp, hum)
 			if not dp and lootStep(hrp) then
 				lookAt = nil
 				if not aura(c, hrp) then endCombo() end
@@ -3840,6 +3852,18 @@ end)()
 		local w = st.weaponSerial
 		pcall(function() w = w or invData().Equipped.Weapon end)
 		if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+	end
+	-- close to where we're going: get off and walk the last bit. Riding at ~70 studs/s the mount circled the Pyrolisk
+	-- 15-55 studs out (and 30 up, flying) and never came within weapon reach -> no swing, no dismount, death
+	local lastOff = 0
+	st.mountArrive = function(goal)
+		local c, hrp = char()
+		if not hrp or c:GetAttribute("Mounted") ~= true or os.clock() - lastOff < 1.5 then return end
+		local t = st.target
+		if t and mobAlive(t) and flat(mobPos(t) - goal).Magnitude < 15 and flat(goal - hrp.Position).Magnitude < 30 then
+			lastOff = os.clock()
+			st.dismount()
+		end
 	end
 	st.mountFor = function(goal)
 		if not e.mountOn or manual() then return end
