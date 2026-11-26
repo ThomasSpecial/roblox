@@ -295,7 +295,7 @@ bossTargetScan = function(hrp)
 					log(("ข้ามบอส %s: ตีทีละ %s แต่เลือดเต็มเรา %d (ปิด 'ข้ามบอสที่ตีทีเดียวตาย' ถ้าจะไปจริง)"):format(kind,
 						tostring(m:GetAttribute("Damage")), hum.MaxHealth))
 				end
-				if e.bossPick[kind] and not lethal then
+				if e.bossPick[kind] and not lethal and not ((skipUntil[m] or 0) > os.clock()) then
 					local ok, p = pcall(function() return m:GetPivot().Position end)
 					if ok then
 						local d = (p - hrp.Position).Magnitude
@@ -491,7 +491,8 @@ do
 		if not l2 then return nil end
 		local n = DIRN[di * 3 + dj]
 		if bit32.band(m.wall[l][k] or 0, bit32.lshift(1, n - 1)) ~= 0 then return nil end
-		if m.bad[((k - 1) * MAXL + l - 1) * 8 + n] then return nil end
+		local bt = m.bad[((k - 1) * MAXL + l - 1) * 8 + n]
+		if bt and (bt == true or os.clock() - bt < 300) then return nil end   -- "bad" marks expire after 5 min
 		local dh = m.hts[l2][k2] - y
 		if walkOnly and dh > WALK_UP then return nil end
 		if diag then
@@ -711,8 +712,15 @@ do
 		local di, dj = math.clamp(qi - i, -1, 1), math.clamp(qj - j, -1, 1)
 		local n = DIRN[di * 3 + dj]
 		if not n or (di == 0 and dj == 0) then return end
-		m.bad[((j * m.w + i) * MAXL + l - 1) * 8 + n] = true
+		m.bad[((j * m.w + i) * MAXL + l - 1) * 8 + n] = os.clock()
 		m.edge = {}
+	end
+	-- forget every "bad" mark (a plan that finds no path at all while marks exist: they cut a real route)
+	function Nav.clearBad(m)
+		local had = next(m.bad) ~= nil
+		m.bad = {}
+		m.edge = {}
+		return had
 	end
 
 	-- ---------------------------------------------------------------- scanner
@@ -1077,6 +1085,13 @@ function NAVR.scan(r, onStatus)
 	log(m2 and ("สแกน NavMap %s เสร็จ: %s"):format(r.name, tostring(info)) or ("สแกน NavMap %s ไม่สำเร็จ: %s"):format(r.name, tostring(info)))
 	st.navScanning = false
 end
+-- rescan a region from outside (debug / when the map went stale)
+st.navScanRegion = function(name)
+	for _, r in ipairs(NAVR.regions) do
+		if r.name == name then task.spawn(NAVR.scan, r) return true end
+	end
+	return false
+end
 local function getNav(goal)
 	local _, hrp = char()
 	local r = hrp and NAVR.at(hrp.Position, goal)
@@ -1179,6 +1194,11 @@ local function computePath(hrp, goal)
 	end
 	if m and Nav.inside(m, hrp.Position) and Nav.inside(m, navGoal) then
 		local ok, pts, why = pcall(Nav.plan, m, hrp.Position, navGoal, true, function() task.wait() end)
+		-- no route at all while unstick "bad" marks exist: they piled up and cut a real path -> forget them, retry once
+		if ok and not pts and why == "no-path" and Nav.clearBad and Nav.clearBad(m) then
+			log("NavMap: หาทางไม่เจอ → ล้างทางที่จำว่าตันแล้วหาใหม่")
+			ok, pts, why = pcall(Nav.plan, m, hrp.Position, navGoal, true, function() task.wait() end)
+		end
 		if ok and pts and #pts >= 2 then
 			local wps = {}
 			for _, q in ipairs(pts) do
@@ -2420,7 +2440,7 @@ task.spawn(function()
 					st.bossActive = true
 					st.target, lookAt = nil, nil
 					endCombo()
-					moveTo(trip.pos)
+					st.tripMove(trip)
 					st.status = ("Auto Boss: ไปหา %s (ป้ายบอกว่าเกิดแล้ว) · %.0f stud"):format(trip.kind, trip.d)
 					return
 				end
@@ -2514,7 +2534,7 @@ task.spawn(function()
 					st.bossActive = true
 					st.target, lookAt = nil, nil
 					endCombo()
-					moveTo(trip.pos)
+					st.tripMove(trip)
 					st.status = ("ไปหาบอส %s (ป้ายบอกว่าเกิดแล้ว) · %.0f stud"):format(trip.kind, trip.d)
 					return
 				end
@@ -2709,6 +2729,27 @@ task.spawn(function()
 					return
 				end
 				lookAt = nil
+				-- no real progress toward this target for 25 s (wedged in a rock crevice next to TripleCobra's
+				-- plateau for minutes): skip it for 2 min, walk our footsteps back out
+				local tpr = st.tprog
+				if not tpr or tpr.t ~= t or dist < tpr.best - 10 then
+					st.tprog = {t = t, best = dist, at = os.clock()}
+				elseif os.clock() - tpr.at > 25 then
+					st.tprog = nil
+					skipUntil[t] = os.clock() + 120
+					local kind = tostring(t:GetAttribute("Animal"))
+					if t:GetAttribute("Tier") == "Boss" then
+						st.bossLock = nil
+						if st.tripFail then st.tripFail(kind, 120) end
+					end
+					backtrack.i = #trail
+					backtrack.stop = math.max(1, #trail - 25)
+					backtrack.untilT = os.clock() + 15
+					path.wps = nil
+					log(("ไปหา %s ไม่คืบหน้า 25 วิ → ข้าม 2 นาที แล้วถอยออกตามรอยเท้า"):format(kind))
+					st.target = nil
+					return
+				end
 				if not aura(c, hrp) then endCombo() end
 				moveTo(e.moveMode == "Walk" and tp or Vector3.new(tp.X, hrp.Position.Y, tp.Z))
 				st.status = ("เดินทางไปหา %s · %.0f stud (%s)"):format(tostring(t:GetAttribute("Animal")), dist, e.moveMode)
@@ -4182,6 +4223,35 @@ end)()
 	local AC
 	pcall(function() AC = require(RS.Animal_Engine.Config) end)
 	local near, failed = {}, {}
+	st.tripFail = function(kind, secs) failed[kind] = os.clock() + (secs or 120) end
+	-- ride toward a boss sign; no progress for 30 s: 1st time walk our footsteps back, 2nd time warp to the town
+	-- nearest the boss and start over from there, 3rd time give that boss up for 3 min
+	local prog = {}
+	st.tripMove = function(trip)
+		local now = os.clock()
+		local pr = prog[trip.kind]
+		if not pr or trip.d < pr.best - 15 then
+			prog[trip.kind] = {best = trip.d, at = now, n = pr and pr.n or 0}
+		elseif now - pr.at > 30 then
+			pr.n += 1
+			pr.at, pr.best = now, trip.d
+			if pr.n == 1 then
+				backtrack.i = #trail
+				backtrack.stop = math.max(1, #trail - 25)
+				backtrack.untilT = now + 15
+				path.wps = nil
+				log(("ไปหา %s ไม่คืบหน้า → ถอยตามรอยเท้า"):format(trip.kind))
+			elseif pr.n == 2 and st.tryWarp and st.tryWarp(trip.pos, true) then
+				log(("ไปหา %s ยังติด → วาร์ปไปเมืองที่ใกล้บอสแล้วเริ่มใหม่"):format(trip.kind))
+			else
+				prog[trip.kind] = nil
+				failed[trip.kind] = now + 180
+				log(("ไปหา %s ไม่ถึง → ข้ามบอสนี้ 3 นาที"):format(trip.kind))
+				return
+			end
+		end
+		moveTo(trip.pos)
+	end
 	st.bossTrip = function(hrp)
 		if not e.bossHunt then return nil end
 		local best
@@ -4263,17 +4333,17 @@ end)()
 	if plr.Character then task.spawn(hookHurt, plr.Character) end
 	plr.CharacterAdded:Connect(hookHurt)
 	local LOCK = (tonumber(MapC.COMBAT_LOCK) or 8) + 0.7
-	st.tryWarp = function(goal)
+	st.tryWarp = function(goal, force)
 		if not e.warpOn or manual() then return false end
 		-- in combat: no warp yet (the trip keeps riding away meanwhile; riding never swings)
 		if os.clock() - (st.combatAt or 0) < LOCK then st.warpWaiting = true return false end
 		st.warpWaiting = nil
 		local now = os.clock()
-		if now - lastTry < 4 or now < quietUntil then return false end
+		if not force and (now - lastTry < 4 or now < quietUntil) then return false end
 		local c, hrp, hum = char()
 		if not hrp or hum.Health <= 0 then return false end
 		local d = flat(goal - hrp.Position).Magnitude
-		if d < e.warpMin then return false end
+		if d < e.warpMin and not force then return false end
 		if (tonumber(plr:GetAttribute(MapC.READY_ATTR)) or 0) > workspace:GetServerTimeNow() then return false end
 		-- the Map is an inventory item (Materials "Map"); it's only a Tool in the Backpack while it sits on the hotbar
 		local map = plr.Backpack:FindFirstChild("Map") or c:FindFirstChild("Map")
@@ -4292,7 +4362,7 @@ end)()
 			if disc[id] and typeof(dest.pos) == "Vector3" and flat(dest.pos - hrp.Position).Magnitude > (MapC.MIN_TRIP or 45) + 5 then
 				local dd = flat(dest.pos - goal).Magnitude
 				-- only worth it when it cuts the walk a lot
-				if dd < d - 300 and (not bd or dd < bd) then best, bd = id, dd end
+				if (force or dd < d - 300) and (not bd or dd < bd) then best, bd = id, dd end
 			end
 		end
 		if not best then quietUntil = now + 15 return false end
