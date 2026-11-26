@@ -2684,6 +2684,21 @@ task.spawn(function()
 			-- until resumeAt. A mob we're already hitting (hurt + in reach) gets finished.
 			if e.retreat then
 				local hp = math.floor(hpPct())
+				-- aggressors around us (Pyrolisk: aggro 46, chases at 1.6x up to leash 110) + the last spot with none near
+				local away, n = Vector3.zero, 0
+				do
+					local nearest = math.huge
+					local folder = AnimalLive:FindFirstChild("Aggressors")
+					for _, m in ipairs(folder and folder:GetChildren() or {}) do
+						if mobAlive(m) then
+							local v = flat(hrp.Position - mobPos(m))
+							nearest = math.min(nearest, v.Magnitude)
+							if v.Magnitude > 0.1 and v.Magnitude < 80 then away += v.Unit * (80 - v.Magnitude); n += 1 end
+						end
+					end
+					-- 60 = past Pyrolisk aggro (46) / mortar (44) range; the volcano is too packed for anything farther
+					if nearest > 60 and hum.FloorMaterial ~= Enum.Material.Air then st.safeSpot = hrp.Position end
+				end
 				if hp >= e.resumeAt then
 					st.resting = nil
 				elseif st.resting and os.clock() - st.resting > 90 then
@@ -2698,16 +2713,14 @@ task.spawn(function()
 						endCombo(); lookAt = nil
 						-- don't let the progress watchdogs count the rest as "stuck" (they'd skip the boss for 2 min)
 						st.tprog, st.travelProg, noProg.t = nil, nil, nil
-						local away, n = Vector3.zero, 0
-						local folder = AnimalLive:FindFirstChild("Aggressors")
-						for _, m in ipairs(folder and folder:GetChildren() or {}) do
-							if mobAlive(m) then
-								local v = flat(hrp.Position - mobPos(m))
-								if v.Magnitude > 0.1 and v.Magnitude < 70 then away += v.Unit * (70 - v.Magnitude); n += 1 end
-							end
-						end
+						-- back to the last spot with no aggressor within 60 (stepping straight away pinned us on a wall at
+						-- 1 % while a Pyrolisk kept hitting); nav walks the way we came. Already there and still chased ->
+						-- step away from them
+						local sp = st.safeSpot
 						if inHealZone() then
 							moveTo(healZone.c)
+						elseif n > 0 and sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 then
+							moveTo(sp)
 						elseif n > 0 and away.Magnitude > 0.1 then
 							moveTo(hrp.Position + away.Unit * 30)
 						else
@@ -2722,9 +2735,12 @@ task.spawn(function()
 			do
 				local h = mobHp(t)
 				-- close by (flat < 40) but no damage: 8 s when "in reach", 20 s while still trying to climb to it
+				-- ...but only 5 s when it is hitting US meanwhile: on a ledge 12 studs above a Pyrolisk we tanked five
+				-- 20k hits (91 % -> 43 %) in 10 s without one of ours landing
 				if noProg.t ~= t or h < noProg.hp - 1 or flat(tp - hrp.Position).Magnitude > 40 then
-					noProg.t, noProg.hp, noProg.at = t, h, os.clock()
-				elseif os.clock() - noProg.at > (dist <= e.reach + 2 and 8 or 20) then
+					noProg.t, noProg.hp, noProg.at, noProg.me = t, h, os.clock(), hum.Health
+				elseif os.clock() - noProg.at > (dist <= e.reach + 2 and 8 or 20)
+					or (os.clock() - noProg.at > 5 and (noProg.me or 0) - hum.Health >= hum.MaxHealth * 0.12) then
 					skipUntil[t] = os.clock() + 45
 					log(("ตี %s ไม่เข้า (อยู่บนที่สูง/หลังหิน) → ข้ามไปตัวอื่น 45 วิ"):format(tostring(t:GetAttribute("Animal"))))
 					st.target, noProg.t = nil, nil
