@@ -148,7 +148,8 @@ st.fixHeld = function(force)
 	if not force and (os.clock() < busyUntil or st.warping or os.clock() - (st.heldCheckAt or 0) < 1) then return end
 	st.heldCheckAt = os.clock()
 	local c = plr.Character
-	if not (c and isWeaponTool(c:FindFirstChildOfClass("Tool"))) then return end
+	local tool = c and c:FindFirstChildOfClass("Tool")
+	if not isWeaponTool(tool) then return end
 	pcall(function()
 		local d = require(plr.PlayerScripts.Data_Client.PlayerData):WaitFor().Data
 		local h = d.Equipped and d.Equipped.Held
@@ -157,6 +158,20 @@ st.fixHeld = function(force)
 			if os.clock() - (st.heldLogAt or 0) > 10 then
 				st.heldLogAt = os.clock()
 				log("เซิร์ฟเวอร์ยังคิดว่าถือของอื่น (แผนที่) อยู่ → เก็บเข้าตัว ไม่งั้นฟันไม่เข้า")
+			end
+		end
+		-- the server's damage for our hits is the player attribute _EquippedWeaponDamage (set by ITS equip). A warp /
+		-- client-side re-draw cleared it: swings "landed" but bosses took 0 (Rex 1.8B, Skullcrab, Owl stayed at full HP
+		-- for an hour; only abilities still killed mobs). EquipRequest(weapon) puts it straight back (nil -> 1.04M)
+		if plr:GetAttribute("_EquippedWeaponDamage") == nil and os.clock() - (st.dmgFixAt or 0) > 2 then
+			st.dmgFixAt = os.clock()
+			local w = tool:GetAttribute("InventorySerial") or (d.Equipped and d.Equipped.Weapon)
+			if w then
+				RS.Inventory_Engine.Remotes.EquipRequest:FireServer(w)
+				if os.clock() - (st.dmgLogAt or 0) > 10 then
+					st.dmgLogAt = os.clock()
+					log("เซิร์ฟเวอร์ลืมดาเมจอาวุธ (_EquippedWeaponDamage) → ใส่อาวุธใหม่ผ่านเซิร์ฟเวอร์")
+				end
 			end
 		end
 	end)
