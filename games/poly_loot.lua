@@ -2633,6 +2633,7 @@ task.spawn(function()
 			-- Auto Tower: walk to the door / start the next floor, or hold still between floors (see the Tower tab)
 			if st.towerLobby and st.towerLobby() then return end
 			if st.dungeonLobby and st.dungeonLobby() then return end
+			if st.harpoonStep and st.harpoonStep() then return end
 			-- Auto Boss on its own (Auto Farm off): fight only a picked boss that is up in range, otherwise hands off
 			local bossOnly = not farmOn and e.bossHunt and next(e.bossPick) ~= nil
 			local bossNow
@@ -4545,6 +4546,7 @@ end)()
 	if e.dungeonAgain == nil then e.dungeonAgain = true end
 	if e.tpDodge == nil then e.tpDodge = true end
 	if e.dungeonGreed == nil then e.dungeonGreed = true end
+	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
 	local function towerNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
@@ -4952,6 +4954,103 @@ end)()
 			tostring(gate:GetAttribute("GateCount")), tostring(gate:GetAttribute("GateMax"))) or ("Auto Dungeon: ยืนบนแท่น · ประตู %s"):format(gs)
 		return true
 	end
+	-- Inferno Dragon (Dragon's Hoard boss): it flies up (_DragAir) and ~14 s later starts a long inhale with a flight plan
+	-- (_DragRun "R1;t0,t1,tEnd,centre,r,alt,...") -> the 4 harpoon towers light up (Tower<n>.Lit) for ~12 s. Not shot
+	-- down = LongBreath for ~100k. So: as soon as it is airborne walk to the nearest tower's Plate, man it (prompt
+	-- "Man Harpoon", server sets GunnerId), then fire through the game's own gun (HarpoonGun._Gun / _fire) with the
+	-- lead from HarpoonMath (Center at the bolt's arrival time), only when HarpoonMath.Fly says the bolt hits.
+	local HG, HM, HMeta, HBody
+	local function hgLoad()
+		if HG and HM and HBody then return true end
+		pcall(function()
+			HG = require(plr.PlayerScripts.VolcanoDungeon_Client.HarpoonGun)
+			HM = require(RS.InfernoDragon_Engine.HarpoonMath)
+			HMeta = require(RS.InfernoDragon_Engine.Meta)
+			HBody = HM.Body(HMeta, (HMeta.TemplateScale or 0.65) / 0.65)
+		end)
+		return HG ~= nil and HM ~= nil and HBody ~= nil
+	end
+	local function harpoonShot(run)
+		if not hgLoad() then return false end
+		local g = HG._Gun and HG._Gun()
+		if not (g and g.T and g.T.restFrame) or g.ending or g.done then return false end
+		local now = workspace:GetServerTimeNow()
+		if now < math.max(g.localReady or 0, tonumber(g.T.model:GetAttribute("ReadyAt")) or 0) - 0.05 then return false end
+		local okP, plan = pcall(HM.Decode, run)
+		if not okP or not plan then return false end
+		local cfg = HMeta.HarpoonGun or {}
+		local from = g.T.restFrame.Position
+		local speed = cfg.BoltSpeed or 260
+		local okC, c = pcall(HM.Center, plan, now, HBody)
+		if not okC or typeof(c) ~= "Vector3" then return false end
+		local fl = (c - from).Magnitude / speed
+		for _ = 1, 8 do
+			c = HM.Center(plan, now + fl, HBody)
+			fl = (c - from).Magnitude / speed
+		end
+		local dir = (c - from).Unit
+		local okF, res = pcall(HM.Fly, plan, {from = from, dir = dir, speed = speed, t = now, range = cfg.BoltRange or 460},
+			HBody, cfg.BoltRadius or 2.5, plan.tEnd, g.wall)
+		if okF and type(res) == "table" and res.hit == false then return false end
+		g.dir = dir
+		HG._fire()
+		T.harpoons = (T.harpoons or 0) + 1
+		return true
+	end
+	st.harpoonStep = function()
+		if not (st.tw and st.tw.kind == "vd" and e.dungeonHarpoon) then return false end
+		local drag
+		for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
+			if m:GetAttribute("Animal") == "Inferno Dragon" and mobAlive(m) and wanted(m) then drag = m break end
+		end
+		if not drag then return false end
+		local run = drag:GetAttribute("_DragRun")
+		local planOn = type(run) == "string" and run ~= ""
+		if drag:GetAttribute("_DragAir") ~= true and not planOn then return false end
+		local _, hrp = char()
+		if not hrp then return false end
+		local room
+		pcall(function() room = drag.DungeonRoom.Value end)
+		local best, bd, bi
+		for i = 1, 4 do
+			local tw = room and room:FindFirstChild("Tower" .. i)
+			local plate = tw and tw:FindFirstChild("Plate", true)
+			if plate and not tw:GetAttribute("Spent") then
+				local gid = tonumber(tw:GetAttribute("GunnerId")) or 0
+				if gid == 0 or gid == plr.UserId then
+					local d = gid == plr.UserId and -1 or flat(plate.Position - hrp.Position).Magnitude
+					if not bd or d < bd then best, bd, bi = tw, d, i end
+				end
+			end
+		end
+		if not best then return false end
+		st.target, lookAt = nil, nil
+		endCombo()
+		local plate = best:FindFirstChild("Plate", true)
+		if (tonumber(best:GetAttribute("GunnerId")) or 0) ~= plr.UserId then
+			local d = flat(plate.Position - hrp.Position).Magnitude
+			if d > 4 then
+				moveTo(Vector3.new(plate.Position.X, plate.Position.Y + 3, plate.Position.Z))
+				st.status = ("Dungeon: มังกรบิน → ไปป้อมฉมวก %d · %.0f stud"):format(bi, d)
+				return true
+			end
+			stopMove()
+			local pr = best:FindFirstChildWhichIsA("ProximityPrompt", true)
+			if best:GetAttribute("Lit") == true and pr and os.clock() - (T.manAt or 0) > 1 then
+				T.manAt = os.clock()
+				pcall(function()
+					pr.HoldDuration = 0
+					if fireproximityprompt then fireproximityprompt(pr) else pr:InputHoldBegin(); task.wait(); pr:InputHoldEnd() end
+				end)
+			end
+			st.status = best:GetAttribute("Lit") == true and ("Dungeon: ขึ้นป้อมฉมวก %d"):format(bi) or ("Dungeon: รอป้อมฉมวก %d ติดไฟ"):format(bi)
+			return true
+		end
+		stopMove()
+		if planOn then pcall(harpoonShot, run) end
+		st.status = ("Dungeon: ยิงฉมวกใส่มังกร (ยิงไป %d)"):format(T.harpoons or 0)
+		return true
+	end
 	-- main-loop hook. true = the tower has the character this tick
 	st.towerLobby = function()
 		if not e.towerAuto then st.towerTrip = nil return false end
@@ -5029,6 +5128,7 @@ end)()
 	DL:Toggle({Name = "Auto Dungeon (ไปยืนแท่นประตูเอง · ตีทุกห้อง + บอส)", Default = e.dungeonAuto, Callback = function(v) e.dungeonAuto = v; sv() end}, "PLDungeonAuto")
 	DL:Toggle({Name = "└ จบรอบแล้วลงรอบใหม่ต่อเลย (ปิด = กลับโลกปกติ)", Default = e.dungeonAgain, Callback = function(v) e.dungeonAgain = v; sv() end}, "PLDungeonAgain")
 	DL:Toggle({Name = "└ เก็บความโลภ (Greed) ที่แท่นหลังเคลียร์ห้อง (+25% ดวง · มอนแรงขึ้น)", Default = e.dungeonGreed, Callback = function(v) e.dungeonGreed = v; sv() end}, "PLDungeonGreed")
+	DL:Toggle({Name = "└ บอสมังกรบิน → ไปขึ้นป้อมยิงฉมวกเอง (ยิงลงมาแล้วตีฟรี)", Default = e.dungeonHarpoon, Callback = function(v) e.dungeonHarpoon = v; sv() end}, "PLDungeonHarpoon")
 	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
 	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
 	local DR = DgTab:Section({Side = "Right"})
