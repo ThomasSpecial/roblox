@@ -2839,7 +2839,10 @@ task.spawn(function()
 				end
 				if st.resting and not ((e.usePotion or e.useFood) and healAvailable()) then
 					local hurt = mobHp(t) < (tonumber(t:GetAttribute("MaxHealth")) or math.huge) * 0.97
-					if not (hurt and flat(tp - hrp.Position).Magnitude <= e.reach + 4) then
+					-- one swing kills it and it's on us: a Pyrolisk chases at 1.6x our speed and shot us from 25 % to 0
+					-- while we "rested" away from it (10:45) -> hit it instead of running
+					local oneHit = mobHp(t) <= (e.bigHit or 0) * 0.9 and flat(tp - hrp.Position).Magnitude <= e.reach + 6
+					if not ((hurt and flat(tp - hrp.Position).Magnitude <= e.reach + 4) or oneHit) then
 						endCombo(); lookAt = nil
 						-- don't let the progress watchdogs count the rest as "stuck" (they'd skip the boss for 2 min)
 						st.tprog, st.travelProg, noProg.t = nil, nil, nil
@@ -3209,6 +3212,7 @@ end)
 
 -- death log: what we were fighting, who was around, who landed the last hit
 local function bindDeath(c)
+	st.spawnAt = os.clock()
 	local hum = c:WaitForChild("Humanoid", 10)
 	if not hum then return end
 	hum.Died:Connect(function()
@@ -3261,6 +3265,13 @@ task.spawn(function()
 		pcall(function()
 			local now = os.clock()
 			if st.kills ~= wd.kills then wd.kills, wd.killAt = st.kills, now end
+			-- resting at low HP, dead, or just respawned is not "stuck": those minutes counted as "no kill for 240 s" and
+			-- the watchdog reset a character 20 s after it respawned (instant death at full HP, 10:46)
+			local _, _, wdHum = char()
+			if st.resting or not wdHum or wdHum.Health <= 0 or now - (st.spawnAt or 0) < 30 then
+				wd.best, wd.at, wd.killAt = nil, now, now
+				return
+			end
 			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive or manual() then
 				wd.best, wd.at = nil, now
 				if not e.farm then wd.killAt = now end
