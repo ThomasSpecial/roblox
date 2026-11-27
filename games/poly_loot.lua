@@ -5546,6 +5546,7 @@ end)()
 	if e.fishTradeMats == nil then e.fishTradeMats = true end    -- deals with a wood / ore line too
 	if type(e.fishTradePick) ~= "table" then e.fishTradePick = {} end   -- reward keys; empty = every reward
 	if e.fishSellQuest == nil then e.fishSellQuest = true end    -- "Sell N fish" / "Earn X coins selling fish" quests
+	if type(e.fishPoolSpots) ~= "table" then e.fishPoolSpots = {} end   -- shore spot found per water (quest mode)
 	local F = {nonce = 70000 + math.random(1, 9999), state = "idle", at = 0, catches = 0, perfect = 0, status = "ปิดอยู่",
 		last = "-", claimAt = {}, dirBad = 0, tradeWait = {}, trades = 0, sellWait = {}}
 	st.fishF = F
@@ -5564,14 +5565,14 @@ end)()
 		end
 		return n
 	end
-	local function rodSerial()
+	local function rodSerial(lava)
 		local d = invData()
 		local best, bk, bs, pick, ps
 		for serial, it in pairs(d and d.Inventory and d.Inventory.Materials or {}) do
 			local ok, def = pcall(Rods.Get, it.Id)
 			if ok and type(def) == "table" then
-				if e.fishRod ~= "" and it.Id == e.fishRod then pick, ps = it.Id, serial end
-				if not def.LavaOnly then
+				if e.fishRod ~= "" and it.Id == e.fishRod and (def.LavaOnly == true) == (lava == true) then pick, ps = it.Id, serial end
+				if (def.LavaOnly == true) == (lava == true) then
 					local k = (tonumber(def.Tier) or 0) * 10 + (tonumber(def.Luck) or 1)
 					if not bk or k > bk then best, bk, bs = it.Id, k, serial end
 				end
@@ -5721,6 +5722,7 @@ end)()
 		if w and d.Equipped.Held ~= w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
 		st.weapon, st.weaponSerial = nil, w
 	end
+	F.bossCheck = bossWanted
 	-- true = fishing stays out of the way this tick (boss first, then back to the spot)
 	local function bossBreak(hrp)
 		local fs = plr:GetAttribute("_FishingState") or "idle"
@@ -5768,6 +5770,10 @@ end)()
 			local c, hrp = char()
 			if not hrp then return false end
 			if flat(pos - hrp.Position).Magnitude <= near then stopMove() return true end
+			if F.bossCheck and os.clock() - (F.bcAt or 0) > 1 then
+				F.bcAt = os.clock()
+				if F.bossCheck(hrp) then stopMove() return false end
+			end
 			moveTo(pos)
 			if not lastP or (hrp.Position - lastP).Magnitude > 2 then
 				lastP, lastAt = hrp.Position, os.clock()
@@ -5783,6 +5789,15 @@ end)()
 		end
 		stopMove()
 		return false
+	end
+	-- far away: map warp toward it first (30 s cooldown, only when it saves the walk), then walk
+	local function travel(pos, near, timeout)
+		local _, hrp = char()
+		if hrp and flat(pos - hrp.Position).Magnitude > (e.warpMin or 500) and st.tryWarp and os.clock() - (F.warpAt or 0) > 10 then
+			F.warpAt = os.clock()
+			if st.tryWarp(pos) then task.wait(2.5) end
+		end
+		return goTo(pos, near, timeout)
 	end
 	-- the module's original Step, kept across reloads (each copy of the script wraps it once)
 	local rawStep = getgenv().__PLMGStep or MG.Step
@@ -5879,11 +5894,15 @@ end)()
 		end
 	end)
 	-- a direction from the rod tip that lands in water (the spot's own direction first)
-	local function castDir(hrp, origin, rodId)
+	local function poolOf(land)
+		local ok, p = pcall(Wt.PoolFor, land.inst, land.at, "Grasslands")
+		return ok and p or nil
+	end
+	local function castDir(hrp, origin, rodId, wantPool)
 		local def = Rods.Get(rodId) or {}
 		local maxCast = def.MaxCast or 55
 		local D = Arc.Distance(1, FCfg.Cast.MIN_DISTANCE, maxCast)
-		local sp = e.fishSpot
+		local sp = type(e.fishSpot) == "table" and e.fishSpot or F.spotT
 		local base = type(sp) == "table" and sp[4] and Vector3.new(sp[4], 0, sp[5]) or flat(hrp.CFrame.LookVector)
 		base = base.Magnitude > 0.1 and base.Unit or Vector3.new(1, 0, 0)
 		local start = math.atan2(base.Z, base.X)
@@ -5891,7 +5910,7 @@ end)()
 			local a = start + (i % 2 == 0 and 1 or -1) * math.ceil(i / 2) * math.pi / 8
 			local dir = Vector3.new(math.cos(a), 0, math.sin(a))
 			local ok, land = pcall(Wt.FindLanding, origin, dir, D, FCfg.Cast, FCfg.Arc, maxCast, Arc, def)
-			if ok and land then return dir end
+			if ok and land and (not wantPool or poolOf(land) == wantPool) then return dir end
 		end
 	end
 	local function traderNear(pos)
@@ -5920,6 +5939,179 @@ end)()
 		return pos
 	end
 	F.offTrader = offTrader
+	local FC
+	pcall(function() FC = require(FE.FishCatalog) end)
+	local POOL_TH = {Grasslands = "Grasslands", Cave = "ถ้ำ (Cave)", Jungle = "ป่า (Jungle)", DarkForest = "Dark Forest", Beach = "ชายหาด (Beach)",
+		Volcano = "บ่อลาวา (Volcano)"}
+	F.badPool = {}
+	-- where each water is, before it streams in: the waterfall sound parts (always loaded, Waters.PoolFor names
+	-- their water), else the middle of the area's biggest zone; the beach = the pier
+	local anchorCache
+	local function anchors()
+		if anchorCache then return anchorCache end
+		local a = {Beach = {Vector3.new(3065, 125, -2606)}}
+		pcall(function()
+			for _, p in ipairs(workspace.AudioZones.AmbientSoundParts:GetChildren()) do
+				if p:IsA("BasePart") and p.Name == "Waterfall" then
+					local ok, pool = pcall(Wt.PoolFor, p, p.Position, "?")
+					if ok and POOL_TH[pool] and pool ~= "Beach" then a[pool] = a[pool] or {}; table.insert(a[pool], p.Position) end
+				end
+			end
+		end)
+		pcall(function()
+			local AC = require(RS.Area_Engine.AreaConfig)
+			local az = workspace:FindFirstChild("AudioZones")
+			for area, pool in pairs({DarkForest = "DarkForest", Volcano = "Volcano"}) do
+				if not a[pool] then
+					local best, bs
+					for _, zn in ipairs(AC.Areas[area] and AC.Areas[area].zones or {}) do
+						local f = az and az:FindFirstChild(zn)
+						for _, z in ipairs(f and f:GetChildren() or {}) do
+							if z:IsA("BasePart") and (not bs or z.Size.X * z.Size.Z > bs) then
+								best, bs = Vector3.new(z.Position.X, 125, z.Position.Z), z.Size.X * z.Size.Z
+							end
+						end
+					end
+					if best then a[pool] = {best} end
+				end
+			end
+		end)
+		anchorCache = a
+		return a
+	end
+	local function nearestAnchor(pool, from)
+		local best, bd
+		for _, p in ipairs(anchors()[pool] or {}) do
+			local d = flat(p - from).Magnitude
+			if not bd or d < bd then best, bd = p, d end
+		end
+		return best, bd
+	end
+	-- the water the open quests need most (pool catches / a species / new species); nil = no particular water
+	local function questPool(hrp)
+		local fd = fishData()
+		local slots = fd and fd.Quests and fd.Quests.Slots
+		if not (QB and type(slots) == "table") then return nil end
+		local journal = type(fd.Journal) == "table" and fd.Journal or {}
+		local score = {}
+		for _, q in pairs(slots) do
+			local okD, def = pcall(QB.Def, type(q) == "table" and q.Id)
+			if okD and type(def) == "table" and (tonumber(q.Have) or 0) < (tonumber(q.Need) or 0) then
+				local pools = {}
+				if (def.Kind == "Catch" or def.Kind == "Species") and type(def.Pool) == "string" then
+					pools[1] = def.Pool
+				elseif def.Kind == "New" and FC then
+					for _, a in ipairs(FC.AREAS or {}) do
+						for _, r in ipairs(FC.Pool(a.Pool) or {}) do
+							if r.id and not journal[r.id] then pools[#pools + 1] = a.Pool break end
+						end
+					end
+				end
+				for _, pl in ipairs(pools) do
+					local usable = anchors()[pl] and os.clock() > (F.badPool[pl] or 0) and (pl ~= "Volcano" or rodSerial(true) ~= nil)
+					if usable then score[pl] = (score[pl] or 0) + 1 end
+				end
+			end
+		end
+		local best, bs, bd
+		for pl, n in pairs(score) do
+			local _, d = nearestAnchor(pl, hrp.Position)
+			d = d or math.huge
+			if not bs or n > bs or (n == bs and d < bd) then best, bs, bd = pl, n, d end
+		end
+		return best
+	end
+	-- a shore spot on that water near the anchor (it has to be streamed in): water points ring by ring, then dry
+	-- ground 8-28 studs off them from where a cast lands in the same water
+	local function scanShore(pool, around, rodId)
+		local _, hrp = char()
+		if not hrp then return nil end
+		local minD = tonumber(FCfg.Cast and FCfg.Cast.MIN_DEPTH) or 1
+		local waters = {}
+		for r = 0, 200, 9 do
+			local n = math.max(1, math.floor(2 * math.pi * r / 9))
+			for i = 0, n - 1 do
+				local a = i / n * math.pi * 2
+				local ok, wp, inst = pcall(Wt.OpenWaterAt, around.X + math.cos(a) * r, around.Z + math.sin(a) * r, around.Y + 80, minD)
+				if ok and wp then
+					local okP, pl = pcall(Wt.PoolFor, inst, wp, "Grasslands")
+					if okP and pl == pool then waters[#waters + 1] = wp end
+				end
+			end
+			if #waters >= 40 then break end
+			task.wait()
+		end
+		table.sort(waters, function(x, y) return flat(x - hrp.Position).Magnitude < flat(y - hrp.Position).Magnitude end)
+		local tries = 0
+		for _, wp in ipairs(waters) do
+			for _, dd in ipairs({8, 14, 20, 28}) do
+				for i = 0, 11 do
+					local a = i * math.pi / 6
+					local x, z = wp.X + math.cos(a) * dd, wp.Z + math.sin(a) * dd
+					local top = Vector3.new(x, wp.Y + 30, z)
+					local okG, g = pcall(Wt.SolidRay, top, Vector3.new(0, -60, 0))
+					local okW, wHit = pcall(Wt.WaterRay, top, Vector3.new(0, -60, 0))
+					local dry = okG and g and not (okW and wHit and wHit.Y > g.Y - 0.5)
+					local bad = false
+					for _, b in ipairs(F.avoid or {}) do if dry and flat(b - g).Magnitude < 10 then bad = true end end
+					if dry and not bad and g.Y > wp.Y - 2 and g.Y < wp.Y + 25 then
+						tries += 1
+						local stand = g + Vector3.new(0, 3, 0)
+						local fake = {Position = stand, CFrame = CFrame.lookAt(stand, Vector3.new(wp.X, stand.Y, wp.Z))}
+						local dir = castDir(fake, stand + Vector3.new(0, 4.5, 0), rodId, pool)
+						if dir then return {stand.X, stand.Y, stand.Z, dir.X, dir.Z} end
+						if tries >= 120 then return nil end
+						if tries % 15 == 0 then task.wait() end
+					end
+				end
+			end
+		end
+	end
+	-- no spot set in the tab: the quests pick the water (none needs one = the beach); water of that kind in reach
+	-- right here = fish here. Returns the spot table, or nil when this tick was spent travelling / scanning.
+	local function questSpot(hrp)
+		local pool = questPool(hrp) or "Beach"
+		F.pool = pool
+		local _, rid = rodSerial(pool == "Volcano")
+		if not rid then F.status = "ไม่มีคันเบ็ดสำหรับ " .. (POOL_TH[pool] or pool) return nil end
+		if F.here and F.here.pool == pool and flat(Vector3.new(F.here[1], 0, F.here[3]) - hrp.Position).Magnitude < 6 then return F.here end
+		local dirHere = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0), rid, pool)
+		if dirHere then
+			F.here = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dirHere.X, dirHere.Z, pool = pool}
+			return F.here
+		end
+		local sp = e.fishPoolSpots[pool]
+		if type(sp) == "table" then return sp end
+		local an, d = nearestAnchor(pool, hrp.Position)
+		if not an then F.badPool[pool] = os.clock() + 600 return nil end
+		local found
+		if d > 150 then
+			if d < 400 and os.clock() - (F.scanAt or 0) > 20 then
+				F.scanAt = os.clock()
+				found = scanShore(pool, hrp.Position, rid)
+			end
+			if not found then
+				F.status = ("ไปตกที่ %s (ตามเควส)"):format(POOL_TH[pool] or pool)
+				st.extStatus = "Auto Fishing: " .. F.status
+				travel(an, 140, 90)
+				return nil
+			end
+		else
+			F.status = "หาริมน้ำ " .. (POOL_TH[pool] or pool)
+			st.extStatus = "Auto Fishing: " .. F.status
+			found = scanShore(pool, Vector3.new(an.X, math.min(an.Y, hrp.Position.Y + 40), an.Z), rid)
+				or scanShore(pool, hrp.Position, rid)
+		end
+		if not found then
+			F.badPool[pool] = os.clock() + 600
+			log(("Fishing: หาริมน้ำ %s ที่โยนลงได้ไม่เจอ → ข้ามน้ำนี้ 10 นาที"):format(POOL_TH[pool] or pool))
+			return nil
+		end
+		e.fishPoolSpots[pool] = found
+		sv()
+		log(("Fishing: เจอริมน้ำ %s ที่ %.0f, %.0f → ตกตามเควส"):format(POOL_TH[pool] or pool, found[1], found[3]))
+		return found
+	end
 	local function step()
 		if not e.fishAuto then
 			if st.extBusy == "fish" then st.extBusy = nil; stopMove() end
@@ -5962,7 +6154,7 @@ end)()
 					F.claimAt[i] = os.clock()
 					F.status = ("เควสเสร็จ (%s) → ไปเคลมที่ร้าน"):format(tostring(q.Id))
 					st.extStatus = "Auto Fishing: " .. F.status
-					if goTo(post(), 7, 60) then
+					if travel(post(), 7, 90) then
 						pcall(function() FR.QuestClaim:FireServer(i) end)
 						task.wait(1.5)
 						log(("Fishing: เคลมเควส %s"):format(tostring(q.Id)))
@@ -5998,7 +6190,7 @@ end)()
 		if e.fishTrade then
 			local o, wk = tradeReady()
 			local pad = o and traderPad()
-			if o and pad then
+			if o and pad and flat(pad - hrp.Position).Magnitude < 300 then
 				F.tradeWait[wk] = os.clock() + 60
 				local what = ("%s x%s"):format(tostring(o.Key), tostring(o.Amount))
 				F.status = "Fish Trader: ไปแลก " .. what
@@ -6028,14 +6220,18 @@ end)()
 				return
 			end
 		end
-		-- the spot: set from the tab, or where Auto Fishing was turned on
-		if type(e.fishSpot) ~= "table" then
-			local lv = flat(hrp.CFrame.LookVector)
-			e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, lv.X, lv.Z}
-			sv()
+		-- the spot: set in the tab; none set = the quests pick the water
+		local spotT
+		if type(e.fishSpot) == "table" then
+			F.pool = nil
+			spotT = e.fishSpot
+		else
+			spotT = questSpot(hrp)
+			if not spotT then return end
 		end
-		local spot = Vector3.new(e.fishSpot[1], e.fishSpot[2], e.fishSpot[3])
-		if traderNear(spot) then
+		F.spotT = spotT
+		local spot = Vector3.new(spotT[1], spotT[2], spotT[3])
+		if type(e.fishSpot) == "table" and traderNear(spot) then
 			local _, rid = rodSerial()
 			local moved = offTrader(spot, rid)
 			if moved ~= spot then
@@ -6046,20 +6242,26 @@ end)()
 			end
 		end
 		if flat(spot - hrp.Position).Magnitude > 5 then
-			if flat(spot - hrp.Position).Magnitude > (e.warpMin or 500) and st.tryWarp and os.clock() - (F.warpAt or 0) > 10 then
-				F.warpAt = os.clock()
-				F.status = "วาร์ปกลับไปจุดตกปลา"
-				st.extStatus = "Auto Fishing: " .. F.status
-				if st.tryWarp(spot) then task.wait(2) return end
-			end
-			F.status = "เดินไปจุดตกปลา"
+			F.status = F.pool and ("เดินไปริมน้ำ " .. (POOL_TH[F.pool] or F.pool)) or "เดินไปจุดตกปลา"
 			st.extStatus = "Auto Fishing: " .. F.status
-			goTo(spot, 4, 60)
+			if not travel(spot, 4, 60) and F.pool and spotT == e.fishPoolSpots[F.pool] then
+				-- a shore spot we never reach: forget it, find another next time
+				F.miss = (F.miss or 0) + 1
+				if F.miss >= 3 then
+					F.miss = 0
+					F.avoid = F.avoid or {}
+					table.insert(F.avoid, spot)
+					e.fishPoolSpots[F.pool] = nil
+					sv()
+					log("Fishing: เดินไปริมน้ำนี้ไม่ถึง → หาจุดใหม่")
+				end
+			end
 			return
 		end
+		F.miss = 0
 		stopMove()
 		-- rod in hand
-		local serial, rodId = rodSerial()
+		local serial, rodId = rodSerial(F.pool == "Volcano")
 		if not serial then F.status = "ไม่มีคันเบ็ด" return end
 		local tool = c:FindFirstChildOfClass("Tool")
 		if not (tool and tool:GetAttribute("FishingRod") == rodId) then
@@ -6101,8 +6303,18 @@ end)()
 		-- cast like a player: press, hold until the power bar is full (the perfect window), aim at the water, release
 		local tip = tool:FindFirstChild("RodTip", true)
 		local origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or (hrp.Position + Vector3.new(0, 4.5, 0))
-		local dir = castDir(hrp, origin, rodId)
-		if not dir then F.status = "หาน้ำไม่เจอจากจุดนี้ (ตั้งจุดใหม่ริมน้ำ หันหน้าเข้าหาน้ำ)" return end
+		local dir = castDir(hrp, origin, rodId, F.pool)
+		if not dir then
+			if F.pool and spotT == e.fishPoolSpots[F.pool] then
+				e.fishPoolSpots[F.pool] = nil
+				sv()
+				log("Fishing: จุดริมน้ำนี้โยนไม่ลงน้ำที่ต้องการ → หาจุดใหม่")
+				return
+			end
+			F.here = nil
+			F.status = "หาน้ำไม่เจอจากจุดนี้ (ตั้งจุดใหม่ริมน้ำ หันหน้าเข้าหาน้ำ)"
+			return
+		end
 		c:PivotTo(CFrame.lookAt(hrp.Position, hrp.Position + dir))
 		task.wait(0.1)
 		F.status = "ง้างคัน"
@@ -6133,18 +6345,7 @@ end)()
 		e.fishAuto = v
 		if not v then F.state = "idle" end
 		if v then
-			local _, hrp = char()
-			local _, rodId = rodSerial()
-			if hrp and rodId then
-				local dir = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0) + flat(hrp.CFrame.LookVector) * 2, rodId)
-				if dir then
-					local at = offTrader(hrp.Position, rodId)
-					e.fishSpot = {at.X, at.Y, at.Z, dir.X, dir.Z}
-					log(at == hrp.Position and "Fishing: ตกตรงที่ยืน (มีน้ำในระยะโยน)" or "Fishing: ตรงนี้คือแท่น Fish Trader → ขยับไปตกข้างๆ")
-				elseif type(e.fishSpot) == "table" then
-					log("Fishing: ตรงนี้ไม่มีน้ำในระยะโยน → ไปจุดตกปลาที่ตั้งไว้")
-				end
-			end
+			log(type(e.fishSpot) == "table" and "Fishing: ตกที่จุดที่ตั้งไว้" or "Fishing: ไม่ได้ตั้งจุด → ตกตามเควส (ไม่มีเควสที่ต้องไปน้ำอื่น = ชายหาด)")
 		end
 		sv()
 	end}, "PLFishAuto")
@@ -6157,6 +6358,12 @@ end)()
 		e.fishSpot = {at.X, at.Y, at.Z, lv.X, lv.Z}
 		sv()
 		log(("Fishing: ตั้งจุดตกปลาที่ %.0f, %.0f, %.0f%s"):format(at.X, at.Y, at.Z, at ~= hrp.Position and " (ขยับออกจากแท่น Trader)" or ""))
+	end})
+	FL:Button({Name = "ล้างจุดตกปลา → ตกตามเควสเอง (ไปน้ำที่เควสต้องการ)", Callback = function()
+		e.fishSpot = nil
+		F.here, F.spotT = nil, nil
+		sv()
+		log("Fishing: ล้างจุดตกปลาแล้ว → ตกตามเควส")
 	end})
 	local baitOpts, baitKey = {"ดีที่สุดที่มี (อัตโนมัติ)"}, {}
 	pcall(function()
@@ -6222,6 +6429,10 @@ end)()
 	local FRs = FiTab:Section({Side = "Right"})
 	FRs:Header({Text = "สถานะตกปลา"})
 	local fLbl = FRs:Label({Text = "-"})
+	F.modeText = function()
+		if type(e.fishSpot) == "table" then return "จุด: ตั้งเอง" end
+		return "จุด: ตามเควส → " .. (POOL_TH[F.pool or "Beach"] or tostring(F.pool))
+	end
 	task.spawn(function()
 		while alive() do
 			pcall(function()
@@ -6244,7 +6455,7 @@ end)()
 					tl = ("\nFish Trader: %s · rep %d%s · แลกแล้ว %d · ดีลเหลือ %d · รีสต็อก %d นาที"):format(tostring(TC.TIERS[tier].Name), rp,
 						nxt and ("/" .. nxt) or "", F.trades, left, mins)
 				end)
-				fLbl:UpdateName(("%s\nจับได้ %d ตัว (perfect %d) · ล่าสุด %s\nคัน %s · เหยื่อ %s (เหลือ %d)%s%s\nเควส:\n%s"):format(F.status, F.catches, F.perfect, F.last,
+				fLbl:UpdateName((F.modeText() .. "\n%s\nจับได้ %d ตัว (perfect %d) · ล่าสุด %s\nคัน %s · เหยื่อ %s (เหลือ %d)%s%s\nเควส:\n%s"):format(F.status, F.catches, F.perfect, F.last,
 					tostring(rodId), tostring(fd.Bait), fd.Bait and owned(fd.Bait) or 0, F.why and ("\nล่าสุดที่ไม่ผ่าน: " .. F.why) or "", tl,
 					#qs > 0 and table.concat(qs, "\n") or "-"))
 			end)
