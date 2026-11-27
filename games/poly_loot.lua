@@ -4910,15 +4910,15 @@ end)()
 	local hopRp = RaycastParams.new()
 	hopRp.FilterType = Enum.RaycastFilterType.Exclude
 	st.towerHop = function(c, hrp, t, tp, dist)
-		if not (e.towerTp and st.tw) or T.hopOff == st.tw.run then return false end
+		if not (e.towerTp and st.tw) or os.clock() < (T.hopOffUntil or 0) then return false end
 		local now = os.clock()
 		local hc = T.hopCheck
 		if hc and now > hc.at then
 			T.hopCheck = nil
 			if c:GetAttribute("_ServerMovementRebaseline") ~= hc.rb then
-				T.hopOff = st.tw.run
+				T.hopOffUntil = os.clock() + 8
 				T.snaps = (T.snaps or 0) + 1
-				log("Tower: เซิร์ฟดึงตัวกลับหลังวาร์ป → ชั้นนี้เดินแทน")
+				log("เซิร์ฟดึงตัวกลับหลังวาร์ป → พักวาร์ป 8 วิ")
 				return false
 			end
 		end
@@ -5425,7 +5425,7 @@ end)()
 				if s then
 					lines[#lines + 1] = ("ชั้นสูงสุด %d (ซีซั่นนี้) · เคยถึง %d · %s"):format(tonumber(s.best) or 0, tonumber(s.bestEver) or 0, tostring(s.seasonName or ""))
 				end
-				if (T.hops or 0) > 0 then lines[#lines + 1] = ("วาร์ปเข้าหามอนไป %d ครั้ง%s"):format(T.hops, st.tw and T.hopOff == st.tw.run and " (ชั้นนี้ปิด: โดนดึงกลับ)" or "") end
+				if (T.hops or 0) > 0 then lines[#lines + 1] = ("วาร์ปเข้าหามอนไป %d ครั้ง%s"):format(T.hops, os.clock() < (T.hopOffUntil or 0) and " (พักวาร์ป: โดนดึงกลับ)" or "") end
 				local f = e.towerFail
 				if type(f) == "table" then lines[#lines + 1] = ("แพ้ชั้น %d ติดกัน %d/%d ครั้ง"):format(f.floor or 0, f.n or 0, e.towerTries) end
 				twLbl:UpdateName(table.concat(lines, "\n"))
