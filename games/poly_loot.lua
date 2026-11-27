@@ -223,6 +223,11 @@ local function wanted(m)
 	if e.bossOnly and m:GetAttribute("Tier") ~= "Boss" then return false end
 	local any = next(e.mobs) ~= nil
 	if any and not e.mobs[m:GetAttribute("Animal") or ""] then return false end
+	-- a mob standing in Ignarok's Rift (st.rift, see the rift watcher): fighting it = 5 s inside = pulled into the arena
+	if st.rift and m:GetAttribute("Tier") ~= "Boss" then
+		local ok, p = pcall(function() return m:GetPivot().Position end)
+		if ok and ((p - st.rift) * Vector3.new(1, 0, 1)).Magnitude < 45 then return false end
+	end
 	return true
 end
 -- farm spot: only mobs within anchorR of it count, and after a death / respawn we walk back to it
@@ -2679,6 +2684,17 @@ task.spawn(function()
 			end
 			st.lootHold = nil
 			local anchor = anchorPos()
+			-- inside / next to Ignarok's Rift: step out before its 5 s join timer pulls us into the Demon Lord arena
+			if st.rift then
+				local v = flat(hrp.Position - st.rift)
+				if v.Magnitude < 38 then
+					local dir = v.Magnitude > 1 and v.Unit or Vector3.new(1, 0, 0)
+					endCombo(); lookAt = nil
+					moveTo(st.rift + dir * 60)
+					st.status = ("ออกจากประตู Ignarok's Rift (%.0f stud) ไม่ให้ถูกดูดเข้าสนามบอส"):format(v.Magnitude)
+					return
+				end
+			end
 			local boss = bossTarget(hrp)
 			-- a mob standing on us (st.blocker) is finished first, the boss waits: swapping between them every tick
 			-- (Spider <-> Gargoyle) meant hitting neither
@@ -4441,6 +4457,37 @@ end)()
 		pcall(function() w = w or invData().Equipped.Weapon end)
 		if w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
 	end
+	-- Ignarok's Rift (DemonLord_Engine.Config.Rift): every 20 min a rift opens for 10 min at a random mob spawn in the
+	-- volcano (radius 26); a Level 300+ player 5 s inside is pulled into the Demon Lord arena (-6500, 400, 4500). The
+	-- farm walked into one at 08:32 and died there. Its visuals live in workspace._DemonLordRiftLocal -> st.rift
+	-- (centre), a NavMap hazard while open, wanted() ignores mobs in it and the main loop steps out of it
+	task.spawn(function()
+		local lastKey
+		while alive() do
+			task.wait(1)
+			local p
+			pcall(function()
+				local folder = workspace:FindFirstChild("_DemonLordRiftLocal")
+				local sum, n = Vector3.zero, 0
+				for _, d in ipairs(folder and folder:GetDescendants() or {}) do
+					if d:IsA("BasePart") and d.Size.Magnitude < 200 and d.Position.Magnitude < 20000 then sum += d.Position; n += 1 end
+				end
+				if n > 0 then p = sum / n end
+			end)
+			-- the arena itself is not a rift: ignore anything over there
+			if p and (p - Vector3.new(-6500, 400, 4500)).Magnitude < 1500 then p = nil end
+			st.rift = p
+			local key = p and ("%d,%d"):format(p.X // 20, p.Z // 20) or "none"
+			if key ~= lastKey then
+				lastKey = key
+				for i = #Nav.hazards, 1, -1 do if Nav.hazards[i].rift then table.remove(Nav.hazards, i) end end
+				if p then table.insert(Nav.hazards, {cf = CFrame.new(p), half = Vector3.new(36, 80, 36), rift = true}) end
+				for _, m in pairs(Nav.maps) do m.hz = nil end
+				path.wps = nil
+				if p then log(("ประตู Ignarok's Rift เปิดที่ %.0f, %.0f → ไม่เข้าใกล้"):format(p.X, p.Z)) end
+			end
+		end
+	end)
 	-- the server-side hand check (st.fixHeld) every second, not only right before a swing: after a warp the Map stayed
 	-- "held" for 15 s while we walked up to Skullcrab, and the first swings there were wasted
 	task.spawn(function()
