@@ -5602,7 +5602,11 @@ end)()
 		stopMove()
 		return false
 	end
+	-- the module's original Step, kept across reloads (each copy of the script wraps it once)
+	local rawStep = getgenv().__PLMGStep or MG.Step
+	getgenv().__PLMGStep = rawStep
 	local function solve(spec, seed)
+		F.solving = true
 		for attempt = 1, 8 do
 			local sim = MG.New(spec, seed)
 			local bot = MG.Bot(1, Random.new(attempt * 7919 + seed % 1000))
@@ -5611,46 +5615,73 @@ end)()
 			while not sim.done and sim.step < maxSteps do
 				local want = bot(sim) and true or false
 				if want ~= holding then toggles[#toggles + 1] = sim.step; holding = want end
-				MG.Step(sim, holding)
+				rawStep(sim, holding)
 			end
 			local outcome, steps, perfect = MG.Replay(spec, seed, toggles)
-			if outcome == "caught" and (perfect or attempt >= 4) then return toggles, steps, perfect end
+			if outcome == "caught" and (perfect or attempt >= 4) then F.solving = false return toggles, steps, perfect end
 		end
+		F.solving = false
+	end
+	-- The game's own fishing controller (Fishing_Client.Controller) does the visible part: cast animation, line, bobber,
+	-- fight bar, catch card. We drive it like a player: onPress (charge / hook / close the card), throw (release), and
+	-- during the fight its input table answers "space" from our solved plan (the step the fight is at comes from the
+	-- module's Step), so the toggles it records and sends with Done are exactly the solved, perfect ones.
+	local CTL = {}
+	local function findCtl()
+		if CTL.press and CTL.throw and CTL.input then return true end
+		for _, v in ipairs(getgc(true)) do
+			if type(v) == "function" then
+				local ok, src = pcall(debug.info, v, "s")
+				if ok and type(src) == "string" and src:find("Fishing_Client%.Controller") then
+					local n = debug.info(v, "n")
+					if n == "onPress" then CTL.press = v elseif n == "throw" then CTL.throw = v end
+				end
+			elseif type(v) == "table" and rawget(v, "padA") ~= nil and rawget(v, "space") ~= nil and rawget(v, "mouse") ~= nil then
+				CTL.input = v
+			end
+		end
+		return CTL.press ~= nil and CTL.throw ~= nil and CTL.input ~= nil
+	end
+	local function sameSpec(a, b)
+		return type(a) == "table" and type(b) == "table" and a.gain == b.gain and a.start == b.start and a.zone == b.zone and a.speed == b.speed
+	end
+	MG.Step = function(sim, holding)
+		if not F.solving and F.planSpec and sameSpec(sim.spec, F.planSpec) then F.sim = sim end
+		return rawStep(sim, holding)
+	end
+	local function hookInput()
+		local t = CTL.input
+		if not t or CTL.hooked == t then return end
+		CTL.hooked = t
+		local userSpace = rawget(t, "space")
+		rawset(t, "space", nil)
+		setmetatable(t, {
+			__index = function(_, k)
+				if k ~= "space" then return nil end
+				local plan = F.plan
+				if plan and e.fishAuto and plr:GetAttribute("_FishingState") == "fight" then
+					local stp = F.sim and F.sim.step or 0
+					local n = 0
+					for _, ti in ipairs(plan) do if ti <= stp then n += 1 else break end end
+					return n % 2 == 1
+				end
+				return userSpace
+			end,
+			__newindex = function(tt, k, v)
+				if k == "space" then userSpace = v else rawset(tt, k, v) end
+			end,
+		})
 	end
 	FR.Event.OnClientEvent:Connect(function(kind, d)
 		if not alive() or type(d) ~= "table" then return end
 		if kind == "Cast" then
-			if d.nonce ~= F.nonce or F.state ~= "cast" then return end
-			if d.ok and d.sid then
-				F.sid, F.state, F.at = d.sid, "wait", os.clock()
-				F.dirBad, F.why = 0, nil
-			else
-				F.state, F.why = "idle", tostring(d.why)
-				F.dirBad += 1
-			end
-			return
-		end
-		if d.sid == nil or d.sid ~= F.sid then return end
-		if kind == "Bite" and F.state == "wait" then
-			F.state = "hook"
-			task.delay(0.12, function() pcall(function() FR.Request:FireServer("Hook", F.sid) end) end)
-		elseif kind == "Missed" then
-			F.state = "wait"
-		elseif kind == "Hooked" then
-			F.state, F.at = "fight", os.clock()
-			local sid = F.sid
-			task.spawn(function()
-				local toggles, steps = solve(d.spec, d.seed)
-				if not toggles then
-					pcall(function() FR.Request:FireServer("Reel", sid) end)
-					F.state = "idle"
-					return
-				end
-				task.wait(steps * d.spec.step + 0.3)
-				if F.sid == sid then pcall(function() FR.Request:FireServer("Done", sid, "caught", toggles) end) end
-			end)
+			if d.ok then F.why = nil else F.why = tostring(d.why) end
+		elseif kind == "Hooked" and e.fishAuto then
+			-- solved right here, before the controller's first fight frame
+			F.sim, F.planSpec = nil, d.spec
+			F.plan = solve(d.spec, d.seed)
 		elseif kind == "Result" then
-			F.state = "idle"
+			F.plan, F.planSpec, F.sim = nil, nil, nil
 			if d.ok then
 				F.catches += 1
 				if d.perfect then F.perfect += 1 end
@@ -5720,13 +5751,22 @@ end)()
 		st.extStatus = "Auto Fishing: " .. F.status
 		local c, hrp = char()
 		if not hrp then F.status = "รอตัวละครเกิด" return end
-		if F.state ~= "idle" then
-			-- no bite for 75 s (the game reels in after 60) / a fight that never resolved: start over
-			if os.clock() - F.at > (F.state == "fight" and 60 or 75) then
-				pcall(function() FR.Request:FireServer("Reel", F.sid) end)
-				F.state = "idle"
-			end
-			F.status = ({cast = "โยนเบ็ด", wait = "รอปลากิน", hook = "ปลากินแล้ว เกี่ยว!", fight = "ดึงปลา"})[F.state] or F.state
+		if not findCtl() then F.status = "หาระบบตกปลาของเกมไม่เจอ (ถือคันเบ็ดค้างไว้สักครู่)" return end
+		hookInput()
+		local fs = plr:GetAttribute("_FishingState") or "idle"
+		if fs ~= F.lastFs then F.lastFs, F.fsAt = fs, os.clock() end
+		if fs == "bite" then
+			task.wait(0.1)
+			pcall(CTL.press)
+			F.status = "ปลากิน → เกี่ยว!"
+			return
+		elseif fs == "catch" then
+			if os.clock() - F.fsAt > 1.2 then pcall(CTL.press) end
+			F.status = "ได้ปลา!"
+			return
+		elseif fs ~= "idle" then
+			F.status = ({charge = "ง้างคัน", throw = "โยนเบ็ด", fly = "โยนเบ็ด", wait = "รอปลากิน", hooking = "เกี่ยวเบ็ด", fight = "ดึงปลา (perfect)",
+				resolve = "ดึงปลา", reel = "ม้วนสาย"})[fs] or fs
 			return
 		end
 		local fd = fishData()
@@ -5809,17 +5849,24 @@ end)()
 				return
 			end
 		end
-		-- cast
+		-- cast like a player: press, hold until the power bar is full (the perfect window), aim at the water, release
 		local tip = tool:FindFirstChild("RodTip", true)
 		local origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or (hrp.Position + Vector3.new(0, 4.5, 0))
 		local dir = castDir(hrp, origin, rodId)
 		if not dir then F.status = "หาน้ำไม่เจอจากจุดนี้ (ตั้งจุดใหม่ริมน้ำ หันหน้าเข้าหาน้ำ)" return end
 		c:PivotTo(CFrame.lookAt(hrp.Position, hrp.Position + dir))
 		task.wait(0.1)
-		origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or origin
-		F.nonce += 1
-		F.state, F.at, F.sid = "cast", os.clock(), nil
-		pcall(function() FR.Request:FireServer("Cast", F.nonce, dir, 1, origin, true) end)
+		F.status = "ง้างคัน"
+		pcall(CTL.press)
+		if plr:GetAttribute("_FishingState") ~= "charge" then return end
+		local fill = tonumber(plr:GetAttribute("_FishFillTime")) or (FCfg.Cast.POWER_FILL or 0.8)
+		task.wait(fill + 0.12)
+		local cam = workspace.CurrentCamera
+		if cam then
+			local cp = cam.CFrame.Position
+			cam.CFrame = CFrame.lookAt(cp, cp + dir + Vector3.new(0, -0.2, 0))
+		end
+		if plr:GetAttribute("_FishingState") == "charge" then pcall(CTL.throw) end
 		F.status = "โยนเบ็ด"
 	end
 	task.spawn(function()
