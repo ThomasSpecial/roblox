@@ -2942,8 +2942,9 @@ task.spawn(function()
 					local ws = st.towerWaitSpot and st.towerWaitSpot(hrp)
 					local vdk = st.tw.kind == "vd"
 					if ws and flat(ws - hrp.Position).Magnitude > 8 then
-						local inRoom = vdk and plr:GetAttribute("DungeonState") == "fight" and math.abs(ws.Y - hrp.Position.Y) < 8
-							and flat(ws - hrp.Position).Magnitude < 160
+						local gr = st.towerT and st.towerT.greed
+						local inRoom = vdk and (plr:GetAttribute("DungeonState") == "fight" or (gr and gr.at == ws))
+							and math.abs(ws.Y - hrp.Position.Y) < 12 and flat(ws - hrp.Position).Magnitude < 160
 						if not (inRoom and st.hopTo and st.hopTo(Vector3.new(ws.X, hrp.Position.Y, ws.Z), ws, false)) then
 							moveTo(ws)   -- between rooms: walked (teleporting down the stairs got us pulled back)
 						end
