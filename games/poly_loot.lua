@@ -5679,6 +5679,32 @@ end)()
 			if ok and land then return dir end
 		end
 	end
+	local function traderNear(pos)
+		for _, pd in ipairs(CS2:GetTagged("FishTraderStation")) do
+			local ok, p = pcall(function() return pd:IsA("Model") and pd:GetPivot().Position or pd.Position end)
+			if ok and flat(p - pos).Magnitude < 10 then return p end
+		end
+	end
+	local function offTrader(pos, rodId)
+		local pad = traderNear(pos)
+		if not pad then return pos end
+		local c = plr.Character
+		hopRp2.FilterDescendantsInstances = {c}
+		for _, r in ipairs({13, 17, 22}) do
+			for i = 0, 11 do
+				local a = i * math.pi / 6
+				local q = pad + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+				local hit = workspace:Raycast(Vector3.new(q.X, pos.Y + 8, q.Z), Vector3.new(0, -16, 0), hopRp2)
+				if hit and hit.Instance.Name ~= "waterpart" and not traderNear(hit.Position) then
+					local stand = hit.Position + Vector3.new(0, 3, 0)
+					local _, hrp = char()
+					if hrp and castDir({Position = stand, CFrame = hrp.CFrame}, stand + Vector3.new(0, 1.5, 0), rodId) then return stand end
+				end
+			end
+		end
+		return pos
+	end
+	F.offTrader = offTrader
 	local function step()
 		if not e.fishAuto then
 			if st.extBusy == "fish" then st.extBusy = nil; stopMove() end
@@ -5727,6 +5753,16 @@ end)()
 			sv()
 		end
 		local spot = Vector3.new(e.fishSpot[1], e.fishSpot[2], e.fishSpot[3])
+		if traderNear(spot) then
+			local _, rid = rodSerial()
+			local moved = offTrader(spot, rid)
+			if moved ~= spot then
+				e.fishSpot = {moved.X, moved.Y, moved.Z, e.fishSpot[4], e.fishSpot[5]}
+				sv()
+				log("Fishing: จุดตกปลาทับแท่น Fish Trader → ย้ายออกมา")
+				return
+			end
+		end
 		if flat(spot - hrp.Position).Magnitude > 5 then
 			F.status = "เดินไปจุดตกปลา"
 			st.extStatus = "Auto Fishing: " .. F.status
@@ -5806,8 +5842,9 @@ end)()
 			if hrp and rodId then
 				local dir = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0) + flat(hrp.CFrame.LookVector) * 2, rodId)
 				if dir then
-					e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dir.X, dir.Z}
-					log("Fishing: ตกตรงที่ยืน (มีน้ำในระยะโยน)")
+					local at = offTrader(hrp.Position, rodId)
+					e.fishSpot = {at.X, at.Y, at.Z, dir.X, dir.Z}
+					log(at == hrp.Position and "Fishing: ตกตรงที่ยืน (มีน้ำในระยะโยน)" or "Fishing: ตรงนี้คือแท่น Fish Trader → ขยับไปตกข้างๆ")
 				elseif type(e.fishSpot) == "table" then
 					log("Fishing: ตรงนี้ไม่มีน้ำในระยะโยน → ไปจุดตกปลาที่ตั้งไว้")
 				end
@@ -5819,9 +5856,11 @@ end)()
 		local _, hrp = char()
 		if not hrp then return end
 		local lv = flat(hrp.CFrame.LookVector)
-		e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, lv.X, lv.Z}
+		local _, rid = rodSerial()
+		local at = offTrader(hrp.Position, rid)
+		e.fishSpot = {at.X, at.Y, at.Z, lv.X, lv.Z}
 		sv()
-		log(("Fishing: ตั้งจุดตกปลาที่ %.0f, %.0f, %.0f"):format(hrp.Position.X, hrp.Position.Y, hrp.Position.Z))
+		log(("Fishing: ตั้งจุดตกปลาที่ %.0f, %.0f, %.0f%s"):format(at.X, at.Y, at.Z, at ~= hrp.Position and " (ขยับออกจากแท่น Trader)" or ""))
 	end})
 	local baitOpts, baitKey = {"ไม่เปลี่ยน (ใช้ที่เลือกในเกม)"}, {}
 	pcall(function()
