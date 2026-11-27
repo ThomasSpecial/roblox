@@ -97,7 +97,9 @@ local function flat(v) return Vector3.new(v.X, 0, v.Z) end
 -- weapon tools carry WeaponId / InventorySerial attributes; food and potions don't. The old check took "holding any
 -- tool" as armed, so an Apple left in hand after eating stayed there and the farm never swung again.
 -- pickaxes are weapon tools too, but a 7-damage Wooden Pickaxe left in hand by Auto Gather is not what we fight with
-local function isWeaponTool(t) return t ~= nil and t:IsA("Tool") and t:GetAttribute("WeaponId") ~= nil and not t.Name:find("Pickaxe") end
+local function isWeaponTool(t)
+	return t ~= nil and t:IsA("Tool") and t:GetAttribute("WeaponId") ~= nil and not t.Name:find("Pickaxe") and t:GetAttribute("FishingRod") == nil
+end
 local busyUntil = 0     -- the farm loop doesn't swing / re-equip while we eat
 local function ensureWeapon()
 	local c, _, hum = char()
@@ -5702,6 +5704,54 @@ end)()
 		return batch, cnt, coins, met()
 	end
 	F.sellPlan = sellPlan
+	pcall(function() if st.weapon and Rods.Get(st.weapon) then st.weapon, st.weaponSerial = nil, nil end end)
+	-- Auto Boss on (Auto Farm off) + a picked boss up in range / its sign says up within the trip range: same test the
+	-- main loop's Auto Boss uses, so fishing hands the character over exactly when Auto Boss would go
+	local function bossWanted(hrp)
+		if e.farm or not e.bossHunt or next(e.bossPick) == nil or st.tw then return false end
+		local ok, b = pcall(bossTarget, hrp)
+		if ok and b then return true end
+		local ok2, t = pcall(function() return st.bossTrip and st.bossTrip(hrp) end)
+		return ok2 and t ~= nil
+	end
+	-- the sword back in hand the server way (the rod is what's held while fishing)
+	local function drawSword()
+		local d = invData()
+		local w = d and d.Equipped and d.Equipped.Weapon
+		if w and d.Equipped.Held ~= w then pcall(function() InvRemotes.EquipRequest:FireServer(w) end) end
+		st.weapon, st.weaponSerial = nil, w
+	end
+	-- true = fishing stays out of the way this tick (boss first, then back to the spot)
+	local function bossBreak(hrp)
+		local fs = plr:GetAttribute("_FishingState") or "idle"
+		local up = hrp and bossWanted(hrp)
+		local looting = st.lootHold and os.clock() < st.lootHold.untilT
+		if not F.bossAway then
+			if not up then return false end
+			-- a fish already biting / on the line is landed first; a line just in the water is reeled in
+			if fs == "bite" or fs == "hooking" or fs == "fight" or fs == "resolve" or fs == "catch" then return false end
+			if fs == "wait" then local ctl = F.CTL; if ctl and ctl.press then pcall(ctl.press) end F.status = "บอสเกิด → ม้วนสายเก็บ" return true end
+			if fs ~= "idle" and fs ~= "off" then F.status = "บอสเกิด → รอเก็บเบ็ด" return true end
+			F.bossAway, F.bossSeen = true, os.clock()
+			if st.extBusy == "fish" then st.extBusy = nil end
+			stopMove()
+			drawSword()
+			log("Fishing: บอสเกิด → ถือดาบไปตีบอสก่อน แล้วค่อยกลับมาตก")
+		end
+		if up or st.bossActive or looting then F.bossSeen = os.clock() end
+		-- the boss is done (and its loot picked up): a few seconds of grace, then back to fishing
+		if os.clock() - F.bossSeen < 4 then
+			if st.extBusy == "fish" then st.extBusy = nil end
+			local c = plr.Character
+			local held = c and c:FindFirstChildOfClass("Tool")
+			if held and held:GetAttribute("FishingRod") and os.clock() - (F.swordAt or 0) > 2 then F.swordAt = os.clock(); drawSword() end
+			F.status = st.bossActive and "พัก: กำลังตีบอส" or looting and "พัก: เก็บของบอส" or "พัก: ไปหาบอส"
+			return true
+		end
+		F.bossAway = false
+		log("Fishing: จบบอสแล้ว → กลับไปตกปลาต่อ")
+		return false
+	end
 	local function post()
 		for _, s in ipairs(CS2:GetTagged("RodShopStation")) do
 			local ok, p = pcall(function() return s:IsA("Model") and s:GetPivot().Position or s.Position end)
@@ -5759,6 +5809,7 @@ end)()
 	-- during the fight its input table answers "space" from our solved plan (the step the fight is at comes from the
 	-- module's Step), so the toggles it records and sends with Done are exactly the solved, perfect ones.
 	local CTL = {}
+	F.CTL = CTL
 	local function findCtl()
 		if CTL.press and CTL.throw and CTL.input then return true end
 		for _, v in ipairs(getgc(true)) do
@@ -5880,9 +5931,10 @@ end)()
 			F.status = "พัก: ปิด Auto Farm / Tower / Dungeon ก่อนถึงจะตกปลา"
 			return
 		end
+		local c, hrp = char()
+		if bossBreak(hrp) then return end
 		st.extBusy = "fish"
 		st.extStatus = "Auto Fishing: " .. F.status
-		local c, hrp = char()
 		if not hrp then F.status = "รอตัวละครเกิด" return end
 		if not findCtl() then F.status = "หาระบบตกปลาของเกมไม่เจอ (ถือคันเบ็ดค้างไว้สักครู่)" return end
 		hookInput()
@@ -5897,7 +5949,7 @@ end)()
 			if os.clock() - F.fsAt > 1.2 then pcall(CTL.press) end
 			F.status = "ได้ปลา!"
 			return
-		elseif fs ~= "idle" then
+		elseif fs ~= "idle" and fs ~= "off" then
 			F.status = ({charge = "ง้างคัน", throw = "โยนเบ็ด", fly = "โยนเบ็ด", wait = "รอปลากิน", hooking = "เกี่ยวเบ็ด", fight = "ดึงปลา (perfect)",
 				resolve = "ดึงปลา", reel = "ม้วนสาย"})[fs] or fs
 			return
@@ -5994,6 +6046,12 @@ end)()
 			end
 		end
 		if flat(spot - hrp.Position).Magnitude > 5 then
+			if flat(spot - hrp.Position).Magnitude > (e.warpMin or 500) and st.tryWarp and os.clock() - (F.warpAt or 0) > 10 then
+				F.warpAt = os.clock()
+				F.status = "วาร์ปกลับไปจุดตกปลา"
+				st.extStatus = "Auto Fishing: " .. F.status
+				if st.tryWarp(spot) then task.wait(2) return end
+			end
 			F.status = "เดินไปจุดตกปลา"
 			st.extStatus = "Auto Fishing: " .. F.status
 			goTo(spot, 4, 60)
