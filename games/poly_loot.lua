@@ -220,6 +220,7 @@ local function mobKinds()
 end
 local function wanted(m)
 	if not mobAlive(m) then return false end
+	if st.tw then return m:GetAttribute("_TowerRun") == st.tw.run end
 	if e.bossOnly and m:GetAttribute("Tier") ~= "Boss" then return false end
 	local any = next(e.mobs) ~= nil
 	if any and not e.mobs[m:GetAttribute("Animal") or ""] then return false end
@@ -232,6 +233,7 @@ local function wanted(m)
 end
 -- farm spot: only mobs within anchorR of it count, and after a death / respawn we walk back to it
 local function anchorPos()
+	if st.tw then return nil end
 	local a = e.useAnchor and e.anchor
 	return type(a) == "table" and tonumber(a[1]) and Vector3.new(a[1], a[2], a[3]) or nil
 end
@@ -258,7 +260,8 @@ local function candidates_(hrp)
 	local anchor = anchorPos()
 	local list = {}
 	local folders = {AnimalLive:FindFirstChild("Aggressors")}
-	if e.passives then folders[#folders + 1] = AnimalLive:FindFirstChild("Passives") end
+	if e.passives or st.tw then folders[#folders + 1] = AnimalLive:FindFirstChild("Passives") end
+	local radius = st.tw and 400 or e.radius
 	for _, folder in ipairs(folders) do
 		for _, m in ipairs(folder and folder:GetChildren() or {}) do
 			if wanted(m) and not ((skipUntil[m] or 0) > os.clock()) then
@@ -268,7 +271,7 @@ local function candidates_(hrp)
 				-- 70 studs away to the spot circle). Moths spread 180+ studs from the spot: with 50 here half of them
 				-- were ignored and the bot walked away from them.
 				if (anchor and (flat(mp - anchor).Magnitude <= e.anchorR or (d <= NEAR_R and math.abs(mp.Y - hrp.Position.Y) < 20)))
-					or (not anchor and d <= e.radius) then
+					or (not anchor and d <= radius) then
 					list[#list + 1] = {m = m, p = mp, d = d}
 				end
 			end
@@ -329,7 +332,7 @@ local bossTargetScan
 -- boss hunt: a picked boss (Tier = Boss) alive within bossRange of us or of the farm spot takes over from the normal
 -- target until it dies; then the farm goes back to its mobs / spot. Every boss seen is remembered for the picker.
 local function bossTarget(hrp)
-	if not e.bossHunt then st.bossLock = nil return nil end
+	if not e.bossHunt or st.tw then st.bossLock = nil return nil end
 	-- keep the boss we already went for: re-deciding every tick at the edge of bossRange flipped boss <-> gathering
 	local lk = st.bossLock
 	if lk and mobAlive(lk) and e.bossPick[tostring(lk:GetAttribute("Animal") or "?")] then
@@ -2040,7 +2043,7 @@ local function invPass(manual)
 			local _, d = nearestStation(hrp and hrp.Position or Vector3.zero)
 			if d and d <= 10 then
 				dismantleNow()
-			elseif not trip.active and (manual or n >= math.min(e.disMin, select(2, bagState(invData())) or e.disMin) or (e.disWhenFull and (function()
+			elseif not trip.active and not st.towerSrv and (manual or n >= math.min(e.disMin, select(2, bagState(invData())) or e.disMin) or (e.disWhenFull and (function()
 				local used, cap = bagState(invData())
 				return used >= cap - e.bagFree
 			end)())) then
@@ -2166,7 +2169,7 @@ task.spawn(function()
 				local pos = merchantPos(hrp.Position)
 				if pos and (pos - hrp.Position).Magnitude <= 10 then
 					buyNow()
-				elseif pos and e.farm and e.buyTrip then
+				elseif pos and e.farm and e.buyTrip and not st.towerSrv then
 					trip.active, trip.at, trip.kind = true, os.clock(), "shop"
 					log(("ร้านมีของที่ตั้งไว้ %d อย่าง → เดินไปซื้อ"):format(#wants))
 				elseif not pos then
@@ -2536,6 +2539,7 @@ task.spawn(function()
 	while alive() do
 		local dt = 0.1
 		local ok, err = pcall(function()
+			local farmOn = e.farm or st.tw ~= nil
 			if manual() then
 				backtrack.i = nil
 				if st.target or path.wps then st.target = nil; lookAt = nil; endCombo(); path.wps = nil end
@@ -2594,8 +2598,10 @@ task.spawn(function()
 					return
 				end
 			end
+			-- Auto Tower: walk to the door / start the next floor, or hold still between floors (see the Tower tab)
+			if st.towerLobby and st.towerLobby() then return end
 			-- Auto Boss on its own (Auto Farm off): fight only a picked boss that is up in range, otherwise hands off
-			local bossOnly = not e.farm and e.bossHunt and next(e.bossPick) ~= nil
+			local bossOnly = not farmOn and e.bossHunt and next(e.bossPick) ~= nil
 			local bossNow
 			if bossOnly and (not st.extBusy or st.extBusy == "gather") then
 				local _, bh = char()
@@ -2611,10 +2617,10 @@ task.spawn(function()
 				end
 			end
 			-- Auto Gather: a mob came at us while gathering -> fight it here (st.defend), gathering waits
-			local defend = e.gather and not e.farm and st.defend and mobAlive(st.defend) and st.defend or nil
+			local defend = e.gather and not farmOn and st.defend and mobAlive(st.defend) and st.defend or nil
 			if defend then st.blocker = defend; if st.target ~= defend then st.target = defend end end
 			local holding = st.lootHold and os.clock() < st.lootHold.untilT   -- boss loot pick-up (also Auto Boss alone)
-			if not e.farm and not bossNow and not defend and not holding then
+			if not farmOn and not bossNow and not defend and not holding then
 				-- a helper script (quest runner) is driving the character through st.api: hands off
 				if st.extBusy then st.status = st.extStatus or "สคริปต์เควสกำลังทำงาน"; return end
 				st.bossActive = false
@@ -2726,7 +2732,7 @@ task.spawn(function()
 				-- out of the spot circle AND not near us (a mob near us counts as a candidate, see NEAR_R)
 				if anchor and flat(mobPos(t) - anchor).Magnitude > e.anchorR + 30
 					and (mobPos(t) - hrp.Position).Magnitude > NEAR_R + 20 then t = nil
-				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > e.radius + 50 then t = nil end
+				elseif not anchor and (mobPos(t) - hrp.Position).Magnitude > (st.tw and 400 or e.radius) + 50 then t = nil end
 			end
 			if st.blocker and not mobAlive(st.blocker) then st.blocker = nil end
 			if t and e.targetMode ~= "ล็อกตัวเดิมจนตาย" and not wanted(t) and t ~= st.blocker then t = nil end
@@ -2767,14 +2773,14 @@ task.spawn(function()
 				end
 			end
 			end -- boss
-			if not t and e.farm then
+			if not t and farmOn then
 				t = pickTarget(hrp)
 				if t then lockStart = os.clock(); log(("ล็อก %s/%s HP %s"):format(tostring(t:GetAttribute("Animal")), tostring(t:GetAttribute("Tier")), tostring(t:GetAttribute("Health")))) end
 			end
 			st.target = t
 			if not t then
 				endCombo(); lookAt = nil
-				if not e.farm then stopMove(); return end
+				if not farmOn then stopMove(); return end
 				if anchor and flat(anchor - hrp.Position).Magnitude > 12 then
 					-- nothing to hit near the farm spot from here (e.g. just respawned in town): walk back
 					if not aura(c, hrp) then endCombo() end
@@ -2796,7 +2802,7 @@ task.spawn(function()
 			-- low HP: never walk into a NEW fight. Burst mode doesn't retreat, so at 8 % we walked into the next Pyrolisk
 			-- and at 5 % into TripleCobra (2 deaths in 3 min). Regen is ~1 %/s out of combat -> rest out of aggro range
 			-- until resumeAt. A mob we're already hitting (hurt + in reach) gets finished.
-			if e.retreat then
+			if e.retreat and not st.tw then
 				local hp = math.floor(hpPct())
 				-- aggressors that can reach us: each species' own max(AttackRange, AggroRadius) + 20 (Pyrolisk 66, TripleCobra /
 				-- Skullcrab 280 -- we rested 82 studs from TripleCobra and it shot us dead) + the last spot none of them covers
@@ -2908,7 +2914,7 @@ task.spawn(function()
 					noProg.t, noProg.hp, noProg.at, noProg.me = t, h, os.clock(), hum.Health
 				elseif os.clock() - noProg.at > (dist <= e.reach + 2 and 8 or 20)
 					or (os.clock() - noProg.at > 5 and (noProg.me or 0) - hum.Health >= hum.MaxHealth * 0.12) then
-					skipUntil[t] = os.clock() + 45
+					skipUntil[t] = os.clock() + (st.tw and 6 or 45)
 					log(("ตี %s ไม่เข้า (อยู่บนที่สูง/หลังหิน) → ข้ามไปตัวอื่น 45 วิ"):format(tostring(t:GetAttribute("Animal"))))
 					st.target, noProg.t = nil, nil
 					endCombo()
@@ -3203,7 +3209,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.25)
 		-- while a regeneration item works, eat again only in an emergency
-		if (e.farm or st.bossActive or st.defend) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
+		if (e.farm or st.bossActive or st.defend or st.tw) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
 			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= 25) then
 			pcall(useHeal)
 		end
@@ -3272,7 +3278,7 @@ task.spawn(function()
 				wd.best, wd.at, wd.killAt = nil, now, now
 				return
 			end
-			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive or manual() then
+			if not (e.farm and e.watchdog) or now < wd.grace or trip.active or st.bossActive or manual() or st.towerSrv or st.towerTrip then
 				wd.best, wd.at = nil, now
 				if not e.farm then wd.killAt = now end
 				return
@@ -3357,7 +3363,7 @@ do
 				if not up then shownAt = nil return end
 				shownAt = shownAt or os.clock()
 				-- the screen ignores clicks until its reveal has played (~1-2 s)
-				if not e.farm or os.clock() - shownAt < 2 then return end
+				if not (e.farm or st.tw or st.towerSrv) or os.clock() - shownAt < 2 then return end
 				local foot = gui:FindFirstChild("Main") and gui.Main:FindFirstChild("Footer")
 				local cam = workspace.CurrentCamera
 				local p = foot and (foot.AbsolutePosition + foot.AbsoluteSize / 2)
@@ -4456,6 +4462,274 @@ BR:Toggle({Name = "└ ซ่อนบอสที่ยังไม่รู้
 	end)
 end)()
 
+-- ------------------------------------------------------------------ Auto Tower (Competition Tower, DockTown)
+-- How the game runs it (read from Tower_Client + tested on floors 1-2, 2026-11-27):
+--  * Tower_Engine.Remotes.Act:InvokeServer("start", best + 1) next to the door (TowerPrompt on the TeleportPad,
+--    DockTown) -> Push "trip" -> TeleportService to a private server of the SAME place: cp_boot / the loader run
+--    this script again there, the config file carries e.towerAuto over.
+--  * In there: player attrs TowerRun (id per floor) / TowerState (intro, fight, won, lost) / TowerFloor / TowerWave /
+--    TowerWaves / TowerEnemies / TowerEndsAt (server epoch, 180 s per floor). The floor's mobs are ordinary
+--    Animal_Live mobs (Aggressors AND Passives) with _TowerRun = TowerRun -> st.tw switches the farm loop over to them.
+--  * Act("ready") skips the 10 s intro countdown.
+--  * Floor over: Dungeons_Engine.Remotes.Result ("state", {key = "Tower", state = "open", outcome = "victory" /
+--    "defeat", session}) -> Choice:FireServer("again", session) = NEXT FLOOR after a win / the same floor again after
+--    a loss, "home" = back to the door in a public server.
+;(function()
+	local TE = RS:FindFirstChild("Tower_Engine")
+	local Act = TE and TE:FindFirstChild("Remotes") and TE.Remotes:FindFirstChild("Act")
+	if not Act then return end
+	local Choice, Result
+	pcall(function() Choice = RS.Dungeons_Engine.Remotes.Choice; Result = RS.Dungeons_Engine.Remotes.Result end)
+	if e.towerAuto == nil then e.towerAuto = false end
+	if type(e.towerStop) ~= "number" then e.towerStop = 0 end     -- 0 = climb as high as we can
+	if type(e.towerTries) ~= "number" then e.towerTries = 3 end   -- losses in a row on one floor before going home
+	if type(e.towerRest) ~= "number" then e.towerRest = 30 end    -- minutes before trying that floor again
+	if e.towerClaim == nil then e.towerClaim = true end
+	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
+	local DOOR = Vector3.new(1307.5, 186.3, -85)
+	local function srvNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
+	st.towerSrvNow = srvNow
+	st.towerSrv = srvNow() or nil
+	local T = {state = nil, stateAt = -1e9, startAt = -1e9, res = nil, sent = {}, readyRun = nil, endedAt = nil}
+	st.towerT = T
+	local function ask(...)
+		local ok, r = pcall(Act.InvokeServer, Act, ...)
+		if ok and type(r) == "table" then return r end
+		return {ok = false, why = ok and tostring(r) or "error"}
+	end
+	-- cached Act("state") ({best, bestEver, level, minLevel, over, ...}); refreshed in the background so the farm loop
+	-- never waits on the server
+	local function towerState(force)
+		if (force or os.clock() - T.stateAt > 30) and not T.asking then
+			T.stateAt, T.asking = os.clock(), true
+			task.spawn(function()
+				local r = ask("state")
+				if r.ok and type(r.state) == "table" then T.state = r.state end
+				T.asking = false
+			end)
+		end
+		return T.state
+	end
+	local function paused() return (tonumber(e.towerPause) or 0) > os.time() end
+	local function claimPass()
+		if not e.towerClaim then return end
+		task.spawn(function()
+			local r = ask("claimAll")
+			if r.ok then log("Tower: รับรางวัล Tower Pass แล้ว") end
+		end)
+	end
+	if Result then
+		Result.OnClientEvent:Connect(function(kind, d)
+			if not alive() or type(d) ~= "table" then return end
+			if kind == "state" and d.key == "Tower" and d.state == "open" and d.session then
+				if not (T.res and T.res.session == d.session) then
+					T.res = {session = d.session, outcome = d.outcome, at = os.clock(), floor = tonumber(plr:GetAttribute("TowerFloor")) or 0}
+				end
+			elseif kind == "close" and T.res and d.session == T.res.session then
+				T.res = nil
+			end
+		end)
+	end
+	-- after a floor: next floor, the same floor again, or home (and rest) -- decided once per session, re-sent until
+	-- the game closes the result
+	local function decide(r)
+		local floor = r.floor
+		if r.outcome == "victory" then
+			e.towerFail = nil
+			if floor % 5 == 0 then claimPass() end
+			if e.towerStop > 0 and floor >= e.towerStop then
+				log(("Tower: ผ่านชั้น %d ถึงชั้นที่ตั้งไว้แล้ว → กลับเมือง"):format(floor))
+				return "home"
+			end
+			log(("Tower: ผ่านชั้น %d → ชั้นต่อไป"):format(floor))
+			return "again"
+		end
+		local f = e.towerFail
+		if type(f) ~= "table" or f.floor ~= floor then f = {floor = floor, n = 0} end
+		f.n += 1
+		e.towerFail = f
+		if f.n >= e.towerTries then
+			e.towerPause = os.time() + e.towerRest * 60
+			log(("Tower: แพ้ชั้น %d ติดกัน %d ครั้ง → กลับเมือง พัก %d นาทีแล้วค่อยลองใหม่"):format(floor, f.n, e.towerRest))
+			return "home"
+		end
+		log(("Tower: แพ้ชั้น %d (ครั้งที่ %d/%d) → ลองใหม่"):format(floor, f.n, e.towerTries))
+		return "again"
+	end
+	task.spawn(function()
+		while alive() do
+			task.wait(0.2)
+			pcall(function()
+				local run = plr:GetAttribute("TowerRun")
+				local ts = plr:GetAttribute("TowerState")
+				st.towerSrv = srvNow() or nil
+				local fighting = e.towerAuto and run and (ts == "intro" or ts == "fight")
+				if fighting then
+					if not st.tw or st.tw.run ~= run then
+						st.tw = {run = run, floor = tonumber(plr:GetAttribute("TowerFloor")) or 0, at = os.clock()}
+						st.target, st.blocker, st.bossLock = nil, nil, nil
+						path.wps = nil
+						T.res, T.endedAt = nil, nil
+						log(("Tower: เริ่มชั้น %d"):format(st.tw.floor))
+					end
+					-- skip the 10 s countdown once the script is up in the new run
+					if ts == "intro" and T.readyRun ~= run and os.clock() - st.tw.at > 1 then
+						T.readyRun = run
+						task.spawn(ask, "ready")
+					end
+				elseif st.tw then
+					st.tw = nil
+					st.target = nil
+				end
+				if e.towerAuto and (st.towerSrv or st.towerTrip) then
+					st.extBusy = "tower"
+				elseif st.extBusy == "tower" then
+					st.extBusy = nil
+				end
+				if not (e.towerAuto and run and (ts == "won" or ts == "lost")) then T.endedAt = nil return end
+				T.endedAt = T.endedAt or os.clock()
+				local r = T.res
+				if r then
+					if os.clock() - r.at < 2 then return end
+					local sent = T.sent[r.session]
+					if sent and os.clock() - sent.at < 6 then return end
+					local choice = sent and sent.choice or decide(r)
+					T.sent[r.session] = {choice = choice, at = os.clock()}
+					if not sent then sv(); towerState(true) end
+					pcall(function() Choice:FireServer(choice, r.session) end)
+				elseif os.clock() - T.endedAt > 8 and not T.lateBusy then
+					-- the result came before this copy of the script loaded (reload / teleport timing): its session id
+					-- "<run>_<n>" (n = results so far in this server) is still in the game's result view
+					T.lateBusy = true
+					task.spawn(function()
+						local session
+						pcall(function()
+							local pre = run .. "_"
+							for _, v in ipairs(getgc(true)) do
+								if type(v) == "table" then
+									local ss = rawget(v, "session")
+									if type(ss) == "string" and ss:sub(1, #pre) == pre and ss:sub(#pre + 1):match("^%d+$") then session = ss break end
+								end
+							end
+						end)
+						local outcome = ts == "won" and "victory" or "defeat"
+						if session then
+							T.res = {session = session, outcome = outcome, at = 0, floor = tonumber(plr:GetAttribute("TowerFloor")) or 0}
+						else
+							local key = "late:" .. run
+							local sent = T.sent[key]
+							local choice = sent and sent.choice or decide({outcome = outcome, floor = tonumber(plr:GetAttribute("TowerFloor")) or 0})
+							if not sent then T.sent[key] = {choice = choice, at = os.clock()}; sv() end
+							for i = 1, 40 do
+								if plr:GetAttribute("TowerRun") ~= run or not alive() then break end
+								pcall(function() Choice:FireServer(choice, run .. "_" .. i) end)
+								task.wait(0.6)
+							end
+						end
+						T.lateBusy = false
+						T.endedAt = os.clock()
+					end)
+				end
+			end)
+		end
+	end)
+	-- main-loop hook. true = the tower has the character this tick
+	st.towerLobby = function()
+		if not e.towerAuto then st.towerTrip = nil return false end
+		local _, hrp = char()
+		st.towerSrv = srvNow() or nil
+		if st.towerSrv then
+			if st.tw then return false end   -- a floor is on: the farm loop fights it
+			-- between floors / waiting for the teleport home: stand still
+			st.target, lookAt = nil, nil
+			endCombo()
+			stopMove()
+			local r = T.res
+			st.status = r and ("Auto Tower: ชั้น %d %s · กำลังไปต่อ"):format(r.floor, r.outcome == "victory" and "ผ่าน" or "ไม่ผ่าน")
+				or "Auto Tower: รอเริ่มชั้นถัดไป"
+			return true
+		end
+		st.towerTrip = nil
+		if paused() or not hrp then return false end
+		local s = towerState()
+		-- no state yet (first second after a load): don't guess floor 1 = a replay without rewards
+		if not s or s.over or (s.level and s.minLevel and s.level < s.minLevel) then return false end
+		local best = tonumber(s.best) or 0
+		if e.towerStop > 0 and best >= e.towerStop then return false end
+		st.towerTrip = true
+		st.target, lookAt = nil, nil
+		st.bossActive = false
+		endCombo()
+		local d = flat(DOOR - hrp.Position).Magnitude
+		if d > 6 then
+			if st.tripMove then st.tripMove({pos = DOOR, kind = "Tower", d = d}) else moveTo(DOOR) end
+			st.status = ("Auto Tower: ไปประตู Tower (DockTown) · %.0f stud"):format(d)
+			return true
+		end
+		stopMove()
+		if os.clock() - T.startAt > 20 then
+			T.startAt = os.clock()
+			local floor = best + 1
+			task.spawn(function()
+				local r = ask("start", floor)
+				if r.ok then
+					log(("Tower: เข้าชั้น %d"):format(floor))
+				else
+					log(("Tower: เข้าไม่ได้ (%s) → ลองใหม่ใน 20 วิ"):format(tostring(r.why)))
+					T.stateAt = -1e9
+				end
+			end)
+		end
+		st.status = ("Auto Tower: เข้า Tower ชั้น %d · รอเกมพาเข้า"):format(best + 1)
+		return true
+	end
+	claimPass()
+	towerState(true)
+
+	local TwTab = TG:Tab({Name = "Tower", Image = "rbxassetid://10723346959"})
+	local TL = TwTab:Section({Side = "Left"})
+	TL:Header({Text = "Competition Tower (DockTown)"})
+	TL:Toggle({Name = "Auto Tower (เดินไปประตูเอง · ไต่ชั้นต่อไปเรื่อยๆ)", Default = e.towerAuto, Callback = function(v)
+		e.towerAuto = v
+		if v then e.towerPause, e.towerFail = nil, nil end
+		sv()
+	end}, "PLTowerAuto")
+	TL:Slider({Name = "└ หยุดที่ชั้น (0 = ไต่จนกว่าจะไม่ไหว)", Default = e.towerStop, Minimum = 0, Maximum = 300, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.towerStop = v; sv() end}, "PLTowerStop")
+	TL:Slider({Name = "└ แพ้ชั้นเดิมติดกันกี่ครั้ง → กลับเมือง", Default = e.towerTries, Minimum = 1, Maximum = 10, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.towerTries = v; sv() end}, "PLTowerTries")
+	TL:Slider({Name = "└ กลับเมืองแล้วพักกี่นาทีก่อนลองใหม่", Default = e.towerRest, Minimum = 5, Maximum = 240, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.towerRest = v; sv() end}, "PLTowerRest")
+	TL:Toggle({Name = "└ รับรางวัล Tower Pass (ช่องฟรี) อัตโนมัติ", Default = e.towerClaim, Callback = function(v) e.towerClaim = v; sv() end}, "PLTowerClaim")
+	TL:Label({Text = "เปิดแล้ว Tower มาก่อน Farm/Boss: ระหว่างพัก (แพ้ติด) บอทกลับไปฟาร์ม/ตีบอสตามที่ตั้งไว้\nในหอคอยใช้ระบบตี/หลบ/กินยาเดียวกับ Farm แต่ไม่ถอยพักเลือด (ชั้นละ 180 วิ)\nชั้นที่ผ่านแล้วเล่นซ้ำไม่ได้ของ → เริ่มที่ชั้นสูงสุด + 1 เสมอ"})
+	local TRs = TwTab:Section({Side = "Right"})
+	TRs:Header({Text = "สถานะ Tower"})
+	local twLbl = TRs:Label({Text = "-"})
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local s = T.state
+				local lines = {}
+				if st.towerSrv then
+					local ends = tonumber(plr:GetAttribute("TowerEndsAt"))
+					lines[#lines + 1] = ("ในหอคอย · ชั้น %s · %s"):format(tostring(plr:GetAttribute("TowerFloor") or "?"), tostring(plr:GetAttribute("TowerState") or "?"))
+					lines[#lines + 1] = ("Wave %s/%s · มอนเหลือ %s%s"):format(tostring(plr:GetAttribute("TowerWave") or 0), tostring(plr:GetAttribute("TowerWaves") or "?"),
+						tostring(plr:GetAttribute("TowerEnemies") or 0), ends and (" · เวลาเหลือ %d วิ"):format(math.max(0, ends - workspace:GetServerTimeNow())) or "")
+				else
+					lines[#lines + 1] = e.towerAuto and (paused() and os.date("พัก Auto Tower ถึง %H:%M", e.towerPause) or "อยู่ข้างนอก · จะไปประตูเอง") or "Auto Tower ปิดอยู่"
+				end
+				if s then
+					lines[#lines + 1] = ("ชั้นสูงสุด %d (ซีซั่นนี้) · เคยถึง %d · %s"):format(tonumber(s.best) or 0, tonumber(s.bestEver) or 0, tostring(s.seasonName or ""))
+				end
+				local f = e.towerFail
+				if type(f) == "table" then lines[#lines + 1] = ("แพ้ชั้น %d ติดกัน %d/%d ครั้ง"):format(f.floor or 0, f.n or 0, e.towerTries) end
+				twLbl:UpdateName(table.concat(lines, "\n"))
+			end)
+			task.wait(1)
+		end
+	end)
+end)()
+
 -- ------------------------------------------------------------------ no mounts
 -- The bot never rides (user: walk / run only). If the character ends up on a mount (the player got on), the walk
 -- step gets off by drawing the fighting weapon (the game drops you off the mount).
@@ -4560,7 +4834,7 @@ end)()
 		moveTo(trip.pos)
 	end
 	st.bossTrip = function(hrp)
-		if not e.bossHunt then return nil end
+		if not e.bossHunt or st.tw then return nil end
 		local best
 		for kind in pairs(e.bossPick) do
 			local bt = e.bossTimes and e.bossTimes[kind]
@@ -4641,7 +4915,7 @@ end)()
 	plr.CharacterAdded:Connect(hookHurt)
 	local LOCK = (tonumber(MapC.COMBAT_LOCK) or 8) + 0.7
 	st.tryWarp = function(goal, force)
-		if not e.warpOn or manual() then return false end
+		if not e.warpOn or manual() or (st.towerSrvNow and st.towerSrvNow()) then return false end
 		-- in combat: no warp yet (the trip keeps riding away meanwhile; riding never swings)
 		if os.clock() - (st.combatAt or 0) < LOCK then st.warpWaiting = true return false end
 		st.warpWaiting = nil
