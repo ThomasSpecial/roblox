@@ -313,6 +313,16 @@ local function routeValue(fromPos, first, pool)
 end
 local function pickTarget(hrp)
 	local list = candidates_(hrp)
+	if st.tw then
+		local best, bs
+		for _, a in ipairs(list) do
+			local n = 0
+			for _, b in ipairs(list) do if b ~= a and flat(b.p - a.p).Magnitude < 14 then n += 1 end end
+			local sc = a.d - n * 6
+			if not bs or sc < bs then best, bs = a.m, sc end
+		end
+		return best
+	end
 	if e.targetMode == SMART_TARGET then
 		table.sort(list, function(a, b) return a.d < b.d end)
 		local pool = {}
@@ -1732,7 +1742,8 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
 	do
 		-- boost only while travelling: with 1.5x on, swings next to a frog did 0 damage (the server doesn't trust our
 		-- position at that speed); same frog, normal speed, standing still: one swing = 77k
-		local want = ((e.farm or st.bossActive or st.defend) and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
+		-- (not inside the tower / dungeon: 1.8x there got us pulled back by the server 4 times in 100 s)
+		local want = ((e.farm or st.bossActive or st.defend) and not st.tw and e.speedOn and e.speedMult ~= 1 and os.clock() > (st.fightUntil or 0)) and e.speedMult or nil
 		-- escaping a slam: the game's swing slow (_WSMultC_WeaponSwing 0.5 -> WalkSpeed 10) kept us inside the circle.
 		-- Cancel it only, so we run at the normal 20, never faster than a player can
 		if (e.farm or st.bossActive or st.defend) and os.clock() < (st.evadeUntil or 0) then
@@ -1835,14 +1846,30 @@ local function equippedSkills()
 end
 local HEALS = {AreaHeal = true, QuickHeal = true}
 local function useSkills(targetPos)
-	if not e.skill then return end
+	local inst = st.tw and e.instSkill
+	if not (e.skill or inst) then return end
+	-- AoE skills (meteor showers, cannon) land where they're aimed: the middle of the pack around the target
+	if inst and targetPos then
+		local sum, n = Vector3.zero, 0
+		for _, f in ipairs({"Aggressors", "Passives"}) do
+			local folder = AnimalLive:FindFirstChild(f)
+			for _, m in ipairs(folder and folder:GetChildren() or {}) do
+				if wanted(m) then
+					local mp = mobPos(m)
+					if flat(mp - targetPos).Magnitude < 18 then sum += mp; n += 1 end
+				end
+			end
+		end
+		if n > 0 then targetPos = sum / n end
+	end
 	local _, hrp = char()
 	if not hrp then return end
 	for _, name in ipairs(equippedSkills()) do
 		if os.clock() >= (skillCd[name] or 0) then
 			local isHeal = HEALS[name]
-			local go = e.skillMode == "ใช้ทันทีที่คูลดาวน์หมด" or (isHeal and hpPct() <= e.healAt) or (not isHeal and targetPos)
-			if isHeal and e.skillMode ~= "ใช้ทันทีที่คูลดาวน์หมด" and hpPct() > e.healAt then go = false end
+			local instant = e.skillMode == "ใช้ทันทีที่คูลดาวน์หมด" and e.skill
+			local go = instant or (isHeal and hpPct() <= e.healAt) or (not isHeal and targetPos)
+			if isHeal and not instant and hpPct() > e.healAt then go = false end
 			if go then
 				seq = seq % 2147483647 + 1
 				skillCd[name] = os.clock() + 2   -- until the server answers
@@ -4676,6 +4703,7 @@ end)()
 	if e.dungeonGreed == nil then e.dungeonGreed = true end
 	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 1 end
 	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
+	if e.instSkill == nil then e.instSkill = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
 	local function towerNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
@@ -4897,6 +4925,17 @@ end)()
 		if dist < e.reach - 0.5 or dist > 62 or math.abs(tp.Y - hrp.Position.Y) > 14 then return false end
 		local dir = flat(hrp.Position - tp)
 		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+		do
+			local sum, n = Vector3.zero, 0
+			for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
+				if m ~= t and wanted(m) then
+					local mp = mobPos(m)
+					if flat(mp - tp).Magnitude < 12 then sum += mp; n += 1 end
+				end
+			end
+			local away = n > 0 and flat(tp - sum / n)
+			if away and away.Magnitude > 1 then dir = away.Unit end
+		end
 		local dest = Vector3.new(tp.X, hrp.Position.Y, tp.Z) + dir * 4
 		if st.dangerAt and st.dangerAt(dest) then
 			local base = math.atan2(dir.Z, dir.X)
@@ -5350,6 +5389,7 @@ end)()
 	DL:Slider({Name = "└ เก็บความโลภไม่เกิน (ชั้น) · แต่ละชั้นเกราะเราเหลือ 10%", Default = e.dungeonGreedMax, Minimum = 1, Maximum = 4, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.dungeonGreedMax = v; sv() end}, "PLDungeonGreedMax")
 	DL:Toggle({Name = "└ บอสมังกรบิน → ไปขึ้นป้อมยิงฉมวกเอง (ยิงลงมาแล้วตีฟรี)", Default = e.dungeonHarpoon, Callback = function(v) e.dungeonHarpoon = v; sv() end}, "PLDungeonHarpoon")
+	DL:Toggle({Name = "ใช้สกิลโจมตีทันทีที่คูลดาวน์หมด (ในหอคอย + ดันเจี้ยน · เล็งกลางกลุ่มมอน)", Default = e.instSkill, Callback = function(v) e.instSkill = v; sv() end}, "PLInstSkill")
 	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
 	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
 	local DR = DgTab:Section({Side = "Right"})
