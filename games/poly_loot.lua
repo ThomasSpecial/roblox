@@ -2479,6 +2479,7 @@ local function smartEvade(hrp, hum)
 end
 do
 	st.dangerAt = function(pos)
+		if st.dragonDanger and st.dragonDanger(pos) then return true end
 		local now = os.clock()
 		for m, rec in pairs(mobState) do
 			if rec.attackAt and m.Parent then
@@ -3027,6 +3028,28 @@ task.spawn(function()
 				return
 			end
 
+			-- Inferno Dragon: standing in its current attack's area -> teleport to another side / out of it; while the
+			-- attack is still coming, don't walk back in (hold, the lock teleports back once it has landed)
+			if st.tw and st.zoneEscape then
+				local zp, zn = st.zoneEscape(hrp)
+				if zp then
+					endCombo()
+					local how = e.tpDodge and st.instDodge and st.instDodge(hrp, t, tp, zp)
+					if not how then moveTo(zp, true) end
+					st.status = ("หลบท่าบอส %s · %s"):format(tostring(zn), how == "side" and "วาร์ปไปอีกมุม" or how == "switch" and "วาร์ปไปตัวอื่น"
+						or how and "วาร์ปออกนอกวง" or "วิ่งออก")
+					return
+				elseif st.zoneActive and st.zoneActive() and dist > e.reach then
+					local dir = flat(hrp.Position - tp)
+					dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+					if st.dangerAt(tp + dir * 4) then
+						stopMove()
+						if not aura(c, hrp) then endCombo() end
+						st.status = "รอท่าบอสลงก่อนค่อยเข้าไปตี"
+						return
+					end
+				end
+			end
 			-- smart evade (heavy hitter winding up) > telegraph dodge > drops > fight
 			local ev, evName, evDmg
 			if not burst then ev, evName, evDmg = smartEvade(hrp, hum) end
@@ -4830,7 +4853,11 @@ end)()
 				end
 			end
 		end
-		if fallback and st.hopTo(fallback, tp, true) then return "out" end
+		if fallback then
+			local v = flat(fallback - hrp.Position)
+			local fb = v.Magnitude > 58 and (hrp.Position + v.Unit * 58) or fallback
+			if st.hopTo(fb, tp, true) then return "out" end
+		end
 		return false
 	end
 	-- instant teleport to a spot (dodges inside the tower / dungeon): needs floor under it, max 60 studs. Counts as a
@@ -5009,6 +5036,12 @@ end)()
 		if drag:GetAttribute("_DragAir") ~= true and not planOn then return false end
 		local _, hrp = char()
 		if not hrp then return false end
+		local zp = st.zoneEscape and st.zoneEscape(hrp)
+		if zp then
+			if not (e.tpDodge and st.hopTo(zp, nil, true)) then moveTo(zp, true) end
+			st.status = "หลบท่ามังกรระหว่างไปป้อมฉมวก"
+			return true
+		end
 		local room
 		pcall(function() room = drag.DungeonRoom.Value end)
 		local best, bd, bi
@@ -5050,6 +5083,77 @@ end)()
 		if planOn then pcall(harpoonShot, run) end
 		st.status = ("Dungeon: ยิงฉมวกใส่มังกร (ยิงไป %d)"):format(T.harpoons or 0)
 		return true
+	end
+	local DZ = {
+		TailHammer = {t = 1.35, k = "rear"},
+		BellySlam = {t = 1.25, k = "round", r = 28},
+		HookL = {t = 1.25, k = "round", r = 30},
+		HookR = {t = 1.25, k = "round", r = 30},
+		WingClap = {t = 2.6, k = "round", r = 58},
+		Smash = {t = 3.1, k = "round", r = 80},
+		MawSnap = {t = 1.5, k = "front", len = 40},
+		Breath = {t = 4.4, k = "front", len = 170},
+		LongBreath = {t = 4, k = "front", len = 190},
+		Spit = {t = 1.3, k = "front", len = 140},
+		Swallow = {t = 4.8, k = "front", len = 70},
+		Pounce = {t = 1.8, k = "aim", r = 28},
+		Dive = {t = 1.6, k = "aim", r = 24},
+	}
+	local function dragonZone()
+		local now = workspace:GetServerTimeNow()
+		for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
+			if m:GetAttribute("Animal") == "Inferno Dragon" and mobAlive(m) and wanted(m) then
+				local clip = m:GetAttribute("_DragClip")
+				local z = DZ[clip or ""]
+				if z and now < (tonumber(m:GetAttribute("_DragClipAt")) or 0) + z.t + 0.4 then
+					local aim = m:GetAttribute("_DragAimAt")
+					return {z = z, cf = st.mobCF(m), aim = typeof(aim) == "Vector3" and aim or nil, name = clip}
+				end
+			end
+		end
+	end
+	local function inZone(dz, pos)
+		local z = dz.z
+		if z.k == "round" then return flat(pos - dz.cf.Position).Magnitude < z.r end
+		if z.k == "aim" then return flat(pos - (dz.aim or dz.cf.Position)).Magnitude < z.r end
+		local lp = dz.cf:PointToObjectSpace(pos)
+		if z.k == "rear" then return lp.Z > 4 and lp.Z < 75 and math.abs(lp.X) < 22 end
+		-- front: along the line to the aim point when it has one (the breath follows its target), else straight ahead
+		if dz.aim then
+			local head = dz.cf.Position
+			local ax = flat(dz.aim - head)
+			if ax.Magnitude > 1 then
+				local u = ax.Unit
+				local rel = flat(pos - head)
+				local along = rel:Dot(u)
+				return along > -6 and along < z.len and (rel - u * along).Magnitude < 24
+			end
+		end
+		return lp.Z < 6 and lp.Z > -z.len and math.abs(lp.X) < 24
+	end
+	st.zoneActive = function() return dragonZone() ~= nil end
+	st.dragonDanger = function(pos)
+		local dz = dragonZone()
+		return dz ~= nil and inZone(dz, pos)
+	end
+	st.zoneEscape = function(hrp)
+		local dz = dragonZone()
+		if not (dz and inZone(dz, hrp.Position)) then return nil end
+		local c = dz.z.k == "aim" and (dz.aim or dz.cf.Position) or dz.cf.Position
+		local look, right = flat(dz.cf.LookVector), flat(dz.cf.RightVector)
+		look = look.Magnitude > 0.1 and look.Unit or Vector3.new(0, 0, -1)
+		right = right.Magnitude > 0.1 and right.Unit or Vector3.new(1, 0, 0)
+		local out
+		if dz.z.k == "round" or dz.z.k == "aim" then
+			local v = flat(hrp.Position - c)
+			v = v.Magnitude > 0.5 and v.Unit or -look
+			out = c + v * (dz.z.r + 6)
+		elseif dz.z.k == "rear" then
+			out = dz.cf.Position + right * 30 + look * 10
+		else
+			out = dz.cf.Position - look * 14 + right * 12
+		end
+		return Vector3.new(out.X, hrp.Position.Y, out.Z), dz.name
 	end
 	-- main-loop hook. true = the tower has the character this tick
 	st.towerLobby = function()
