@@ -2942,7 +2942,11 @@ task.spawn(function()
 					local ws = st.towerWaitSpot and st.towerWaitSpot(hrp)
 					local vdk = st.tw.kind == "vd"
 					if ws and flat(ws - hrp.Position).Magnitude > 8 then
-						moveTo(ws)   -- walked: teleporting between rooms got us pulled back by the server
+						local inRoom = vdk and plr:GetAttribute("DungeonState") == "fight" and math.abs(ws.Y - hrp.Position.Y) < 8
+							and flat(ws - hrp.Position).Magnitude < 160
+						if not (inRoom and st.hopTo and st.hopTo(Vector3.new(ws.X, hrp.Position.Y, ws.Z), ws, false)) then
+							moveTo(ws)   -- between rooms: walked (teleporting down the stairs got us pulled back)
+						end
 						st.status = vdk and ("Dungeon: ไปห้องถัดไป (ห้อง %s) · %.0f stud"):format(tostring(plr:GetAttribute("DungeonRoom")), flat(ws - hrp.Position).Magnitude)
 							or "Tower: ไปรอตรงจุดเกิดมอน (wave ถัดไป)"
 					else
