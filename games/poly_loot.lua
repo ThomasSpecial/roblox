@@ -318,7 +318,7 @@ local function pickTarget(hrp)
 		for _, a in ipairs(list) do
 			local n = 0
 			for _, b in ipairs(list) do if b ~= a and flat(b.p - a.p).Magnitude < 14 then n += 1 end end
-			local sc = a.d - n * 6
+			local sc = (tonumber(plr:GetAttribute("VDGreed")) or 0) >= 2 and (a.d + n * 6) or (a.d - n * 6)
 			if not bs or sc < bs then best, bs = a.m, sc end
 		end
 		return best
@@ -3174,6 +3174,34 @@ task.spawn(function()
 					end
 				end
 			end
+			if st.tw and (tonumber(plr:GetAttribute("VDGreed")) or 0) >= 2 and os.clock() - (st.packOutAt or 0) > 2.5 then
+				local near = {}
+				for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
+					if wanted(m) then
+						local mp = mobPos(m)
+						if flat(mp - hrp.Position).Magnitude < 9 then near[#near + 1] = mp end
+					end
+				end
+				if #near >= 3 then
+					local all = {}
+					for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do if wanted(m) then all[#all + 1] = mobPos(m) end end
+					local best, bs
+					for i = 0, 11 do
+						local a = i * math.pi / 6
+						local p = hrp.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * 24
+						local sc = 0
+						for _, mp in ipairs(all) do sc += 1 / math.max(flat(mp - p).Magnitude, 3) end
+						if not st.dangerAt(p) and (not bs or sc < bs) then best, bs = p, sc end
+					end
+					if best and st.hopTo and st.hopTo(best, nil, true) then
+						st.packOutAt = os.clock()
+						st.target = nil
+						endCombo()
+						st.status = ("โดนรุม %d ตัว → วาร์ปออกข้างที่มอนน้อย"):format(#near)
+						return
+					end
+				end
+			end
 			if st.tw and hpPct() < 25 then
 				local sum, n = Vector3.zero, 0
 				for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
@@ -3442,7 +3470,7 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.25)
 		-- while a regeneration item works, eat again only in an emergency
-		local at = st.tw and math.max(e.healItemAt, tonumber(e.instHealAt) or 60) or e.healItemAt
+		local at = st.tw and math.max(e.healItemAt, tonumber(e.instHealAt) or 60, (tonumber(plr:GetAttribute("VDGreed")) or 0) >= 2 and 70 or 0) or e.healItemAt
 		if (e.farm or st.bossActive or st.defend or st.tw) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= at
 			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= (st.tw and 35 or 25)) then
 			pcall(useHeal)
@@ -4725,6 +4753,7 @@ end)()
 	if e.tpDodge == nil then e.tpDodge = true end
 	if e.dungeonGreed == nil then e.dungeonGreed = true end
 	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 1 end
+	if e.dungeonGreedSafe == nil then e.dungeonGreedSafe = true end
 	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
 	if e.instSkill == nil then e.instSkill = true end
 	if type(e.instHealAt) ~= "number" then e.instHealAt = 60 end
@@ -4832,6 +4861,7 @@ end)()
 					local vd = plr:GetAttribute("VDRun")
 					if not st.tw or st.tw.run ~= vd then
 						st.tw = {run = vd, kind = "vd", floor = 0, at = os.clock()}
+						T.runDeaths0, T.lastRoomMin, T.roomMinHp = st.deaths or 0, 100, 100
 						st.target, st.blocker, st.bossLock = nil, nil, nil
 						path.wps = nil
 						log("Dungeon: อยู่ใน Dragon's Hoard แล้ว")
@@ -4840,6 +4870,7 @@ end)()
 					st.tw = nil
 					st.target = nil
 				end
+				if st.tw and st.tw.kind == "vd" then T.roomMinHp = math.min(T.roomMinHp or 100, hpPct()) end
 				local vr = T.vres
 				if e.dungeonAuto and vr and os.clock() - vr.at > 4 then
 					local sent = T.sent[vr.session]
@@ -5092,7 +5123,8 @@ end)()
 		if state == "fight" and T.waveSpot and T.waveRoom == room then return T.waveSpot end
 		-- a Greed stand woke up after the clear: take it before moving on
 		local g = T.greed
-		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 and (tonumber(plr:GetAttribute("VDGreed")) or 0) < e.dungeonGreedMax then
+		local safe = not e.dungeonGreedSafe or ((T.lastRoomMin or 100) >= 50 and (st.deaths or 0) == (T.runDeaths0 or 0))
+		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 and (tonumber(plr:GetAttribute("VDGreed")) or 0) < e.dungeonGreedMax and safe then
 			if flat(g.at - hrp.Position).Magnitude <= 9 then
 				if os.clock() - g.tryAt > 2.5 then
 					g.tryAt, g.tries = os.clock(), g.tries + 1
@@ -5127,6 +5159,7 @@ end)()
 			elseif kind == "cleared" or kind == "room" then
 				T.waveSpot = nil
 			end
+			if kind == "room" then T.roomMinHp = 100 elseif kind == "cleared" then T.lastRoomMin = T.roomMinHp or 100 end
 			if (kind == "cleared" or kind == "stand") and d.stand ~= false and not d.taken and (d.at or d.model) then
 				local at = typeof(d.at) == "Vector3" and d.at or (typeof(d.at) == "CFrame" and d.at.Position)
 				if not at and typeof(d.model) == "Instance" then pcall(function() at = d.model:GetPivot().Position end) end
@@ -5417,6 +5450,7 @@ end)()
 	DL:Toggle({Name = "└ เก็บความโลภ (Greed) ที่แท่นหลังเคลียร์ห้อง (+25% ดวง · มอนแรงขึ้น)", Default = e.dungeonGreed, Callback = function(v) e.dungeonGreed = v; sv() end}, "PLDungeonGreed")
 	DL:Slider({Name = "└ เก็บความโลภไม่เกิน (ชั้น) · แต่ละชั้นเกราะเราเหลือ 10%", Default = e.dungeonGreedMax, Minimum = 1, Maximum = 4, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.dungeonGreedMax = v; sv() end}, "PLDungeonGreedMax")
+	DL:Toggle({Name = "└ เก็บเพิ่มเฉพาะตอนไหว (ห้องที่เพิ่งเคลียร์เลือด ≥ 50% และรอบนี้ยังไม่ตาย)", Default = e.dungeonGreedSafe, Callback = function(v) e.dungeonGreedSafe = v; sv() end}, "PLDungeonGreedSafe")
 	DL:Toggle({Name = "└ บอสมังกรบิน → ไปขึ้นป้อมยิงฉมวกเอง (ยิงลงมาแล้วตีฟรี)", Default = e.dungeonHarpoon, Callback = function(v) e.dungeonHarpoon = v; sv() end}, "PLDungeonHarpoon")
 	DL:Slider({Name = "กินของฟื้นเลือดเมื่อเลือดต่ำกว่า % (ในหอคอย + ดันเจี้ยน)", Default = e.instHealAt, Minimum = 30, Maximum = 90, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.instHealAt = v; sv() end}, "PLInstHealAt")
