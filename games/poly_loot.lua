@@ -5538,10 +5538,14 @@ end)()
 	if e.fishAuto == nil then e.fishAuto = false end
 	if e.fishClaim == nil then e.fishClaim = true end
 	if e.fishCharm == nil then e.fishCharm = false end
-	if type(e.fishBait) ~= "string" then e.fishBait = "" end    -- "" = keep the bait picked in the game
-	if type(e.fishRod) ~= "string" then e.fishRod = "" end      -- "" = best rod we own
+	if type(e.fishBait) ~= "string" then e.fishBait = "" end    -- "" = the best bait we own (picked one runs out -> best)
+	if type(e.fishRod) ~= "string" then e.fishRod = "" end      -- "" = the best rod we own (picked one missing -> best)
+	if e.fishTrade == nil then e.fishTrade = true end            -- trade with the Fish Trader when a deal is payable
+	if e.fishTradeMats == nil then e.fishTradeMats = true end    -- deals with a wood / ore line too
+	if type(e.fishTradePick) ~= "table" then e.fishTradePick = {} end   -- reward keys; empty = every reward
+	if e.fishSellQuest == nil then e.fishSellQuest = true end    -- "Sell N fish" / "Earn X coins selling fish" quests
 	local F = {nonce = 70000 + math.random(1, 9999), state = "idle", at = 0, catches = 0, perfect = 0, status = "ปิดอยู่",
-		last = "-", claimAt = {}, dirBad = 0}
+		last = "-", claimAt = {}, dirBad = 0, tradeWait = {}, trades = 0, sellWait = {}}
 	st.fishF = F
 	local CS2 = game:GetService("CollectionService")
 	local function fishData()
@@ -5560,16 +5564,144 @@ end)()
 	end
 	local function rodSerial()
 		local d = invData()
-		local best, bl, bs
+		local best, bk, bs, pick, ps
 		for serial, it in pairs(d and d.Inventory and d.Inventory.Materials or {}) do
 			local ok, def = pcall(Rods.Get, it.Id)
-			if ok and type(def) == "table" and (e.fishRod == "" or it.Id == e.fishRod) then
-				local l = tonumber(def.Luck) or 1
-				if not bl or l > bl then best, bl, bs = it.Id, l, serial end
+			if ok and type(def) == "table" then
+				if e.fishRod ~= "" and it.Id == e.fishRod then pick, ps = it.Id, serial end
+				if not def.LavaOnly then
+					local k = (tonumber(def.Tier) or 0) * 10 + (tonumber(def.Luck) or 1)
+					if not bk or k > bk then best, bk, bs = it.Id, k, serial end
+				end
 			end
 		end
+		if ps then return ps, pick end
 		return bs, best
 	end
+	-- the picked bait while we have it, else the luckiest bait we own
+	local function baitToUse()
+		if e.fishBait ~= "" and owned(e.fishBait) > 0 then return e.fishBait end
+		local best, bl
+		pcall(function()
+			for _, id in ipairs(Sup.BaitIds()) do
+				local l = tonumber((Sup.Items[id] or {}).Luck) or 1
+				if owned(id) > 0 and (not bl or l > bl) then best, bl = id, l end
+			end
+		end)
+		return best
+	end
+	-- Fish Trader (Trader_Engine.FishTraderConfig): offers live in Data.FishTrader {Reputation, Cycle, NextRestockAt,
+	-- Offers[i]{Key, Id, Amount, Tier, Remaining, Inputs}}. A trade is FishTradeRequest:FireServer(offer.Key) while on
+	-- his pad (OPEN_RANGE 6); the reply is OnClientEvent(ok, result, reason, key). He only counts items that are not
+	-- locked and not starred, same as below.
+	local TC, TRR, fishIn = nil, nil, {}
+	pcall(function()
+		local TE = game:GetService("ReplicatedStorage"):FindFirstChild("Trader_Engine")
+		TC = require(TE.FishTraderConfig)
+		TRR = TE.Remotes:FindFirstChild(TC.REMOTE_NAME or "FishTradeRequest")
+		for _, inp in ipairs(TC.Inputs or {}) do if inp.Group == "Fish" then fishIn[inp.Id] = true end end
+	end)
+	F.TC = TC
+	if TRR then
+		TRR.OnClientEvent:Connect(function(ok, res, why, key)
+			if alive() then F.tradeReply = {ok = ok, why = why, key = key} end
+		end)
+	end
+	local function usable(id)
+		local d = invData()
+		local n = 0
+		for _, cat in pairs(d and d.Inventory or {}) do
+			for _, it in pairs(type(cat) == "table" and cat or {}) do
+				if type(it) == "table" and it.Id == id and not it.Locked and not it.Favorited and it.Source ~= "Starter" then
+					n += tonumber(it.Count) or 1
+				end
+			end
+		end
+		return n
+	end
+	local function traderData()
+		local d = invData()
+		local ft = TC and d and d[TC.PROFILE_KEY or "FishTrader"]
+		return type(ft) == "table" and ft or nil
+	end
+	local function traderPad()
+		for _, pd in ipairs(CS2:GetTagged(TC and TC.STATION_TAG or "FishTraderStation")) do
+			local ok, p = pcall(function() return pd:IsA("Model") and pd:GetPivot().Position or pd.Position end)
+			if ok then return p end
+		end
+	end
+	-- the first offer in stock, unlocked for our tier, picked in the tab, payable without coins / starred / locked items
+	local function tradeReady()
+		if not (TC and TRR) then return end
+		local ft = traderData()
+		if not (ft and type(ft.Offers) == "table") then return end
+		local okT, tier = pcall(TC.TierFor, tonumber(ft.Reputation) or 0)
+		if not okT then return end
+		for _, o in pairs(ft.Offers) do
+			local wk = tostring(ft.Cycle) .. ":" .. tostring(type(o) == "table" and o.Key)
+			if type(o) == "table" and o.Key and (tonumber(o.Remaining) or 0) > 0 and tier >= math.max(1, math.floor(tonumber(o.Tier) or 1))
+				and (next(e.fishTradePick) == nil or e.fishTradePick[o.Key]) and os.clock() > (F.tradeWait[wk] or 0) then
+				local okI, ins = pcall(TC.EffectiveInputs, o, tier)
+				local can = okI and type(ins) == "table" and #ins > 0
+				for _, inp in ipairs(can and ins or {}) do
+					if inp.Id == TC.COIN_ID or (not e.fishTradeMats and not fishIn[inp.Id]) or usable(inp.Id) < (tonumber(inp.N) or math.huge) then
+						can = false
+						break
+					end
+				end
+				if can then return o, wk end
+			end
+		end
+	end
+	local QB
+	pcall(function() QB = require(FE.QuestBoard) end)
+	-- cheapest fish first (unlocked, unstarred); fish an in-stock Fish Trader deal asks for are kept for a second pass
+	local function sellPlan(left, coinsMode)
+		local d = invData()
+		local list, reserve = {}, {}
+		if e.fishTrade and TC then
+			local ft = traderData()
+			for _, o in pairs(ft and ft.Offers or {}) do
+				if type(o) == "table" and (tonumber(o.Remaining) or 0) > 0 then
+					for _, inp in ipairs(type(o.Inputs) == "table" and o.Inputs or {}) do
+						if inp.Id then reserve[inp.Id] = math.max(reserve[inp.Id] or 0, tonumber(inp.N) or 0) end
+					end
+				end
+			end
+		end
+		for serial, it in pairs(d and d.Inventory and d.Inventory.Materials or {}) do
+			local row = type(it) == "table" and ItemRegistry and ItemRegistry[it.Id]
+			if row and row.IsFish and not it.Locked and not it.Favorited and (tonumber(row.SellPrice) or 0) > 0 then
+				list[#list + 1] = {serial = serial, id = it.Id, n = tonumber(it.Count) or 1, price = tonumber(row.SellPrice)}
+			end
+		end
+		table.sort(list, function(a, b) return a.price < b.price end)
+		local resLeft = {}
+		for id, n in pairs(reserve) do resLeft[id] = n end
+		for _, f in ipairs(list) do
+			local r = math.min(f.n, resLeft[f.id] or 0)
+			resLeft[f.id] = (resLeft[f.id] or 0) - r
+			f.free, f.kept = f.n - r, r
+		end
+		local batch, cnt, coins = {}, 0, 0
+		local function met() return (coinsMode and coins or cnt) >= left end
+		for pass = 1, 2 do
+			for _, f in ipairs(list) do
+				if met() then break end
+				local avail = pass == 1 and f.free or f.kept
+				if avail > 0 then
+					local want = coinsMode and math.ceil((left - coins) / f.price) or (left - cnt)
+					local k = math.min(avail, want)
+					batch[f.serial] = (batch[f.serial] or 0) + k
+					cnt += k
+					coins += k * f.price
+				end
+			end
+			if met() then break end
+		end
+		return batch, cnt, coins, met()
+	end
+	F.sellPlan = sellPlan
 	local function post()
 		for _, s in ipairs(CS2:GetTagged("RodShopStation")) do
 			local ok, p = pcall(function() return s:IsA("Model") and s:GetPivot().Position or s.Position end)
@@ -5636,7 +5768,7 @@ end)()
 					local n = debug.info(v, "n")
 					if n == "onPress" then CTL.press = v elseif n == "throw" then CTL.throw = v end
 				end
-			elseif type(v) == "table" and rawget(v, "padA") ~= nil and rawget(v, "space") ~= nil and rawget(v, "mouse") ~= nil then
+			elseif type(v) == "table" and rawget(v, "padA") ~= nil and rawget(v, "mouse") ~= nil and rawget(v, "pad") ~= nil then
 				CTL.input = v
 			end
 		end
@@ -5654,6 +5786,7 @@ end)()
 		if not t or CTL.hooked == t then return end
 		CTL.hooked = t
 		local userSpace = rawget(t, "space")
+		if userSpace == nil then userSpace = false end
 		rawset(t, "space", nil)
 		setmetatable(t, {
 			__index = function(_, k)
@@ -5786,6 +5919,63 @@ end)()
 				end
 			end
 		end
+		-- sell quests (QuestBoard kinds Sell = fish count, SellCoins = coins from fish): sell the cheapest fish until the
+		-- quest is just met, only once we hold enough for it (never the whole bag); the claim step above turns it in
+		if e.fishSellQuest and QB and fd and fd.Quests and type(fd.Quests.Slots) == "table" then
+			for _, q in pairs(fd.Quests.Slots) do
+				local okD, def = pcall(QB.Def, type(q) == "table" and q.Id)
+				local left = okD and type(def) == "table" and (tonumber(q.Need) or 0) - (tonumber(q.Have) or 0) or 0
+				if left > 0 and (def.Kind == "Sell" or def.Kind == "SellCoins") and os.clock() > (F.sellWait[q.Id] or 0) then
+					local batch, n, coins, enough = sellPlan(left, def.Kind == "SellCoins")
+					if enough and n > 0 then
+						F.sellWait[q.Id] = os.clock() + 8
+						F.status = ("เควส %s: ขายปลา %d ตัว (~%d เหรียญ)"):format(tostring(q.Id), n, coins)
+						st.extStatus = "Auto Fishing: " .. F.status
+						pcall(function() SellRequest:FireServer(batch) end)
+						log(("Fishing: เควส %s → ขายปลาถูกสุด %d ตัว ได้ ~%d เหรียญ (ต้องการ %d%s)"):format(tostring(q.Id), n, coins, left,
+							def.Kind == "SellCoins" and " เหรียญ" or " ตัว"))
+						task.wait(1.5)
+						return
+					end
+					-- not enough fish yet: keep fishing, look again in a minute
+					F.sellWait[q.Id] = os.clock() + 60
+				end
+			end
+		end
+		-- a Fish Trader deal we can pay -> onto his pad, trade, back to the spot next tick
+		if e.fishTrade then
+			local o, wk = tradeReady()
+			local pad = o and traderPad()
+			if o and pad then
+				F.tradeWait[wk] = os.clock() + 60
+				local what = ("%s x%s"):format(tostring(o.Key), tostring(o.Amount))
+				F.status = "Fish Trader: ไปแลก " .. what
+				st.extStatus = "Auto Fishing: " .. F.status
+				if goTo(pad, 2.5, 45) then
+					task.wait(0.6)
+					local ft0 = traderData()
+					local rep0 = tonumber(ft0 and ft0.Reputation) or 0
+					F.tradeReply = nil
+					pcall(function() TRR:FireServer(o.Key) end)
+					local t0 = os.clock()
+					while not F.tradeReply and os.clock() - t0 < 6 do task.wait(0.1) end
+					local r = F.tradeReply
+					if r and r.ok then
+						task.wait(0.5)
+						local ft1 = traderData()
+						F.trades += 1
+						F.tradeWait[wk] = os.clock() + 2
+						log(("Fish Trader: แลก %s สำเร็จ (rep %d → %d)"):format(what, rep0, tonumber(ft1 and ft1.Reputation) or rep0))
+					else
+						local why = r and tostring(r.why) or "ไม่มีคำตอบ"
+						pcall(function() why = why .. " · " .. tostring(TC.ReasonText(r.why)) end)
+						F.tradeWait[wk] = os.clock() + 600
+						log("Fish Trader: แลกไม่ผ่าน " .. what .. " (" .. why .. ")")
+					end
+				end
+				return
+			end
+		end
 		-- the spot: set from the tab, or where Auto Fishing was turned on
 		if type(e.fishSpot) ~= "table" then
 			local lv = flat(hrp.CFrame.LookVector)
@@ -5821,9 +6011,10 @@ end)()
 			return
 		end
 		-- bait / charm
-		if e.fishBait ~= "" and fd and fd.Bait ~= e.fishBait and owned(e.fishBait) > 0 and os.clock() - (F.baitAt or 0) > 5 then
+		local bait = baitToUse()
+		if bait and fd and fd.Bait ~= bait and os.clock() - (F.baitAt or 0) > 5 then
 			F.baitAt = os.clock()
-			pcall(function() FR.Request:FireServer("Bait", e.fishBait) end)
+			pcall(function() FR.Request:FireServer("Bait", bait) end)
 		end
 		if e.fishCharm and fd and (tonumber(fd.LuckUntil) or 0) < workspace:GetServerTimeNow() and owned("LuckyCharm") > 0
 			and os.clock() - (F.charmAt or 0) > 30 then
@@ -5909,7 +6100,7 @@ end)()
 		sv()
 		log(("Fishing: ตั้งจุดตกปลาที่ %.0f, %.0f, %.0f%s"):format(at.X, at.Y, at.Z, at ~= hrp.Position and " (ขยับออกจากแท่น Trader)" or ""))
 	end})
-	local baitOpts, baitKey = {"ไม่เปลี่ยน (ใช้ที่เลือกในเกม)"}, {}
+	local baitOpts, baitKey = {"ดีที่สุดที่มี (อัตโนมัติ)"}, {}
 	pcall(function()
 		for _, id in ipairs(Sup.BaitIds()) do
 			local it = Sup.Items[id] or {}
@@ -5920,25 +6111,55 @@ end)()
 		end
 	end)
 	FL:Dropdown({Name = "เหยื่อ", Multi = false, Required = true, Options = baitOpts,
-		Default = baitKey[e.fishBait] or baitOpts[1],
+		Default = table.find(baitOpts, baitKey[e.fishBait]) or 1,
 		Callback = function(v) e.fishBait = baitKey[v] or ""; sv() end}, "PLFishBait")
-	local rodOpts, rodKey = {"คันที่ดีที่สุดที่มี"}, {}
+	local rodOpts, rodKey = {"ดีที่สุดที่มี (อัตโนมัติ)"}, {}
 	pcall(function()
 		local list = {}
-		for id, def in pairs(Rods.Rods or {}) do list[#list + 1] = {id = id, luck = tonumber(def.Luck) or 1, name = def.Display or id} end
+		for id, def in pairs(Rods.Rods or {}) do list[#list + 1] = {id = id, luck = tonumber(def.Luck) or 1, name = def.Display or id, lava = def.LavaOnly} end
 		table.sort(list, function(a, b) return a.luck < b.luck end)
 		for _, r in ipairs(list) do
-			local lab = ("%s · ดวง x%.2f"):format(tostring(r.name), r.luck)
+			local lab = ("%s · ดวง x%.2f%s"):format(tostring(r.name), r.luck, r.lava and " · ลาวาเท่านั้น" or "")
 			rodOpts[#rodOpts + 1] = lab
 			rodKey[lab] = r.id
 			rodKey[r.id] = lab
 		end
 	end)
 	FL:Dropdown({Name = "คันเบ็ด", Multi = false, Required = true, Options = rodOpts,
-		Default = rodKey[e.fishRod] or rodOpts[1],
+		Default = table.find(rodOpts, rodKey[e.fishRod]) or 1,
 		Callback = function(v) e.fishRod = rodKey[v] or ""; sv() end}, "PLFishRod")
 	FL:Toggle({Name = "Auto Claim Quest ตกปลา (เดินไปเคลมที่ร้านแล้วกลับมาตกต่อ)", Default = e.fishClaim, Callback = function(v) e.fishClaim = v; sv() end}, "PLFishClaim")
+	FL:Toggle({Name = "└ ทำเควสขายปลา (ขายปลาถูกสุดแค่พอดีเป้า แล้วเคลม)", Default = e.fishSellQuest, Callback = function(v) e.fishSellQuest = v; sv() end}, "PLFishSellQ")
 	FL:Toggle({Name = "ใช้ Lucky Charm อัตโนมัติ (ดวง x1.5 · 10 นาที/อัน)", Default = e.fishCharm, Callback = function(v) e.fishCharm = v; sv() end}, "PLFishCharm")
+	FL:Header({Text = "Fish Trader"})
+	FL:Toggle({Name = "Auto แลกของกับ Fish Trader (เก็บเวล Trader)", Default = e.fishTrade, Callback = function(v) e.fishTrade = v; sv() end}, "PLFishTrade")
+	FL:Toggle({Name = "└ ดีลที่ขอไม้/แร่ด้วย ก็แลก", Default = e.fishTradeMats, Callback = function(v) e.fishTradeMats = v; sv() end}, "PLFishTradeMats")
+	local tradeOpts, tradeKey = {}, {}
+	pcall(function()
+		local list = {}
+		for k, o in pairs(TC.Outputs or {}) do list[#list + 1] = {k = k, o = o} end
+		table.sort(list, function(a, b) return (a.o.Tier or 1) == (b.o.Tier or 1) and a.k < b.k or (a.o.Tier or 1) < (b.o.Tier or 1) end)
+		for _, r in ipairs(list) do
+			local lab = ("%s x%d (tier %d)"):format(tostring(r.o.Id or r.k), tonumber(r.o.Amount) or 1, tonumber(r.o.Tier) or 1)
+			tradeOpts[#tradeOpts + 1] = lab
+			tradeKey[lab] = r.k
+			tradeKey[r.k] = lab
+		end
+	end)
+	FL:Dropdown({Name = "└ ของที่จะแลก (ไม่เลือก = ทุกอย่าง)", Multi = true, Required = false, Options = tradeOpts,
+		Default = (function() local d = {} for k in pairs(e.fishTradePick) do if tradeKey[k] then d[#d + 1] = tradeKey[k] end end return d end)(),
+		Callback = function(v)
+			local m = {}
+			if type(v) == "table" then
+				for k, on in pairs(v) do
+					local lab = (type(k) == "string" and on == true) and k or (type(on) == "string" and on) or nil
+					if lab and tradeKey[lab] then m[tradeKey[lab]] = true end
+				end
+			end
+			e.fishTradePick = m
+			sv()
+		end}, "PLFishTradePick")
+	FL:Label({Text = "แลกเฉพาะตอนจ่ายได้ครบ · ไม่ใช้ของที่ล็อก/ติดดาว · ไม่ใช้เหรียญ\nเดินไปแท่น Trader แลกแล้วกลับมาตกต่อ"})
 	FL:Label({Text = "ปิด Auto Farm / Tower / Dungeon ก่อนเปิดตกปลา\nจุดตกปลาจำไว้: ตาย/หลุดแล้วเดินกลับมาเอง"})
 	local FRs = FiTab:Section({Side = "Right"})
 	FRs:Header({Text = "สถานะตกปลา"})
@@ -5953,8 +6174,20 @@ end)()
 				end
 				table.sort(qs)
 				local _, rodId = rodSerial()
-				fLbl:UpdateName(("%s\nจับได้ %d ตัว (perfect %d) · ล่าสุด %s\nคัน %s · เหยื่อ %s (เหลือ %d)%s\nเควส:\n%s"):format(F.status, F.catches, F.perfect, F.last,
-					tostring(rodId), tostring(fd.Bait), fd.Bait and owned(fd.Bait) or 0, F.why and ("\nล่าสุดที่ไม่ผ่าน: " .. F.why) or "",
+				local tl = ""
+				pcall(function()
+					local ft = traderData()
+					local rp = tonumber(ft.Reputation) or 0
+					local tier = TC.TierFor(rp)
+					local left = 0
+					for _, o in pairs(ft.Offers or {}) do left += tonumber(o.Remaining) or 0 end
+					local nxt = (TC.TIERS[tier + 1] or {}).Rep
+					local mins = math.max(0, math.floor(((tonumber(ft.NextRestockAt) or 0) - workspace:GetServerTimeNow()) / 60))
+					tl = ("\nFish Trader: %s · rep %d%s · แลกแล้ว %d · ดีลเหลือ %d · รีสต็อก %d นาที"):format(tostring(TC.TIERS[tier].Name), rp,
+						nxt and ("/" .. nxt) or "", F.trades, left, mins)
+				end)
+				fLbl:UpdateName(("%s\nจับได้ %d ตัว (perfect %d) · ล่าสุด %s\nคัน %s · เหยื่อ %s (เหลือ %d)%s%s\nเควส:\n%s"):format(F.status, F.catches, F.perfect, F.last,
+					tostring(rodId), tostring(fd.Bait), fd.Bait and owned(fd.Bait) or 0, F.why and ("\nล่าสุดที่ไม่ผ่าน: " .. F.why) or "", tl,
 					#qs > 0 and table.concat(qs, "\n") or "-"))
 			end)
 			task.wait(1)
