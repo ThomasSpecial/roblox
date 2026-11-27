@@ -5517,6 +5517,334 @@ end)()
 	end)
 end)()
 
+-- ------------------------------------------------------------------ Auto Fishing (Fishing_Engine)
+-- Verified 2026-11-28 at the Beach Town pier: Remotes.Request "Cast"(nonce, dir, power, rodTipWorldPos, perfect) ->
+-- Event "Cast" {nonce, ok, sid, pool, why} -> "Nibble" -> "Bite" {sid, window} -> Request "Hook"(sid) -> "Hooked"
+-- {sid, spec, seed} -> Request "Done"(sid, "caught", toggles) -> "Result" {ok, fish, rarity, perfect, xp}. The fight is
+-- deterministic (Minigame.New(spec, seed)); the server re-runs it with our toggles (Minigame.Replay), so we solve it
+-- with the game's own Minigame.Bot at full skill, check it with Replay, and send Done after the fight's real length.
+-- Bait: Request "Bait"(id); Lucky Charm: Request "Charm". Quests: Data.Fishing.Quests.Slots[i] {Id, Have, Need} ->
+-- Remotes.QuestClaim(i), only at the fishing post (tag RodShopStation, range ~10).
+;(function()
+	local FE = RS:FindFirstChild("Fishing_Engine")
+	local FR = FE and FE:FindFirstChild("Remotes")
+	if not (FR and FR:FindFirstChild("Request")) then return end
+	local MG, Wt, Arc, FCfg, Rods, Sup
+	pcall(function()
+		MG = require(FE.Minigame); Wt = require(FE.Waters); Arc = require(FE.Arc); FCfg = require(FE.Config)
+		Rods = require(FE.Rods); Sup = require(FE.Supplies)
+	end)
+	if not (MG and Wt and Arc and FCfg and Rods) then return end
+	if e.fishAuto == nil then e.fishAuto = false end
+	if e.fishClaim == nil then e.fishClaim = true end
+	if e.fishCharm == nil then e.fishCharm = false end
+	if type(e.fishBait) ~= "string" then e.fishBait = "" end    -- "" = keep the bait picked in the game
+	if type(e.fishRod) ~= "string" then e.fishRod = "" end      -- "" = best rod we own
+	local F = {nonce = 70000 + math.random(1, 9999), state = "idle", at = 0, catches = 0, perfect = 0, status = "ปิดอยู่",
+		last = "-", claimAt = {}, dirBad = 0}
+	st.fishF = F
+	local CS2 = game:GetService("CollectionService")
+	local function fishData()
+		local d = invData()
+		return d and d.Fishing
+	end
+	local function owned(id)
+		local d = invData()
+		local n = 0
+		for _, cat in pairs(d and d.Inventory or {}) do
+			for _, it in pairs(type(cat) == "table" and cat or {}) do
+				if type(it) == "table" and it.Id == id then n += tonumber(it.Count) or 1 end
+			end
+		end
+		return n
+	end
+	local function rodSerial()
+		local d = invData()
+		local best, bl, bs
+		for serial, it in pairs(d and d.Inventory and d.Inventory.Materials or {}) do
+			local ok, def = pcall(Rods.Get, it.Id)
+			if ok and type(def) == "table" and (e.fishRod == "" or it.Id == e.fishRod) then
+				local l = tonumber(def.Luck) or 1
+				if not bl or l > bl then best, bl, bs = it.Id, l, serial end
+			end
+		end
+		return bs, best
+	end
+	local function post()
+		for _, s in ipairs(CS2:GetTagged("RodShopStation")) do
+			local ok, p = pcall(function() return s:IsA("Model") and s:GetPivot().Position or s.Position end)
+			if ok then return p end
+		end
+		return Vector3.new(2897, 129, -2606)   -- Beach Town tackle shop
+	end
+	local hopRp2 = RaycastParams.new()
+	hopRp2.FilterType = Enum.RaycastFilterType.Exclude
+	-- walk there; stuck 2.5 s (the low wall between the shop and the pier) -> a short hop over it
+	local function goTo(pos, near, timeout)
+		local t0, lastP, lastAt = os.clock(), nil, os.clock()
+		while alive() and e.fishAuto and os.clock() - t0 < (timeout or 45) do
+			local c, hrp = char()
+			if not hrp then return false end
+			if flat(pos - hrp.Position).Magnitude <= near then stopMove() return true end
+			moveTo(pos)
+			if not lastP or (hrp.Position - lastP).Magnitude > 2 then
+				lastP, lastAt = hrp.Position, os.clock()
+			elseif os.clock() - lastAt > 2.5 then
+				local dir = flat(pos - hrp.Position).Unit
+				local dest = hrp.Position + dir * math.min(14, flat(pos - hrp.Position).Magnitude)
+				hopRp2.FilterDescendantsInstances = {c}
+				local hit = workspace:Raycast(dest + Vector3.new(0, 12, 0), Vector3.new(0, -40, 0), hopRp2)
+				if hit then c:PivotTo(CFrame.lookAt(hit.Position + Vector3.new(0, 3, 0), hit.Position + Vector3.new(0, 3, 0) + dir)) end
+				lastAt = os.clock()
+			end
+			task.wait(0.2)
+		end
+		stopMove()
+		return false
+	end
+	local function solve(spec, seed)
+		for attempt = 1, 8 do
+			local sim = MG.New(spec, seed)
+			local bot = MG.Bot(1, Random.new(attempt * 7919 + seed % 1000))
+			local toggles, holding = {}, false
+			local maxSteps = math.ceil(spec.maxTime / spec.step) + 1
+			while not sim.done and sim.step < maxSteps do
+				local want = bot(sim) and true or false
+				if want ~= holding then toggles[#toggles + 1] = sim.step; holding = want end
+				MG.Step(sim, holding)
+			end
+			local outcome, steps, perfect = MG.Replay(spec, seed, toggles)
+			if outcome == "caught" and (perfect or attempt >= 4) then return toggles, steps, perfect end
+		end
+	end
+	FR.Event.OnClientEvent:Connect(function(kind, d)
+		if not alive() or type(d) ~= "table" then return end
+		if kind == "Cast" then
+			if d.nonce ~= F.nonce or F.state ~= "cast" then return end
+			if d.ok and d.sid then
+				F.sid, F.state, F.at = d.sid, "wait", os.clock()
+				F.dirBad, F.why = 0, nil
+			else
+				F.state, F.why = "idle", tostring(d.why)
+				F.dirBad += 1
+			end
+			return
+		end
+		if d.sid == nil or d.sid ~= F.sid then return end
+		if kind == "Bite" and F.state == "wait" then
+			F.state = "hook"
+			task.delay(0.12, function() pcall(function() FR.Request:FireServer("Hook", F.sid) end) end)
+		elseif kind == "Missed" then
+			F.state = "wait"
+		elseif kind == "Hooked" then
+			F.state, F.at = "fight", os.clock()
+			local sid = F.sid
+			task.spawn(function()
+				local toggles, steps = solve(d.spec, d.seed)
+				if not toggles then
+					pcall(function() FR.Request:FireServer("Reel", sid) end)
+					F.state = "idle"
+					return
+				end
+				task.wait(steps * d.spec.step + 0.3)
+				if F.sid == sid then pcall(function() FR.Request:FireServer("Done", sid, "caught", toggles) end) end
+			end)
+		elseif kind == "Result" then
+			F.state = "idle"
+			if d.ok then
+				F.catches += 1
+				if d.perfect then F.perfect += 1 end
+				F.last = ("%s (%s%s%s)"):format(tostring(d.fish), tostring(d.rarity), d.giant and " · ยักษ์" or "", d.perfect and " · perfect" or "")
+			else
+				F.why = tostring(d.why)
+				log("ตกปลาไม่ได้: " .. F.why)
+			end
+		elseif kind == "Cancel" then
+			F.state = "idle"
+		end
+	end)
+	-- a direction from the rod tip that lands in water (the spot's own direction first)
+	local function castDir(hrp, origin, rodId)
+		local def = Rods.Get(rodId) or {}
+		local maxCast = def.MaxCast or 55
+		local D = Arc.Distance(1, FCfg.Cast.MIN_DISTANCE, maxCast)
+		local sp = e.fishSpot
+		local base = type(sp) == "table" and sp[4] and Vector3.new(sp[4], 0, sp[5]) or flat(hrp.CFrame.LookVector)
+		base = base.Magnitude > 0.1 and base.Unit or Vector3.new(1, 0, 0)
+		local start = math.atan2(base.Z, base.X)
+		for i = 0, 15 do
+			local a = start + (i % 2 == 0 and 1 or -1) * math.ceil(i / 2) * math.pi / 8
+			local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+			local ok, land = pcall(Wt.FindLanding, origin, dir, D, FCfg.Cast, FCfg.Arc, maxCast, Arc, def)
+			if ok and land then return dir end
+		end
+	end
+	local function step()
+		if not e.fishAuto then
+			if st.extBusy == "fish" then st.extBusy = nil; stopMove() end
+			F.status = "ปิดอยู่"
+			return
+		end
+		if e.farm or e.towerAuto or e.dungeonAuto or st.tw or st.towerSrv then
+			if st.extBusy == "fish" then st.extBusy = nil end
+			F.status = "พัก: ปิด Auto Farm / Tower / Dungeon ก่อนถึงจะตกปลา"
+			return
+		end
+		st.extBusy = "fish"
+		st.extStatus = "Auto Fishing: " .. F.status
+		local c, hrp = char()
+		if not hrp then F.status = "รอตัวละครเกิด" return end
+		if F.state ~= "idle" then
+			-- no bite for 75 s (the game reels in after 60) / a fight that never resolved: start over
+			if os.clock() - F.at > (F.state == "fight" and 60 or 75) then
+				pcall(function() FR.Request:FireServer("Reel", F.sid) end)
+				F.state = "idle"
+			end
+			F.status = ({cast = "โยนเบ็ด", wait = "รอปลากิน", hook = "ปลากินแล้ว เกี่ยว!", fight = "ดึงปลา"})[F.state] or F.state
+			return
+		end
+		local fd = fishData()
+		-- finished quests -> the fishing post
+		if e.fishClaim and fd and fd.Quests and type(fd.Quests.Slots) == "table" then
+			for i, q in pairs(fd.Quests.Slots) do
+				if type(q) == "table" and (tonumber(q.Have) or 0) >= (tonumber(q.Need) or math.huge) and os.clock() - (F.claimAt[i] or 0) > 20 then
+					F.claimAt[i] = os.clock()
+					F.status = ("เควสเสร็จ (%s) → ไปเคลมที่ร้าน"):format(tostring(q.Id))
+					st.extStatus = "Auto Fishing: " .. F.status
+					if goTo(post(), 7, 60) then
+						pcall(function() FR.QuestClaim:FireServer(i) end)
+						task.wait(1.5)
+						log(("Fishing: เคลมเควส %s"):format(tostring(q.Id)))
+					end
+					return
+				end
+			end
+		end
+		-- the spot: set from the tab, or where Auto Fishing was turned on
+		if type(e.fishSpot) ~= "table" then
+			local lv = flat(hrp.CFrame.LookVector)
+			e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, lv.X, lv.Z}
+			sv()
+		end
+		local spot = Vector3.new(e.fishSpot[1], e.fishSpot[2], e.fishSpot[3])
+		if flat(spot - hrp.Position).Magnitude > 5 then
+			F.status = "เดินไปจุดตกปลา"
+			st.extStatus = "Auto Fishing: " .. F.status
+			goTo(spot, 4, 60)
+			return
+		end
+		stopMove()
+		-- rod in hand
+		local serial, rodId = rodSerial()
+		if not serial then F.status = "ไม่มีคันเบ็ด" return end
+		local tool = c:FindFirstChildOfClass("Tool")
+		if not (tool and tool:GetAttribute("FishingRod") == rodId) then
+			pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
+			F.status = "หยิบคันเบ็ด " .. rodId
+			task.wait(1)
+			return
+		end
+		-- bait / charm
+		if e.fishBait ~= "" and fd and fd.Bait ~= e.fishBait and owned(e.fishBait) > 0 and os.clock() - (F.baitAt or 0) > 5 then
+			F.baitAt = os.clock()
+			pcall(function() FR.Request:FireServer("Bait", e.fishBait) end)
+		end
+		if e.fishCharm and fd and (tonumber(fd.LuckUntil) or 0) < workspace:GetServerTimeNow() and owned("LuckyCharm") > 0
+			and os.clock() - (F.charmAt or 0) > 15 then
+			F.charmAt = os.clock()
+			pcall(function() FR.Request:FireServer("Charm") end)
+			log("Fishing: ใช้ Lucky Charm")
+		end
+		-- cast
+		local tip = tool:FindFirstChild("RodTip", true)
+		local origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or (hrp.Position + Vector3.new(0, 4.5, 0))
+		local dir = castDir(hrp, origin, rodId)
+		if not dir then F.status = "หาน้ำไม่เจอจากจุดนี้ (ตั้งจุดใหม่ริมน้ำ หันหน้าเข้าหาน้ำ)" return end
+		c:PivotTo(CFrame.lookAt(hrp.Position, hrp.Position + dir))
+		task.wait(0.1)
+		origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or origin
+		F.nonce += 1
+		F.state, F.at, F.sid = "cast", os.clock(), nil
+		pcall(function() FR.Request:FireServer("Cast", F.nonce, dir, 1, origin, true) end)
+		F.status = "โยนเบ็ด"
+	end
+	task.spawn(function()
+		while alive() do
+			task.wait(0.25)
+			local ok, err = pcall(step)
+			if not ok then F.status = "error: " .. tostring(err) end
+		end
+	end)
+
+	local FiTab = TG:Tab({Name = "Fishing", Image = "rbxassetid://10723346959"})
+	local FL = FiTab:Section({Side = "Left"})
+	FL:Header({Text = "ตกปลาอัตโนมัติ"})
+	FL:Toggle({Name = "Auto Fishing (โยน · เกี่ยว · ดึงแบบ Perfect)", Default = e.fishAuto, Callback = function(v)
+		e.fishAuto = v
+		if not v then F.state = "idle" end
+		sv()
+	end}, "PLFishAuto")
+	FL:Button({Name = "ตั้งจุดตกปลา = ตรงที่ยืน (ยืนริมน้ำ หันหน้าเข้าหาน้ำ)", Callback = function()
+		local _, hrp = char()
+		if not hrp then return end
+		local lv = flat(hrp.CFrame.LookVector)
+		e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, lv.X, lv.Z}
+		sv()
+		log(("Fishing: ตั้งจุดตกปลาที่ %.0f, %.0f, %.0f"):format(hrp.Position.X, hrp.Position.Y, hrp.Position.Z))
+	end})
+	local baitOpts, baitKey = {"ไม่เปลี่ยน (ใช้ที่เลือกในเกม)"}, {}
+	pcall(function()
+		for _, id in ipairs(Sup.BaitIds()) do
+			local it = Sup.Items[id] or {}
+			local lab = ("%s · %s"):format(tostring(it.Display or id), tostring(it.Effect or ""))
+			baitOpts[#baitOpts + 1] = lab
+			baitKey[lab] = id
+			baitKey[id] = lab
+		end
+	end)
+	FL:Dropdown({Name = "เหยื่อ", Multi = false, Required = true, Options = baitOpts,
+		Default = baitKey[e.fishBait] or baitOpts[1],
+		Callback = function(v) e.fishBait = baitKey[v] or ""; sv() end}, "PLFishBait")
+	local rodOpts, rodKey = {"คันที่ดีที่สุดที่มี"}, {}
+	pcall(function()
+		local list = {}
+		for id, def in pairs(Rods.Rods or {}) do list[#list + 1] = {id = id, luck = tonumber(def.Luck) or 1, name = def.Display or id} end
+		table.sort(list, function(a, b) return a.luck < b.luck end)
+		for _, r in ipairs(list) do
+			local lab = ("%s · ดวง x%.2f"):format(tostring(r.name), r.luck)
+			rodOpts[#rodOpts + 1] = lab
+			rodKey[lab] = r.id
+			rodKey[r.id] = lab
+		end
+	end)
+	FL:Dropdown({Name = "คันเบ็ด", Multi = false, Required = true, Options = rodOpts,
+		Default = rodKey[e.fishRod] or rodOpts[1],
+		Callback = function(v) e.fishRod = rodKey[v] or ""; sv() end}, "PLFishRod")
+	FL:Toggle({Name = "Auto Claim Quest ตกปลา (เดินไปเคลมที่ร้านแล้วกลับมาตกต่อ)", Default = e.fishClaim, Callback = function(v) e.fishClaim = v; sv() end}, "PLFishClaim")
+	FL:Toggle({Name = "ใช้ Lucky Charm อัตโนมัติ (ดวง x1.5 · 10 นาที/อัน)", Default = e.fishCharm, Callback = function(v) e.fishCharm = v; sv() end}, "PLFishCharm")
+	FL:Label({Text = "ปิด Auto Farm / Tower / Dungeon ก่อนเปิดตกปลา\nจุดตกปลาจำไว้: ตาย/หลุดแล้วเดินกลับมาเอง"})
+	local FRs = FiTab:Section({Side = "Right"})
+	FRs:Header({Text = "สถานะตกปลา"})
+	local fLbl = FRs:Label({Text = "-"})
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local fd = fishData() or {}
+				local qs = {}
+				for i, q in pairs(type(fd.Quests) == "table" and type(fd.Quests.Slots) == "table" and fd.Quests.Slots or {}) do
+					if type(q) == "table" then qs[#qs + 1] = ("%d) %s %s/%s"):format(i, tostring(q.Id), tostring(q.Have), tostring(q.Need)) end
+				end
+				table.sort(qs)
+				local _, rodId = rodSerial()
+				fLbl:UpdateName(("%s\nจับได้ %d ตัว (perfect %d) · ล่าสุด %s\nคัน %s · เหยื่อ %s (เหลือ %d)%s\nเควส:\n%s"):format(F.status, F.catches, F.perfect, F.last,
+					tostring(rodId), tostring(fd.Bait), fd.Bait and owned(fd.Bait) or 0, F.why and ("\nล่าสุดที่ไม่ผ่าน: " .. F.why) or "",
+					#qs > 0 and table.concat(qs, "\n") or "-"))
+			end)
+			task.wait(1)
+		end
+	end)
+end)()
+
 -- ------------------------------------------------------------------ no mounts
 -- The bot never rides (user: walk / run only). If the character ends up on a mount (the player got on), the walk
 -- step gets off by drawing the fighting weapon (the game drops you off the mount).
