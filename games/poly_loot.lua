@@ -3170,6 +3170,24 @@ task.spawn(function()
 					end
 				end
 			end
+			if st.tw and hpPct() < 25 then
+				local sum, n = Vector3.zero, 0
+				for _, m in ipairs(AnimalLive.Aggressors:GetChildren()) do
+					if wanted(m) then
+						local mp = mobPos(m)
+						if flat(mp - hrp.Position).Magnitude < 35 then sum += mp; n += 1 end
+					end
+				end
+				if n > 0 then
+					local away = flat(hrp.Position - sum / n)
+					away = away.Magnitude > 0.5 and away.Unit or -flat(hrp.CFrame.LookVector).Unit
+					local goal = hrp.Position + away * 36
+					endCombo()
+					if not (st.hopTo and st.hopTo(goal, nil, true)) then moveTo(goal, true) end
+					st.status = ("เลือดวิกฤต %d%% → ออกจากฝูงก่อน"):format(hpPct())
+					return
+				end
+			end
 			if st.tw and e.smart and st.skillEscape then
 				local sp = st.skillEscape(hrp)
 				if sp then
@@ -3420,8 +3438,9 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.25)
 		-- while a regeneration item works, eat again only in an emergency
-		if (e.farm or st.bossActive or st.defend or st.tw) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= e.healItemAt
-			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= 25) then
+		local at = st.tw and math.max(e.healItemAt, tonumber(e.instHealAt) or 60) or e.healItemAt
+		if (e.farm or st.bossActive or st.defend or st.tw) and (e.usePotion or e.useFood) and hpPct() > 0 and hpPct() <= at
+			and os.clock() - lastHeal > e.healItemGap and (os.clock() > regenUntil or hpPct() <= (st.tw and 35 or 25)) then
 			pcall(useHeal)
 		end
 	end
@@ -4704,6 +4723,7 @@ end)()
 	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 1 end
 	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
 	if e.instSkill == nil then e.instSkill = true end
+	if type(e.instHealAt) ~= "number" then e.instHealAt = 60 end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
 	local function towerNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
@@ -5393,6 +5413,8 @@ end)()
 	DL:Slider({Name = "└ เก็บความโลภไม่เกิน (ชั้น) · แต่ละชั้นเกราะเราเหลือ 10%", Default = e.dungeonGreedMax, Minimum = 1, Maximum = 4, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.dungeonGreedMax = v; sv() end}, "PLDungeonGreedMax")
 	DL:Toggle({Name = "└ บอสมังกรบิน → ไปขึ้นป้อมยิงฉมวกเอง (ยิงลงมาแล้วตีฟรี)", Default = e.dungeonHarpoon, Callback = function(v) e.dungeonHarpoon = v; sv() end}, "PLDungeonHarpoon")
+	DL:Slider({Name = "กินของฟื้นเลือดเมื่อเลือดต่ำกว่า % (ในหอคอย + ดันเจี้ยน)", Default = e.instHealAt, Minimum = 30, Maximum = 90, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.instHealAt = v; sv() end}, "PLInstHealAt")
 	DL:Toggle({Name = "ใช้สกิลโจมตีทันทีที่คูลดาวน์หมด (ในหอคอย + ดันเจี้ยน · เล็งกลางกลุ่มมอน)", Default = e.instSkill, Callback = function(v) e.instSkill = v; sv() end}, "PLInstSkill")
 	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
 	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
