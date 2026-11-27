@@ -220,7 +220,15 @@ local function mobKinds()
 end
 local function wanted(m)
 	if not mobAlive(m) then return false end
-	if st.tw then return m:GetAttribute("_TowerRun") == st.tw.run end
+	if st.tw then
+		if st.tw.kind ~= "vd" then return m:GetAttribute("_TowerRun") == st.tw.run end
+		local hc = plr.Character
+		local hh = hc and hc:FindFirstChild("HumanoidRootPart")
+		if not hh then return false end
+		local p = mobPos(m)
+		local boss = m:GetAttribute("Tier") == "Boss"
+		return flat(p - hh.Position).Magnitude < (boss and 400 or 260) and math.abs(p.Y - hh.Position.Y) < (boss and 90 or 40)
+	end
 	if e.bossOnly and m:GetAttribute("Tier") ~= "Boss" then return false end
 	local any = next(e.mobs) ~= nil
 	if any and not e.mobs[m:GetAttribute("Animal") or ""] then return false end
@@ -2600,6 +2608,7 @@ task.spawn(function()
 			end
 			-- Auto Tower: walk to the door / start the next floor, or hold still between floors (see the Tower tab)
 			if st.towerLobby and st.towerLobby() then return end
+			if st.dungeonLobby and st.dungeonLobby() then return end
 			-- Auto Boss on its own (Auto Farm off): fight only a picked boss that is up in range, otherwise hands off
 			local bossOnly = not farmOn and e.bossHunt and next(e.bossPick) ~= nil
 			local bossNow
@@ -2997,7 +3006,7 @@ task.spawn(function()
 				st.evades = (st.evades or 0) + 1
 				st.evadeUntil = os.clock() + 0.3
 				endCombo()
-				moveTo(ev, true)
+				if not (st.tw and e.tpDodge and st.tpTo and st.tpTo(ev, tp)) then moveTo(ev, true) end
 				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
 				return
 			end
@@ -3009,7 +3018,7 @@ task.spawn(function()
 			end
 			if dp then
 				st.dodges += 1
-				moveTo(dp, true)
+				if not (st.tw and e.tpDodge and st.tpTo and st.tpTo(dp, tp)) then moveTo(dp, true) end
 				lookAt = tp
 				st.status = "หลบท่า"
 			elseif dist > math.max(e.standDist, e.orbitRadius) + 8 then
@@ -4501,9 +4510,13 @@ end)()
 	if type(e.towerRest) ~= "number" then e.towerRest = 30 end    -- minutes before trying that floor again
 	if e.towerClaim == nil then e.towerClaim = true end
 	if e.towerTp == nil then e.towerTp = true end
+	if e.dungeonAuto == nil then e.dungeonAuto = false end
+	if e.dungeonAgain == nil then e.dungeonAgain = true end
+	if e.tpDodge == nil then e.tpDodge = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
-	local function srvNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
+	local function towerNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
+	local function srvNow() return towerNow() or plr:GetAttribute("VDRun") ~= nil or workspace:GetAttribute("DungeonServer") ~= nil end
 	st.towerSrvNow = srvNow
 	st.towerSrv = srvNow() or nil
 	local T = {state = nil, stateAt = -1e9, startAt = -1e9, res = nil, sent = {}, readyRun = nil, endedAt = nil}
@@ -4541,8 +4554,15 @@ end)()
 				if not (T.res and T.res.session == d.session) then
 					T.res = {session = d.session, outcome = d.outcome, at = os.clock(), floor = tonumber(plr:GetAttribute("TowerFloor")) or 0}
 				end
+			elseif kind == "state" and d.key == "Volcano" and d.state == "open" and d.session then
+				if not (T.vres and T.vres.session == d.session) then
+					T.vres = {session = d.session, outcome = d.outcome, at = os.clock()}
+					log(("Dungeon: จบรอบ (%s)"):format(tostring(d.outcome)))
+				end
 			elseif kind == "close" and T.res and d.session == T.res.session then
 				T.res = nil
+			elseif kind == "close" and T.vres and d.session == T.vres.session then
+				T.vres = nil
 			end
 		end)
 	end
@@ -4593,11 +4613,29 @@ end)()
 						T.readyRun = run
 						task.spawn(ask, "ready")
 					end
+				elseif e.dungeonAuto and plr:GetAttribute("VDRun") ~= nil then
+					local vd = plr:GetAttribute("VDRun")
+					if not st.tw or st.tw.run ~= vd then
+						st.tw = {run = vd, kind = "vd", floor = 0, at = os.clock()}
+						st.target, st.blocker, st.bossLock = nil, nil, nil
+						path.wps = nil
+						log("Dungeon: อยู่ใน Dragon's Hoard แล้ว")
+					end
 				elseif st.tw then
 					st.tw = nil
 					st.target = nil
 				end
-				if e.towerAuto and (st.towerSrv or st.towerTrip) then
+				local vr = T.vres
+				if e.dungeonAuto and vr and os.clock() - vr.at > 4 then
+					local sent = T.sent[vr.session]
+					if not sent or os.clock() - sent.at > 6 then
+						local choice = sent and sent.choice or (e.dungeonAgain and "again" or "home")
+						T.sent[vr.session] = {choice = choice, at = os.clock()}
+						if not sent then log(("Dungeon: %s"):format(choice == "again" and "ลงรอบใหม่" or "กลับโลกปกติ")) end
+						pcall(function() Choice:FireServer(choice, vr.session) end)
+					end
+				end
+				if (e.towerAuto and (st.towerSrv or st.towerTrip)) or (e.dungeonAuto and (st.towerSrv or st.dungeonTrip)) then
 					st.extBusy = "tower"
 				elseif st.extBusy == "tower" then
 					st.extBusy = nil
@@ -4706,13 +4744,59 @@ end)()
 		c:PivotTo(CFrame.lookAt(dest, Vector3.new(tp.X, dest.Y, tp.Z)))
 		return true
 	end
+	-- instant teleport to a spot (dodges inside the tower / dungeon): needs floor under it, max 60 studs. Counts as a
+	-- hop for the spacing rule (hops < 3 s apart got us rebaselined = pulled back into the attack)
+	st.tpTo = function(pos, look)
+		local c, hrp = char()
+		if not hrp or flat(pos - hrp.Position).Magnitude > 60 then return false end
+		if os.clock() - (T.hopAt or 0) < 0.8 then return false end
+		hopRp.FilterDescendantsInstances = {c, AnimalLive}
+		local dest = Vector3.new(pos.X, hrp.Position.Y, pos.Z)
+		if not workspace:Raycast(dest + Vector3.new(0, 4, 0), Vector3.new(0, -14, 0), hopRp) then return false end
+		T.hopAt = os.clock()
+		T.tps = (T.tps or 0) + 1
+		stopMove()
+		local lk = look and Vector3.new(look.X, dest.Y, look.Z) or (dest + hrp.CFrame.LookVector)
+		if flat(lk - dest).Magnitude < 0.5 then lk = dest + hrp.CFrame.LookVector end
+		c:PivotTo(CFrame.lookAt(dest, lk))
+		return true
+	end
+	-- Dragon's Hoard gate (Volcano): stand on the seal (DragonSeal.Seal, 22x22 at 195, 169, -3673) -> it gathers the
+	-- party for 15 s (GateState "gathering", GateEndsAt, GateCount/GateMax 4), the doors open and the server sends us
+	-- to a dungeon server (player attr VDRun). Level 300+.
+	local SEAL = Vector3.new(195.2, 168.8, -3672.7)
+	st.dungeonLobby = function()
+		if not e.dungeonAuto then st.dungeonTrip = nil return false end
+		if srvNow() then return false end
+		if (tonumber(plr:GetAttribute("Level")) or 0) < 300 then return false end
+		local _, hrp = char()
+		if not hrp then return false end
+		local gate, seal = nil, SEAL
+		pcall(function() gate = workspace.Volcano.Assets.DungeonEntrance.DragonSeal; seal = gate.Seal.Position end)
+		st.dungeonTrip = true
+		st.target, lookAt = nil, nil
+		st.bossActive = false
+		endCombo()
+		local d = flat(seal - hrp.Position).Magnitude
+		if d > 6 then
+			if st.tripMove then st.tripMove({pos = seal, kind = "Dungeon", d = d}) else moveTo(seal) end
+			st.status = ("Auto Dungeon: ไปแท่นประตู Dragon's Hoard · %.0f stud"):format(d)
+			return true
+		end
+		stopMove()
+		local gs = gate and gate:GetAttribute("GateState") or "?"
+		local ends = gate and tonumber(gate:GetAttribute("GateEndsAt"))
+		st.status = gs == "gathering" and ends and ("Auto Dungeon: ยืนบนแท่น · ประตูเปิดใน %d วิ (%s/%s คน)"):format(math.max(0, ends - workspace:GetServerTimeNow()),
+			tostring(gate:GetAttribute("GateCount")), tostring(gate:GetAttribute("GateMax"))) or ("Auto Dungeon: ยืนบนแท่น · ประตู %s"):format(gs)
+		return true
+	end
 	-- main-loop hook. true = the tower has the character this tick
 	st.towerLobby = function()
 		if not e.towerAuto then st.towerTrip = nil return false end
 		local _, hrp = char()
 		st.towerSrv = srvNow() or nil
 		if st.towerSrv then
-			if st.tw then return false end   -- a floor is on: the farm loop fights it
+			if st.tw or not towerNow() then return false end   -- a floor is on (the farm loop fights it) / a dungeon
 			st.target, lookAt = nil, nil
 			endCombo()
 			local r = T.res
@@ -4777,6 +4861,27 @@ end)()
 	TL:Toggle({Name = "└ วาร์ปสั้นเข้าหามอน (≤ 45 stud · เฉพาะในหอคอย)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLTowerTp")
 	TL:Toggle({Name = "└ รับรางวัล Tower Pass (ช่องฟรี) อัตโนมัติ", Default = e.towerClaim, Callback = function(v) e.towerClaim = v; sv() end}, "PLTowerClaim")
 	TL:Label({Text = "เปิดแล้ว Tower มาก่อน Farm/Boss: ระหว่างพัก (แพ้ติด) บอทกลับไปฟาร์ม/ตีบอสตามที่ตั้งไว้\nในหอคอยใช้ระบบตี/หลบ/กินยาเดียวกับ Farm แต่ไม่ถอยพักเลือด (ชั้นละ 180 วิ)\nชั้นที่ผ่านแล้วเล่นซ้ำไม่ได้ของ → เริ่มที่ชั้นสูงสุด + 1 เสมอ"})
+	local DgTab = TG:Tab({Name = "Dungeon", Image = "rbxassetid://10723346959"})
+	local DL = DgTab:Section({Side = "Left"})
+	DL:Header({Text = "Dragon's Hoard (ประตู Volcano · เลเวล 300+)"})
+	DL:Toggle({Name = "Auto Dungeon (ไปยืนแท่นประตูเอง · ตีทุกห้อง + บอส)", Default = e.dungeonAuto, Callback = function(v) e.dungeonAuto = v; sv() end}, "PLDungeonAuto")
+	DL:Toggle({Name = "└ จบรอบแล้วลงรอบใหม่ต่อเลย (ปิด = กลับโลกปกติ)", Default = e.dungeonAgain, Callback = function(v) e.dungeonAgain = v; sv() end}, "PLDungeonAgain")
+	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
+	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
+	local DR = DgTab:Section({Side = "Right"})
+	DR:Header({Text = "สถานะ Dungeon"})
+	local dgLbl = DR:Label({Text = "-"})
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local vd = plr:GetAttribute("VDRun")
+				dgLbl:UpdateName(("%s\nวาร์ปหลบ %d ครั้ง · วาร์ปเข้าหา %d ครั้ง"):format(
+					vd and ("ในดันเจี้ยน (run " .. tostring(vd) .. ")") or (e.dungeonAuto and "อยู่ข้างนอก · จะไปแท่นประตูเอง" or "Auto Dungeon ปิดอยู่"),
+					T.tps or 0, T.hops or 0))
+			end)
+			task.wait(1)
+		end
+	end)
 	local TRs = TwTab:Section({Side = "Right"})
 	TRs:Header({Text = "สถานะ Tower"})
 	local twLbl = TRs:Label({Text = "-"})
