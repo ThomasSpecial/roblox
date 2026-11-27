@@ -5765,7 +5765,6 @@ end)()
 			if type(e.fishSpot) ~= "table" and hrp then
 				F.avoid = F.avoid or {}
 				table.insert(F.avoid, {p = hrp.Position, r = 45})
-				F.here = nil
 				local sp = F.pool and e.fishPoolSpots[F.pool]
 				if type(sp) == "table" and flat(Vector3.new(sp[1], 0, sp[3]) - hrp.Position).Magnitude < 45 then e.fishPoolSpots[F.pool] = nil; sv() end
 				log("Fishing: โดนมอนตีตรงนี้ → ย้ายไปริมน้ำที่ห่างมอน")
@@ -6188,16 +6187,21 @@ end)()
 		F.pool = pool
 		local _, rid = rodSerial(pool == "Volcano")
 		if not rid then F.status = "ไม่มีคันเบ็ดสำหรับ " .. (POOL_TH[pool] or pool) return nil end
-		if F.here and F.here.pool == pool and flat(Vector3.new(F.here[1], 0, F.here[3]) - hrp.Position).Magnitude < 6 then return F.here end
-		local dirHere = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0), rid, pool)
+		local known = e.fishPoolSpots[pool]
+		if type(known) == "table" then return known end
+		local held = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Tool")
+		local tipNow = held and held:GetAttribute("FishingRod") and held:FindFirstChild("RodTip", true)
+		local originNow = tipNow and (tipNow:IsA("Attachment") and tipNow.WorldPosition or tipNow.Position) or hrp.Position + Vector3.new(0, 4.5, 0)
+		local dirHere = castDir(hrp, originNow, rid, pool)
 		local inAvoid = false
 		for _, b in ipairs(F.avoid or {}) do if flat(b.p - hrp.Position).Magnitude < b.r then inAvoid = true end end
 		if dirHere and not inAvoid and clearance(hrp.Position, dangerPts()) >= SAFE then
-			F.here = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dirHere.X, dirHere.Z, pool = pool}
-			return F.here
+			local here = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dirHere.X, dirHere.Z}
+			e.fishPoolSpots[pool] = here
+			sv()
+			log(("Fishing: ริมน้ำ %s ตรงนี้ใช้ได้ (ห่างมอน) → จำเป็นจุดตกของน้ำนี้"):format(POOL_TH[pool] or pool))
+			return here
 		end
-		local sp = e.fishPoolSpots[pool]
-		if type(sp) == "table" then return sp end
 		local an, d = nearestAnchor(pool, hrp.Position)
 		if not an then F.badPool[pool] = os.clock() + 600 return nil end
 		local found, safe
@@ -6430,7 +6434,13 @@ end)()
 				log("Fishing: จุดริมน้ำนี้โยนไม่ลงน้ำที่ต้องการ → หาจุดใหม่")
 				return
 			end
-			F.here = nil
+			if type(e.fishSpot) ~= "table" then
+				F.avoid = F.avoid or {}
+				table.insert(F.avoid, {p = hrp.Position, r = 10})
+				if F.pool and e.fishPoolSpots[F.pool] then e.fishPoolSpots[F.pool] = nil; sv() end
+				log("Fishing: ตรงนี้โยนไม่ถึงน้ำ → หาจุดใหม่")
+				return
+			end
 			F.status = "หาน้ำไม่เจอจากจุดนี้ (ตั้งจุดใหม่ริมน้ำ หันหน้าเข้าหาน้ำ)"
 			return
 		end
