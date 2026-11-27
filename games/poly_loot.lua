@@ -3600,6 +3600,11 @@ end)
 pcall(function()
 	game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
 		if not (alive() and e.autoRejoin) or msg == "" then return end
+		local low = tostring(msg):lower()
+		if low:find("same account") or low:find("different device") or low:find("another device") then
+			log("หลุดเพราะบัญชีนี้เข้าเกมจากที่อื่น → ไม่เข้าใหม่ (กันเตะกันไปมา)")
+			return
+		end
 		log("หลุดจากเกม: " .. tostring(msg) .. " → เข้าใหม่")
 		local qot = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
 		if qot then pcall(qot, ('loadstring(game:HttpGet("%s"))()'):format(LOADER_URL)) end
