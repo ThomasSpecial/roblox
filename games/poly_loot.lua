@@ -1141,15 +1141,22 @@ end
 return Nav
 end)()
 -- [NAV END]
--- lava pools for the NavMap (Nav.hazards): the game's own list of lava surfaces
-pcall(function()
-	local LZ = require(RS:WaitForChild("Lava_Engine", 10):WaitForChild("Zones", 10))
-	for _, p in ipairs(LZ.Surfaces() or {}) do
-		if typeof(p) == "Instance" and p:IsA("BasePart") and p.Size.X < 1000 then
-			table.insert(Nav.hazards, {cf = p.CFrame, half = p.Size / 2 + Vector3.new(3, 4, 3)})
+-- lava pools for the NavMap (Nav.hazards): the game's own list of lava surfaces. In its OWN thread: calling the
+-- game's Lava Zones module from the main chunk left that thread without executor rights, and the UI library failed
+-- right after ("cloneref got nil") -> warp / boss trips / boss signs never loaded for 25 min
+task.spawn(function()
+	pcall(function()
+		local LZ = require(RS:WaitForChild("Lava_Engine", 10):WaitForChild("Zones", 10))
+		local list = {}
+		for _, p in ipairs(LZ.Surfaces() or {}) do
+			if typeof(p) == "Instance" and p:IsA("BasePart") and p.Size.X < 1000 then
+				list[#list + 1] = {cf = p.CFrame, half = p.Size / 2 + Vector3.new(3, 4, 3)}
+			end
 		end
-	end
-	st.navHazards = #Nav.hazards
+		for _, h in ipairs(list) do table.insert(Nav.hazards, h) end
+		for _, m in pairs(Nav.maps) do m.hz = nil end   -- plans made before this cached "no lava"
+		st.navHazards = #Nav.hazards
+	end)
 end)
 local path = {goal = nil, wps = nil, i = 0, at = 0, nav = false}
 -- NavMap regions: "main" (town, grass, cave, jungle, dark forest) only reached z -2380, so the Volcano (Pyrolisk farm,
