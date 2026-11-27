@@ -222,6 +222,8 @@ local function wanted(m)
 	if not mobAlive(m) then return false end
 	if st.tw then
 		if st.tw.kind ~= "vd" then return m:GetAttribute("_TowerRun") == st.tw.run end
+		local dr = m:GetAttribute("_DungeonRun")
+		if dr ~= nil then return dr == st.tw.run end
 		local hc = plr.Character
 		local hh = hc and hc:FindFirstChild("HumanoidRootPart")
 		if not hh then return false end
@@ -2794,12 +2796,15 @@ task.spawn(function()
 					if not aura(c, hrp) then endCombo() end
 					if (tonumber(plr:GetAttribute("TowerEnemies")) or 0) == 0 and lootStep(hrp) then return end
 					local ws = st.towerWaitSpot and st.towerWaitSpot(hrp)
+					local vdk = st.tw.kind == "vd"
 					if ws and flat(ws - hrp.Position).Magnitude > 8 then
-						moveTo(ws)
-						st.status = "Tower: ไปรอตรงจุดเกิดมอน (wave ถัดไป)"
+						if not (vdk and st.travelHop and st.travelHop(hrp, ws)) then moveTo(ws) end
+						st.status = vdk and ("Dungeon: ไปห้องถัดไป (ห้อง %s) · %.0f stud"):format(tostring(plr:GetAttribute("DungeonRoom")), flat(ws - hrp.Position).Magnitude)
+							or "Tower: ไปรอตรงจุดเกิดมอน (wave ถัดไป)"
 					else
 						stopMove()
-						st.status = "Tower: รอ wave ถัดไป"
+						st.status = vdk and ("Dungeon: รอ (ห้อง %s · %s)"):format(tostring(plr:GetAttribute("DungeonRoom")), tostring(plr:GetAttribute("DungeonState")))
+							or "Tower: รอ wave ถัดไป"
 					end
 					return
 				end
@@ -4691,6 +4696,7 @@ end)()
 	-- where the next wave appears: centre of the Mob<n> spawn parts of the arena we're in (Long Hall: 90 studs from the
 	-- entrance, walking there after every wave started cost ~5 s a wave)
 	st.towerWaitSpot = function(hrp)
+		if st.tw and st.tw.kind == "vd" then return st.dungeonGoal and st.dungeonGoal(hrp) end
 		local run = st.tw and st.tw.run
 		if not run then return nil end
 		if T.spotRun == run then return T.spot end
@@ -4765,6 +4771,79 @@ end)()
 	-- party for 15 s (GateState "gathering", GateEndsAt, GateCount/GateMax 4), the doors open and the server sends us
 	-- to a dungeon server (player attr VDRun). Level 300+.
 	local SEAL = Vector3.new(195.2, 168.8, -3672.7)
+	-- inside: rooms are folders workspace.VolcanoDungeon_Chain.Chain_<n>.<NN_name> (attr VDIndex) laid out along +X,
+	-- stairs between them; player attr DungeonRoom = the room we're on. Nothing to hit -> walk to the next room's
+	-- VD_Markers.Arrival1 (the game says "Down the stairs" and waits for us there)
+	local function roomCentre(r)
+		local p
+		pcall(function()
+			local sh = r:FindFirstChild("Shell")
+			local tf = sh and sh:FindFirstChild("Top_flag")
+			if tf then p = tf.Position return end
+			local mk = r:FindFirstChild("VD_Markers")
+			local sum, n = Vector3.zero, 0
+			for _, d in ipairs(mk and mk:GetChildren() or {}) do
+				if d:IsA("BasePart") and d.Name:match("^Spawn") then sum += d.Position; n += 1 end
+			end
+			if n > 0 then p = sum / n end
+		end)
+		return p
+	end
+	st.dungeonGoal = function(hrp)
+		local room = tonumber(plr:GetAttribute("DungeonRoom")) or 1
+		local state = plr:GetAttribute("DungeonState")
+		if state == "fight" and T.waveSpot and T.waveRoom == room then return T.waveSpot end
+		local want = state == "fight" and room or room + 1
+		local chain = workspace:FindFirstChild("VolcanoDungeon_Chain")
+		local best, bd
+		for _, ch in ipairs(chain and chain:GetChildren() or {}) do
+			for _, r in ipairs(ch:GetChildren()) do
+				if r:GetAttribute("VDIndex") == want then
+					local c = roomCentre(r)
+					local d = c and (c - hrp.Position).Magnitude
+					if d and (not bd or d < bd) then best, bd = c, d end
+				end
+			end
+		end
+		return best
+	end
+	-- wave spawn spots (Scene "wave" {spots, room}) -> wait where they rise; cleared -> forget
+	pcall(function()
+		RS.VolcanoDungeon_Engine.Remotes.Scene.OnClientEvent:Connect(function(kind, d)
+			if not alive() or type(d) ~= "table" then return end
+			if kind == "wave" and type(d.spots) == "table" then
+				local sum, n = Vector3.zero, 0
+				for _, v in pairs(d.spots) do if typeof(v) == "Vector3" then sum += v; n += 1 end end
+				if n > 0 then T.waveSpot, T.waveRoom = sum / n, tonumber(d.room) end
+			elseif kind == "cleared" or kind == "room" then
+				T.waveSpot = nil
+			end
+		end)
+	end)
+	-- travel hop inside the dungeon: up to 40 studs straight toward the goal when nothing collidable is in the way and
+	-- there is floor under the landing spot not far below (never into the chasm under the stairs); 3 s apart
+	local travRp = RaycastParams.new()
+	travRp.FilterType = Enum.RaycastFilterType.Exclude
+	travRp.RespectCanCollide = true
+	st.travelHop = function(hrp, goal)
+		if not (e.towerTp and st.tw) or os.clock() - (T.hopAt or 0) < (T.hopGap or 3) then return false end
+		local c = plr.Character
+		local fl = flat(goal - hrp.Position)
+		if fl.Magnitude < 25 then return false end
+		local step = math.min(40, fl.Magnitude - 6)
+		local from = hrp.Position + Vector3.new(0, 1.5, 0)
+		local dest = hrp.Position + fl.Unit * step
+		travRp.FilterDescendantsInstances = {c, AnimalLive}
+		if workspace:Raycast(from, (dest + Vector3.new(0, 1.5, 0)) - from, travRp) then return false end
+		local hit = workspace:Raycast(dest + Vector3.new(0, 6, 0), Vector3.new(0, -70, 0), travRp)
+		if not hit or hit.Position.Y < math.min(goal.Y, hrp.Position.Y) - 12 then return false end
+		T.hopAt = os.clock()
+		T.hops = (T.hops or 0) + 1
+		stopMove()
+		local land = hit.Position + Vector3.new(0, 3, 0)   -- root part stands ~3 studs above the floor
+		c:PivotTo(CFrame.lookAt(land, land + fl.Unit))
+		return true
+	end
 	st.dungeonLobby = function()
 		if not e.dungeonAuto then st.dungeonTrip = nil return false end
 		if srvNow() then return false end
