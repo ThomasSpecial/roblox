@@ -2774,7 +2774,7 @@ task.spawn(function()
 				end
 			end
 			-- Auto Gather: a mob came at us while gathering -> fight it here (st.defend), gathering waits
-			local defend = e.gather and not farmOn and st.defend and mobAlive(st.defend) and st.defend or nil
+			local defend = (e.gather or e.fishAuto) and not farmOn and st.defend and mobAlive(st.defend) and st.defend or nil
 			if defend then st.blocker = defend; if st.target ~= defend then st.target = defend end end
 			local holding = st.lootHold and os.clock() < st.lootHold.untilT   -- boss loot pick-up (also Auto Boss alone)
 			if not farmOn and not bossNow and not defend and not holding then
@@ -5723,6 +5723,73 @@ end)()
 		st.weapon, st.weaponSerial = nil, w
 	end
 	F.bossCheck = bossWanted
+	-- an aggressive mob at arm's length (same test as Auto Gather's), not one that kills in a hit
+	local function threatNear(hrp)
+		local _, _, hum = char()
+		if not (hrp and hum) then return nil end
+		local best, bd
+		local folder = AnimalLive:FindFirstChild("Aggressors")
+		for _, m in ipairs(folder and folder:GetChildren() or {}) do
+			if mobAlive(m) and m:GetAttribute("Tier") ~= "Boss" and not (F.ignoreMob and (F.ignoreMob[m] or 0) > os.clock()) then
+				local mp = mobPos(m)
+				local ok, sz = pcall(function() return m:GetExtentsSize() end)
+				local rad = ok and math.min(math.max(sz.X, sz.Z) / 2, 12) or 2
+				local d = flat(mp - hrp.Position).Magnitude - rad
+				local lethal = (tonumber(m:GetAttribute("Damage")) or 0) >= hum.MaxHealth * 0.9
+				if d <= (e.reach or 8) + 4 and math.abs(mp.Y - hrp.Position.Y) < 10 and not lethal and (not bd or d < bd) then best, bd = m, d end
+			end
+		end
+		return best
+	end
+	F.threatNear = threatNear
+	-- a mob came at us: land a fish already on the line, put the line away, sword out, the main loop kills it; in
+	-- quest mode that water's edge is remembered as unsafe and we move to another one
+	local function defendBreak(hrp)
+		if st.defend and mobAlive(st.defend) then
+			local hpNow = tonumber(st.defend:GetAttribute("Health")) or 0
+			if F.defMob ~= st.defend or F.defHp ~= hpNow then F.defMob, F.defHp, F.defAt = st.defend, hpNow, os.clock() end
+			if os.clock() - F.defAt < 12 then
+				if st.extBusy == "fish" then st.extBusy = nil end
+				F.status = ("สู้ %s ที่เข้ามาตีก่อน"):format(tostring(st.defend:GetAttribute("Animal")))
+				return true
+			end
+			F.ignoreMob = F.ignoreMob or {}
+			F.ignoreMob[st.defend] = os.clock() + 120
+			log(("Fishing: ตี %s ไม่เข้า 12 วิ → ปล่อยมัน%s"):format(tostring(st.defend:GetAttribute("Animal")),
+				type(e.fishSpot) == "table" and " แล้วตกต่อ" or " แล้วย้ายไปริมน้ำที่ห่างมอน"))
+			st.defend, st.blocker, st.target = nil, nil, nil
+		end
+		if st.defend then st.defend = nil end
+		if F.fought then
+			F.fought = false
+			if type(e.fishSpot) ~= "table" and hrp then
+				F.avoid = F.avoid or {}
+				table.insert(F.avoid, {p = hrp.Position, r = 45})
+				F.here = nil
+				local sp = F.pool and e.fishPoolSpots[F.pool]
+				if type(sp) == "table" and flat(Vector3.new(sp[1], 0, sp[3]) - hrp.Position).Magnitude < 45 then e.fishPoolSpots[F.pool] = nil; sv() end
+				log("Fishing: โดนมอนตีตรงนี้ → ย้ายไปริมน้ำที่ห่างมอน")
+			end
+		end
+		if not hrp then return false end
+		local m = threatNear(hrp)
+		if not m then return false end
+		local fs = plr:GetAttribute("_FishingState") or "idle"
+		if fs == "bite" or fs == "hooking" or fs == "fight" or fs == "resolve" then return false end
+		if fs == "wait" then
+			local ctl = F.CTL
+			if ctl and ctl.press then pcall(ctl.press) end
+			F.status = "มอนเข้ามา → ม้วนสายเก็บ"
+			return true
+		end
+		st.defend, st.blocker, st.target = m, m, m
+		if st.extBusy == "fish" then st.extBusy = nil end
+		stopMove()
+		drawSword()
+		F.fought = true
+		log(("Fishing: %s เข้ามาตี → ถือดาบสู้ก่อน"):format(tostring(m:GetAttribute("Animal"))))
+		return true
+	end
 	-- true = fishing stays out of the way this tick (boss first, then back to the spot)
 	local function bossBreak(hrp)
 		local fs = plr:GetAttribute("_FishingState") or "idle"
@@ -5772,7 +5839,7 @@ end)()
 			if flat(pos - hrp.Position).Magnitude <= near then stopMove() return true end
 			if F.bossCheck and os.clock() - (F.bcAt or 0) > 1 then
 				F.bcAt = os.clock()
-				if F.bossCheck(hrp) then stopMove() return false end
+				if F.bossCheck(hrp) or (F.threatNear and F.threatNear(hrp)) then stopMove() return false end
 			end
 			moveTo(pos)
 			if not lastP or (hrp.Position - lastP).Magnitude > 2 then
@@ -6021,8 +6088,34 @@ end)()
 		end
 		return best
 	end
+	-- where aggressive mobs are / come back to: live ones in Animal_Live.Aggressors + Animal_SpawnPoints of their kinds
+	local SAFE = 70
+	local function dangerPts()
+		local pts, kinds = {}, {}
+		local ag = AnimalLive:FindFirstChild("Aggressors")
+		for _, m in ipairs(ag and ag:GetChildren() or {}) do
+			local k = m:GetAttribute("Animal")
+			if k then kinds[k] = true end
+			if mobAlive(m) then pts[#pts + 1] = mobPos(m) end
+		end
+		local sp = workspace:FindFirstChild("Animal_SpawnPoints")
+		for _, p in ipairs(sp and sp:GetChildren() or {}) do
+			if p:IsA("BasePart") and kinds[p:GetAttribute("Animal")] then pts[#pts + 1] = p.Position end
+		end
+		return pts
+	end
+	local function clearance(pos, pts)
+		local best = math.huge
+		for _, q in ipairs(pts) do
+			local d = flat(q - pos).Magnitude
+			if d < best then best = d end
+		end
+		return best
+	end
+	F.clearance = function(pos) return clearance(pos, dangerPts()) end
 	-- a shore spot on that water near the anchor (it has to be streamed in): water points ring by ring, then dry
-	-- ground 8-28 studs off them from where a cast lands in the same water
+	-- ground 8-28 studs off them from where a cast lands in the same water; 70+ studs from aggressive mobs / their
+	-- spawns first, then 40+, then the farthest there is
 	local function scanShore(pool, around, rodId)
 		local _, hrp = char()
 		if not hrp then return nil end
@@ -6042,7 +6135,9 @@ end)()
 			task.wait()
 		end
 		table.sort(waters, function(x, y) return flat(x - hrp.Position).Magnitude < flat(y - hrp.Position).Magnitude end)
-		local tries = 0
+		-- dry ground next to the water, with its clearance from mobs
+		local pts = dangerPts()
+		local cands = {}
 		for _, wp in ipairs(waters) do
 			for _, dd in ipairs({8, 14, 20, 28}) do
 				for i = 0, 11 do
@@ -6053,18 +6148,37 @@ end)()
 					local okW, wHit = pcall(Wt.WaterRay, top, Vector3.new(0, -60, 0))
 					local dry = okG and g and not (okW and wHit and wHit.Y > g.Y - 0.5)
 					local bad = false
-					for _, b in ipairs(F.avoid or {}) do if dry and flat(b - g).Magnitude < 10 then bad = true end end
+					for _, b in ipairs(F.avoid or {}) do if dry and flat(b.p - g).Magnitude < b.r then bad = true end end
 					if dry and not bad and g.Y > wp.Y - 2 and g.Y < wp.Y + 25 then
-						tries += 1
-						local stand = g + Vector3.new(0, 3, 0)
-						local fake = {Position = stand, CFrame = CFrame.lookAt(stand, Vector3.new(wp.X, stand.Y, wp.Z))}
-						local dir = castDir(fake, stand + Vector3.new(0, 4.5, 0), rodId, pool)
-						if dir then return {stand.X, stand.Y, stand.Z, dir.X, dir.Z} end
-						if tries >= 120 then return nil end
-						if tries % 15 == 0 then task.wait() end
+						cands[#cands + 1] = {g = g, wp = wp, safe = clearance(g, pts)}
 					end
 				end
 			end
+		end
+		local tested, tries = {}, 0
+		for _, need in ipairs({SAFE, 40}) do
+			for idx, cd in ipairs(cands) do
+				if cd.safe >= need and not tested[idx] then
+					tested[idx] = true
+					tries += 1
+					local stand = cd.g + Vector3.new(0, 3, 0)
+					local fake = {Position = stand, CFrame = CFrame.lookAt(stand, Vector3.new(cd.wp.X, stand.Y, cd.wp.Z))}
+					local dir = castDir(fake, stand + Vector3.new(0, 4.5, 0), rodId, pool)
+					if dir then return {stand.X, stand.Y, stand.Z, dir.X, dir.Z}, cd.safe end
+					if tries >= 160 then break end
+					if tries % 15 == 0 then task.wait() end
+				end
+			end
+		end
+		-- nothing that far from mobs: the farthest spot that works
+		table.sort(cands, function(x, y) return x.safe > y.safe end)
+		for idx, cd in ipairs(cands) do
+			if idx > 40 then break end
+			local stand = cd.g + Vector3.new(0, 3, 0)
+			local fake = {Position = stand, CFrame = CFrame.lookAt(stand, Vector3.new(cd.wp.X, stand.Y, cd.wp.Z))}
+			local dir = castDir(fake, stand + Vector3.new(0, 4.5, 0), rodId, pool)
+			if dir then return {stand.X, stand.Y, stand.Z, dir.X, dir.Z}, cd.safe end
+			if idx % 10 == 0 then task.wait() end
 		end
 	end
 	-- no spot set in the tab: the quests pick the water (none needs one = the beach); water of that kind in reach
@@ -6076,7 +6190,9 @@ end)()
 		if not rid then F.status = "ไม่มีคันเบ็ดสำหรับ " .. (POOL_TH[pool] or pool) return nil end
 		if F.here and F.here.pool == pool and flat(Vector3.new(F.here[1], 0, F.here[3]) - hrp.Position).Magnitude < 6 then return F.here end
 		local dirHere = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0), rid, pool)
-		if dirHere then
+		local inAvoid = false
+		for _, b in ipairs(F.avoid or {}) do if flat(b.p - hrp.Position).Magnitude < b.r then inAvoid = true end end
+		if dirHere and not inAvoid and clearance(hrp.Position, dangerPts()) >= SAFE then
 			F.here = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dirHere.X, dirHere.Z, pool = pool}
 			return F.here
 		end
@@ -6084,11 +6200,12 @@ end)()
 		if type(sp) == "table" then return sp end
 		local an, d = nearestAnchor(pool, hrp.Position)
 		if not an then F.badPool[pool] = os.clock() + 600 return nil end
-		local found
+		local found, safe
 		if d > 150 then
 			if d < 400 and os.clock() - (F.scanAt or 0) > 20 then
 				F.scanAt = os.clock()
-				found = scanShore(pool, hrp.Position, rid)
+				found, safe = scanShore(pool, hrp.Position, rid)
+				if found and safe < SAFE then found = nil end   -- keep going: the anchor side may have a safer edge
 			end
 			if not found then
 				F.status = ("ไปตกที่ %s (ตามเควส)"):format(POOL_TH[pool] or pool)
@@ -6099,8 +6216,8 @@ end)()
 		else
 			F.status = "หาริมน้ำ " .. (POOL_TH[pool] or pool)
 			st.extStatus = "Auto Fishing: " .. F.status
-			found = scanShore(pool, Vector3.new(an.X, math.min(an.Y, hrp.Position.Y + 40), an.Z), rid)
-				or scanShore(pool, hrp.Position, rid)
+			found, safe = scanShore(pool, Vector3.new(an.X, math.min(an.Y, hrp.Position.Y + 40), an.Z), rid)
+			if not found then found, safe = scanShore(pool, hrp.Position, rid) end
 		end
 		if not found then
 			F.badPool[pool] = os.clock() + 600
@@ -6109,7 +6226,8 @@ end)()
 		end
 		e.fishPoolSpots[pool] = found
 		sv()
-		log(("Fishing: เจอริมน้ำ %s ที่ %.0f, %.0f → ตกตามเควส"):format(POOL_TH[pool] or pool, found[1], found[3]))
+		log(("Fishing: เจอริมน้ำ %s ที่ %.0f, %.0f (ห่างมอน %s stud) → ตกตามเควส"):format(POOL_TH[pool] or pool, found[1], found[3],
+			safe and safe < math.huge and ("%.0f"):format(safe) or "ไม่มีมอน"))
 		return found
 	end
 	local function step()
@@ -6125,6 +6243,7 @@ end)()
 		end
 		local c, hrp = char()
 		if bossBreak(hrp) then return end
+		if defendBreak(hrp) then return end
 		st.extBusy = "fish"
 		st.extStatus = "Auto Fishing: " .. F.status
 		if not hrp then F.status = "รอตัวละครเกิด" return end
@@ -6250,7 +6369,7 @@ end)()
 				if F.miss >= 3 then
 					F.miss = 0
 					F.avoid = F.avoid or {}
-					table.insert(F.avoid, spot)
+					table.insert(F.avoid, {p = spot, r = 10})
 					e.fishPoolSpots[F.pool] = nil
 					sv()
 					log("Fishing: เดินไปริมน้ำนี้ไม่ถึง → หาจุดใหม่")
