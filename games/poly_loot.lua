@@ -2808,7 +2808,10 @@ task.spawn(function()
 							end
 						end
 					end
-					if safe and hum.FloorMaterial ~= Enum.Material.Air then st.safeSpot = hrp.Position end
+					-- (never inside the farm circle: a lull between Pyrolisks there is not a safe place to come back to)
+					if safe and hum.FloorMaterial ~= Enum.Material.Air and not (anchor and flat(hrp.Position - anchor).Magnitude < e.anchorR + 60) then
+						st.safeSpot = hrp.Position
+					end
 				end
 				if hp >= e.resumeAt then
 					st.resting = nil
@@ -2838,10 +2841,16 @@ task.spawn(function()
 							-- inside the farm circle the "away from the nearest" step only zig-zagged between Pyrolisks
 							-- (4 always within 40 studs, death at 06:48): leave the spawn circle instead, anchorR + 120
 							-- (Pyrolisk leash 110) out from the farm spot on our side of it
+							-- Still chased once out there (a Pyrolisk followed us north to 1 %) -> keep going 60 further out,
+							-- never back in: the old fallback "safe spot" lay inside the farm and walked us back into the pack
 							local ap = anchor and flat(hrp.Position - anchor)
-							if ap and ap.Magnitude < e.anchorR + 80 and not (rg and rg.out and os.clock() - rg.at > 2) then
+							if ap and ap.Magnitude < e.anchorR + 400 then
 								local dir = ap.Magnitude > 1 and ap.Unit or (away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0))
-								goal = anchor + dir * (e.anchorR + 120)
+								if rg and rg.out and os.clock() - rg.at > 2 then
+									rg.turn = (rg.turn or 0) + 1
+									dir = CFrame.Angles(0, math.rad(50 * rg.turn * (rg.turn % 2 == 0 and 1 or -1)), 0):VectorToWorldSpace(dir)
+								end
+								goal = anchor + dir * math.max(ap.Magnitude + 60, e.anchorR + 120)
 								goal = Vector3.new(goal.X, hrp.Position.Y, goal.Z)
 							elseif sp and (sp - hrp.Position).Magnitude > 8 and (sp - hrp.Position).Magnitude < 600 and not (rg and rg.p == sp) then
 								goal = sp
@@ -2853,7 +2862,7 @@ task.spawn(function()
 								end
 								goal = hrp.Position + dir * 60
 							end
-							local out = ap and ap.Magnitude < e.anchorR + 80 and not (rg and rg.out and os.clock() - rg.at > 2)
+							local out = ap and ap.Magnitude < e.anchorR + 400
 							st.restGoal = goal and {p = goal, untilT = os.clock() + (out and 20 or 6), from = hrp.Position, at = os.clock(), turn = rg and rg.turn, out = out} or nil
 							rg = st.restGoal
 						end
