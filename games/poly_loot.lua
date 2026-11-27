@@ -2477,6 +2477,28 @@ local function smartEvade(hrp, hum)
 		return Vector3.new(p.X, hrp.Position.Y, p.Z), worst, total
 	end
 end
+do
+	st.dangerAt = function(pos)
+		local now = os.clock()
+		for m, rec in pairs(mobState) do
+			if rec.attackAt and m.Parent then
+				local name = m:GetAttribute("Animal") or "?"
+				if now - rec.attackAt < windupOf(name) + 0.15 then
+					local safeR = math.max(e.smartRange, hitRadius(name) + 4)
+					if flat(mobPos(m) - pos).Magnitude < safeR then return true end
+				end
+			end
+		end
+		for _, p in ipairs(CS:GetTagged("AttackBoxTelegraph")) do
+			if p:IsA("BasePart") and p.Parent then
+				local lp = p.CFrame:PointToObjectSpace(pos)
+				if math.abs(lp.X) < p.Size.X / 2 + e.dodgeMargin and math.abs(lp.Z) < p.Size.Z / 2 + e.dodgeMargin
+					and math.abs(lp.Y) < p.Size.Y / 2 + 8 then return true end
+			end
+		end
+		return false
+	end
+end
 local function learnText()
 	local rows = {}
 	for name, l in pairs(learn) do
@@ -2798,7 +2820,7 @@ task.spawn(function()
 					local ws = st.towerWaitSpot and st.towerWaitSpot(hrp)
 					local vdk = st.tw.kind == "vd"
 					if ws and flat(ws - hrp.Position).Magnitude > 8 then
-						if not (vdk and st.travelHop and st.travelHop(hrp, ws)) then moveTo(ws) end
+						moveTo(ws)   -- walked: teleporting between rooms got us pulled back by the server
 						st.status = vdk and ("Dungeon: ไปห้องถัดไป (ห้อง %s) · %.0f stud"):format(tostring(plr:GetAttribute("DungeonRoom")), flat(ws - hrp.Position).Magnitude)
 							or "Tower: ไปรอตรงจุดเกิดมอน (wave ถัดไป)"
 					else
@@ -2822,7 +2844,7 @@ task.spawn(function()
 			end
 			local tp = mobPos(t)
 			local dist = flat(tp - hrp.Position).Magnitude
-			-- tower: short hop next to the target instead of walking (see st.towerHop)
+			-- tower / dungeon: teleport next to the target (lock) instead of running up to it (st.towerHop)
 			if st.tw and st.towerHop and st.towerHop(c, hrp, t, tp, dist) then return end
 			-- a mob on a ledge 20 studs up but 9 across is NOT in reach: we stood under the cliff swinging at rock
 			if dist < 30 then st.fightUntil = os.clock() + 2 end
@@ -3011,8 +3033,10 @@ task.spawn(function()
 				st.evades = (st.evades or 0) + 1
 				st.evadeUntil = os.clock() + 0.3
 				endCombo()
-				if not (st.tw and e.tpDodge and st.tpTo and st.tpTo(ev, tp)) then moveTo(ev, true) end
-				st.status = ("ถอยหลบ %s (ตีแรง ~%d)"):format(tostring(evName), evDmg or 0)
+				local how = st.tw and e.tpDodge and st.instDodge and st.instDodge(hrp, t, tp, ev)
+				if not how then moveTo(ev, true) end
+				st.status = ("%s %s (ตีแรง ~%d)"):format(how == "switch" and "วาร์ปหลบไปล็อกตัวอื่น ·" or how == "side" and "วาร์ปหลบไปอีกมุม ·"
+					or how and "วาร์ปหลบ" or "ถอยหลบ", tostring(evName), evDmg or 0)
 				return
 			end
 			local dp = e.dodge and not burst and dodgePoint(hrp, hum)
@@ -3023,7 +3047,7 @@ task.spawn(function()
 			end
 			if dp then
 				st.dodges += 1
-				if not (st.tw and e.tpDodge and st.tpTo and st.tpTo(dp, tp)) then moveTo(dp, true) end
+				if not (st.tw and e.tpDodge and st.instDodge and st.instDodge(hrp, t, tp, dp)) then moveTo(dp, true) end
 				lookAt = tp
 				st.status = "หลบท่า"
 			elseif dist > math.max(e.standDist, e.orbitRadius) + 8 then
@@ -3087,7 +3111,9 @@ task.spawn(function()
 				-- the swing's hitbox is in front of us -> stand ~4.5 studs off, face it, no orbit
 				local tier = t:GetAttribute("Tier")
 				local fd = flat(hrp.Position - tp).Magnitude
-				if tier == "Tiny" or tier == "Small" then
+				if st.tw then
+					if fd > e.reach - 1 then moveTo(Vector3.new(tp.X, hrp.Position.Y, tp.Z), true) else stopMove() end
+				elseif tier == "Tiny" or tier == "Small" then
 					if fd < 3.5 then
 						local away = flat(hrp.Position - tp)
 						away = away.Magnitude > 0.1 and away.Unit or -hrp.CFrame.LookVector
@@ -4518,6 +4544,7 @@ end)()
 	if e.dungeonAuto == nil then e.dungeonAuto = false end
 	if e.dungeonAgain == nil then e.dungeonAgain = true end
 	if e.tpDodge == nil then e.tpDodge = true end
+	if e.dungeonGreed == nil then e.dungeonGreed = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
 	local function towerNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
@@ -4736,19 +4763,73 @@ end)()
 				return false
 			end
 		end
-		if dist < 14 or dist > 45 or math.abs(tp.Y - hrp.Position.Y) > 6 or now - (T.hopAt or 0) < (T.hopGap or 3) then return false end
+		if dist < e.reach - 0.5 or dist > 55 or math.abs(tp.Y - hrp.Position.Y) > 6 then return false end
 		local dir = flat(hrp.Position - tp)
 		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
 		local dest = Vector3.new(tp.X, hrp.Position.Y, tp.Z) + dir * 4
+		if st.dangerAt and st.dangerAt(dest) then return false end
+		return st.hopTo(dest, tp, false)
+	end
+	-- one teleport, paid from the hop budget (dodges may overdraw a little). Floor must be under the spot.
+	st.hopTo = function(dest, look, urgent)
+		local c, hrp = char()
+		if not hrp then return false end
+		local now = os.clock()
+		T.budget = math.min(50, (T.budget or 50) + (now - (T.budAt or now)) * 15)
+		T.budAt = now
+		local d = flat(dest - hrp.Position).Magnitude
+		if d > 60 or now - (T.hopAt or 0) < (urgent and 0.35 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
 		hopRp.FilterDescendantsInstances = {c, AnimalLive}
-		-- floor under the landing spot (never hop off the arena edge)
-		if not workspace:Raycast(dest + Vector3.new(0, 4, 0), Vector3.new(0, -14, 0), hopRp) then return false end
+		local hit = workspace:Raycast(Vector3.new(dest.X, hrp.Position.Y + 4, dest.Z), Vector3.new(0, -16, 0), hopRp)
+		if not hit then return false end
+		local land = Vector3.new(dest.X, hit.Position.Y + 3, dest.Z)
+		T.budget -= d
 		T.hopAt = now
 		T.hopCheck = {at = now + 1, rb = c:GetAttribute("_ServerMovementRebaseline")}
 		T.hops = (T.hops or 0) + 1
 		stopMove()
-		c:PivotTo(CFrame.lookAt(dest, Vector3.new(tp.X, dest.Y, tp.Z)))
+		local lk = look and Vector3.new(look.X, land.Y, look.Z) or (land + hrp.CFrame.LookVector)
+		if flat(lk - land).Magnitude < 0.5 then lk = land + hrp.CFrame.LookVector end
+		c:PivotTo(CFrame.lookAt(land, lk))
 		return true
+	end
+	-- teleport dodge: 1) lock another of our mobs whose side is safe, 2) another side of this mob (behind first),
+	-- 3) the plain escape point. Returns "switch" / "side" / "out" or false.
+	st.instDodge = function(hrp, t, tp, fallback)
+		local danger = st.dangerAt or function() return false end
+		local best, bd, bspot
+		for _, f in ipairs({"Aggressors", "Passives"}) do
+			local folder = AnimalLive:FindFirstChild(f)
+			for _, m in ipairs(folder and folder:GetChildren() or {}) do
+				if m ~= t and wanted(m) then
+					local mp = mobPos(m)
+					local d = flat(mp - hrp.Position).Magnitude
+					if d < 45 and math.abs(mp.Y - hrp.Position.Y) < 8 then
+						local dir = flat(hrp.Position - mp)
+						dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+						local spot = Vector3.new(mp.X, hrp.Position.Y, mp.Z) + dir * 4
+						if not danger(spot) and (not bd or d < bd) then best, bd, bspot = m, d, spot end
+					end
+				end
+			end
+		end
+		if best and st.hopTo(bspot, mobPos(best), true) then
+			st.target = best
+			return "switch"
+		end
+		if t and tp then
+			local cur = flat(hrp.Position - tp)
+			local base = cur.Magnitude > 0.1 and math.atan2(cur.Z, cur.X) or 0
+			for _, r in ipairs({4.5, 8}) do
+				for _, off in ipairs({180, 135, -135, 90, -90}) do
+					local a = base + math.rad(off)
+					local spot = Vector3.new(tp.X + math.cos(a) * r, hrp.Position.Y, tp.Z + math.sin(a) * r)
+					if not danger(spot) and st.hopTo(spot, tp, true) then return "side" end
+				end
+			end
+		end
+		if fallback and st.hopTo(fallback, tp, true) then return "out" end
+		return false
 	end
 	-- instant teleport to a spot (dodges inside the tower / dungeon): needs floor under it, max 60 studs. Counts as a
 	-- hop for the spacing rule (hops < 3 s apart got us rebaselined = pulled back into the attack)
@@ -4785,7 +4866,11 @@ end)()
 			for _, d in ipairs(mk and mk:GetChildren() or {}) do
 				if d:IsA("BasePart") and d.Name:match("^Spawn") then sum += d.Position; n += 1 end
 			end
-			if n > 0 then p = sum / n end
+			if n > 0 then p = sum / n return end
+			local fl = r:FindFirstChild("Floor")
+			if fl then p = fl:GetPivot().Position return end
+			local b = mk and (mk:FindFirstChild("Boss") or mk:FindFirstChild("Arrival1"))
+			if b then p = b.Position end
 		end)
 		return p
 	end
@@ -4793,6 +4878,18 @@ end)()
 		local room = tonumber(plr:GetAttribute("DungeonRoom")) or 1
 		local state = plr:GetAttribute("DungeonState")
 		if state == "fight" and T.waveSpot and T.waveRoom == room then return T.waveSpot end
+		-- a Greed stand woke up after the clear: take it before moving on
+		local g = T.greed
+		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 then
+			if flat(g.at - hrp.Position).Magnitude <= 9 then
+				if os.clock() - g.tryAt > 2.5 then
+					g.tryAt, g.tries = os.clock(), g.tries + 1
+					pcall(function() RS.VolcanoDungeon_Engine.Remotes.Request:FireServer("greed") end)
+				end
+				return nil
+			end
+			return g.at
+		end
 		local want = state == "fight" and room or room + 1
 		local chain = workspace:FindFirstChild("VolcanoDungeon_Chain")
 		local best, bd
@@ -4818,32 +4915,18 @@ end)()
 			elseif kind == "cleared" or kind == "room" then
 				T.waveSpot = nil
 			end
+			if (kind == "cleared" or kind == "stand") and d.stand ~= false and not d.taken and (d.at or d.model) then
+				local at = typeof(d.at) == "Vector3" and d.at or (typeof(d.at) == "CFrame" and d.at.Position)
+				if not at and typeof(d.model) == "Instance" then pcall(function() at = d.model:GetPivot().Position end) end
+				if at and (kind == "stand" or d.stand) then T.greed = {at = at, room = tonumber(d.room), tries = 0, tryAt = 0} end
+			elseif kind == "stand" and d.taken then
+				T.greed = nil
+			elseif kind == "greed" then
+				T.greed = nil
+				log(("Dungeon: เก็บความโลภแล้ว (Greed %s)"):format(tostring(plr:GetAttribute("VDGreed"))))
+			end
 		end)
 	end)
-	-- travel hop inside the dungeon: up to 40 studs straight toward the goal when nothing collidable is in the way and
-	-- there is floor under the landing spot not far below (never into the chasm under the stairs); 3 s apart
-	local travRp = RaycastParams.new()
-	travRp.FilterType = Enum.RaycastFilterType.Exclude
-	travRp.RespectCanCollide = true
-	st.travelHop = function(hrp, goal)
-		if not (e.towerTp and st.tw) or os.clock() - (T.hopAt or 0) < (T.hopGap or 3) then return false end
-		local c = plr.Character
-		local fl = flat(goal - hrp.Position)
-		if fl.Magnitude < 25 then return false end
-		local step = math.min(40, fl.Magnitude - 6)
-		local from = hrp.Position + Vector3.new(0, 1.5, 0)
-		local dest = hrp.Position + fl.Unit * step
-		travRp.FilterDescendantsInstances = {c, AnimalLive}
-		if workspace:Raycast(from, (dest + Vector3.new(0, 1.5, 0)) - from, travRp) then return false end
-		local hit = workspace:Raycast(dest + Vector3.new(0, 6, 0), Vector3.new(0, -70, 0), travRp)
-		if not hit or hit.Position.Y < math.min(goal.Y, hrp.Position.Y) - 12 then return false end
-		T.hopAt = os.clock()
-		T.hops = (T.hops or 0) + 1
-		stopMove()
-		local land = hit.Position + Vector3.new(0, 3, 0)   -- root part stands ~3 studs above the floor
-		c:PivotTo(CFrame.lookAt(land, land + fl.Unit))
-		return true
-	end
 	st.dungeonLobby = function()
 		if not e.dungeonAuto then st.dungeonTrip = nil return false end
 		if srvNow() then return false end
@@ -4945,6 +5028,7 @@ end)()
 	DL:Header({Text = "Dragon's Hoard (ประตู Volcano · เลเวล 300+)"})
 	DL:Toggle({Name = "Auto Dungeon (ไปยืนแท่นประตูเอง · ตีทุกห้อง + บอส)", Default = e.dungeonAuto, Callback = function(v) e.dungeonAuto = v; sv() end}, "PLDungeonAuto")
 	DL:Toggle({Name = "└ จบรอบแล้วลงรอบใหม่ต่อเลย (ปิด = กลับโลกปกติ)", Default = e.dungeonAgain, Callback = function(v) e.dungeonAgain = v; sv() end}, "PLDungeonAgain")
+	DL:Toggle({Name = "└ เก็บความโลภ (Greed) ที่แท่นหลังเคลียร์ห้อง (+25% ดวง · มอนแรงขึ้น)", Default = e.dungeonGreed, Callback = function(v) e.dungeonGreed = v; sv() end}, "PLDungeonGreed")
 	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
 	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
 	local DR = DgTab:Section({Side = "Right"})
