@@ -2478,8 +2478,101 @@ local function smartEvade(hrp, hum)
 	end
 end
 do
+	local function v3(v) return typeof(v) == "Vector3" and v or nil end
+	local function segDist(p, a, b)
+		local ab = flat(b - a)
+		local ap = flat(p - a)
+		local l2 = ab:Dot(ab)
+		local t = l2 > 0.01 and math.clamp(ap:Dot(ab) / l2, 0, 1) or 0
+		return (ap - ab * t).Magnitude
+	end
+	-- one active skill marker -> {kind, test(pos) -> inside?, away(pos) -> escape point}
+	local HITS = {EFoxSnap = true, BPhxRake = true, MSerpSnap = true, EFoxImpact = true, EFoxListen = true, BPhxSnatch = true,
+		MSerpSide = true, MSerpFuse = true, Lane = true, EFoxTrick = true, BPhxStrafe = true}
+	local function shapeOf(v)
+		if not (v:IsA("BasePart") and v.Parent) then return nil end
+		if not HITS[v:GetAttribute("CobraVFXKind") or ""] or (v:GetAttribute("Ended") or "") ~= "" then return nil end
+		local now = workspace:GetServerTimeNow()
+		local s0 = tonumber(v:GetAttribute("StartedAt")) or now
+		local hit = tonumber(v:GetAttribute("HitAt")) or tonumber(v:GetAttribute("SlamAt")) or tonumber(v:GetAttribute("FlingAt"))
+			or (tonumber(v:GetAttribute("GoAt")) and tonumber(v:GetAttribute("GoAt")) + (tonumber(v:GetAttribute("Duration")) or 0.5))
+			or s0 + (tonumber(v:GetAttribute("Windup")) or tonumber(v:GetAttribute("Hit")) or tonumber(v:GetAttribute("Land"))
+				or tonumber(v:GetAttribute("Off")) or 1.0)
+		if now > hit + 0.3 or now < hit - 0.7 then return nil end   -- only while it is about to land
+		local o = v.Position
+		local W = tonumber(v:GetAttribute("Width"))
+		local R = tonumber(v:GetAttribute("Radius"))
+		local fac = v3(v:GetAttribute("Facing"))
+		local a, b = v3(v:GetAttribute("Start")) or v3(v:GetAttribute("From")), v3(v:GetAttribute("End")) or v3(v:GetAttribute("To"))
+		local path = v:GetAttribute("Path")
+		if v.Size.X > 1 or v.Size.Z > 1 then   -- a real telegraph part (Lane)
+			local cf, hs = v.CFrame, v.Size / 2
+			return function(p)
+				local lp = cf:PointToObjectSpace(p)
+				return math.abs(lp.X) < hs.X + 2.5 and math.abs(lp.Z) < hs.Z + 2.5
+			end
+		elseif R then
+			local c = v3(v:GetAttribute("Center")) or o
+			return function(p) return flat(p - c).Magnitude < R + 3 end
+		elseif W and fac and tonumber(v:GetAttribute("Length")) then
+			local L = tonumber(v:GetAttribute("Length"))
+			local f = flat(fac)
+			f = f.Magnitude > 0.01 and f.Unit or Vector3.new(0, 0, -1)
+			return function(p)
+				local rel = flat(p - o)
+				local along = rel:Dot(f)
+				return along > -3 and along < L + 3 and (rel - f * along).Magnitude < W / 2 + 2.5
+			end
+		elseif a and b then
+			local hw = (W or 8) / 2 + 2.5
+			return function(p) return segDist(p, a, b) < hw end
+		elseif type(path) == "string" then
+			local pts = {}
+			local nums = {}
+			for n in path:gmatch("[-%d%.]+") do nums[#nums + 1] = tonumber(n) end
+			for i = 1, #nums - 2, 3 do pts[#pts + 1] = Vector3.new(nums[i], nums[i + 1], nums[i + 2]) end
+			local hw = (W or 8) / 2 + 2.5
+			return function(p)
+				for i = 1, #pts - 1 do if segDist(p, pts[i], pts[i + 1]) < hw then return true end end
+				return #pts == 1 and flat(p - pts[1]).Magnitude < hw
+			end
+		elseif v3(v:GetAttribute("Center")) then
+			local c = v:GetAttribute("Center")
+			return function(p) return flat(p - c).Magnitude < 11 end
+		end
+		return nil
+	end
+	local cache = {at = 0, list = {}}
+	st.skillShapes = function()
+		if os.clock() - cache.at < 0.05 then return cache.list end
+		cache.at = os.clock()
+		local list = {}
+		for _, v in ipairs(CS:GetTagged("CobraAttackVisual")) do
+			local ok, f = pcall(shapeOf, v)
+			if ok and f then list[#list + 1] = f end
+		end
+		cache.list = list
+		return list
+	end
+	st.skillDanger = function(pos)
+		for _, f in ipairs(st.skillShapes()) do if f(pos) then return true end end
+		return false
+	end
+	-- inside a skill area: the nearest spot (rings of 8-40 studs around us) that no active skill covers
+	st.skillEscape = function(hrp)
+		if not st.skillDanger(hrp.Position) then return nil end
+		for _, r in ipairs({8, 14, 22, 32, 42}) do
+			for i = 0, 11 do
+				local a = i * math.pi / 6
+				local p = hrp.Position + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+				if not st.dangerAt(p) then return p end
+			end
+		end
+		return nil
+	end
 	st.dangerAt = function(pos)
 		if st.dragonDanger and st.dragonDanger(pos) then return true end
+		if st.skillDanger(pos) then return true end
 		local now = os.clock()
 		for m, rec in pairs(mobState) do
 			if rec.attackAt and m.Parent then
@@ -2851,7 +2944,7 @@ task.spawn(function()
 			-- a mob on a ledge 20 studs up but 9 across is NOT in reach: we stood under the cliff swinging at rock
 			if dist < 30 then st.fightUntil = os.clock() + 2 end
 			local dy = math.abs(tp.Y - hrp.Position.Y)
-			if dy > 8 then dist = math.max(dist, math.max(e.standDist, e.orbitRadius) + 9 + dy) end
+			if dy > (st.tw and 14 or 8) then dist = math.max(dist, math.max(e.standDist, e.orbitRadius) + 9 + dy) end
 			-- low HP: never walk into a NEW fight. Burst mode doesn't retreat, so at 8 % we walked into the next Pyrolisk
 			-- and at 5 % into TripleCobra (2 deaths in 3 min). Regen is ~1 %/s out of combat -> rest out of aggro range
 			-- until resumeAt. A mob we're already hitting (hurt + in reach) gets finished.
@@ -3048,6 +3141,18 @@ task.spawn(function()
 						st.status = "รอท่าบอสลงก่อนค่อยเข้าไปตี"
 						return
 					end
+				end
+			end
+			if st.tw and e.smart and st.skillEscape then
+				local sp = st.skillEscape(hrp)
+				if sp then
+					endCombo()
+					local how = e.tpDodge and st.instDodge and st.instDodge(hrp, t, tp, sp)
+					if not how then moveTo(sp, true) end
+					st.evades = (st.evades or 0) + 1
+					st.status = ("หลบสกิลมอน · %s"):format(how == "switch" and "วาร์ปไปล็อกตัวอื่น" or how == "side" and "วาร์ปไปอีกมุม"
+						or how and "วาร์ปออก" or "วิ่งออก")
+					return
 				end
 			end
 			-- smart evade (heavy hitter winding up) > telegraph dodge > drops > fight
@@ -4569,7 +4674,7 @@ end)()
 	if e.dungeonAgain == nil then e.dungeonAgain = true end
 	if e.tpDodge == nil then e.tpDodge = true end
 	if e.dungeonGreed == nil then e.dungeonGreed = true end
-	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 2 end
+	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 1 end
 	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
@@ -4789,7 +4894,7 @@ end)()
 				return false
 			end
 		end
-		if dist < e.reach - 0.5 or dist > 55 or math.abs(tp.Y - hrp.Position.Y) > 6 then return false end
+		if dist < e.reach - 0.5 or dist > 62 or math.abs(tp.Y - hrp.Position.Y) > 14 then return false end
 		local dir = flat(hrp.Position - tp)
 		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
 		local dest = Vector3.new(tp.X, hrp.Position.Y, tp.Z) + dir * 4
@@ -4810,10 +4915,10 @@ end)()
 		local c, hrp = char()
 		if not hrp then return false end
 		local now = os.clock()
-		T.budget = math.min(50, (T.budget or 50) + (now - (T.budAt or now)) * 15)
+		T.budget = math.min(T.budMax or 60, (T.budget or 60) + (now - (T.budAt or now)) * (T.budRate or 16))
 		T.budAt = now
 		local d = flat(dest - hrp.Position).Magnitude
-		if d > 60 or now - (T.hopAt or 0) < (urgent and 0.35 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
+		if d > 62 or now - (T.hopAt or 0) < (urgent and 0.35 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
 		hopRp.FilterDescendantsInstances = {c, AnimalLive}
 		local hit = workspace:Raycast(Vector3.new(dest.X, hrp.Position.Y + 4, dest.Z), Vector3.new(0, -16, 0), hopRp)
 		if not hit then return false end
