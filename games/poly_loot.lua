@@ -2808,6 +2808,8 @@ task.spawn(function()
 			end
 			local tp = mobPos(t)
 			local dist = flat(tp - hrp.Position).Magnitude
+			-- tower: short hop next to the target instead of walking (see st.towerHop)
+			if st.tw and st.towerHop and st.towerHop(c, hrp, t, tp, dist) then return end
 			-- a mob on a ledge 20 studs up but 9 across is NOT in reach: we stood under the cliff swinging at rock
 			if dist < 30 then st.fightUntil = os.clock() + 2 end
 			local dy = math.abs(tp.Y - hrp.Position.Y)
@@ -4498,6 +4500,7 @@ end)()
 	if type(e.towerTries) ~= "number" then e.towerTries = 3 end   -- losses in a row on one floor before going home
 	if type(e.towerRest) ~= "number" then e.towerRest = 30 end    -- minutes before trying that floor again
 	if e.towerClaim == nil then e.towerClaim = true end
+	if e.towerTp == nil then e.towerTp = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
 	local function srvNow() return plr:GetAttribute("TowerRun") ~= nil or plr:GetAttribute("TowerState") ~= nil end
@@ -4670,6 +4673,39 @@ end)()
 		end
 		return T.spot
 	end
+	-- Short hop to the target (PivotTo, 14-45 studs, only inside the tower). Tested floor 51: six hops of 18-39 studs
+	-- ~3.5 s apart, no server snap-back (_ServerMovementRebaseline unchanged), every mob died 2.5 s later = hits land.
+	-- One every 1.2 s got us rebaselined (pulled back + ~3 s distrust) on floor 56 -> T.hopGap (3 s). If the server
+	-- rebaselines us right after a hop anyway, the rest of that floor is walked.
+	local hopRp = RaycastParams.new()
+	hopRp.FilterType = Enum.RaycastFilterType.Exclude
+	st.towerHop = function(c, hrp, t, tp, dist)
+		if not (e.towerTp and st.tw) or T.hopOff == st.tw.run then return false end
+		local now = os.clock()
+		local hc = T.hopCheck
+		if hc and now > hc.at then
+			T.hopCheck = nil
+			if c:GetAttribute("_ServerMovementRebaseline") ~= hc.rb then
+				T.hopOff = st.tw.run
+				T.snaps = (T.snaps or 0) + 1
+				log("Tower: เซิร์ฟดึงตัวกลับหลังวาร์ป → ชั้นนี้เดินแทน")
+				return false
+			end
+		end
+		if dist < 14 or dist > 45 or math.abs(tp.Y - hrp.Position.Y) > 6 or now - (T.hopAt or 0) < (T.hopGap or 3) then return false end
+		local dir = flat(hrp.Position - tp)
+		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+		local dest = Vector3.new(tp.X, hrp.Position.Y, tp.Z) + dir * 4
+		hopRp.FilterDescendantsInstances = {c, AnimalLive}
+		-- floor under the landing spot (never hop off the arena edge)
+		if not workspace:Raycast(dest + Vector3.new(0, 4, 0), Vector3.new(0, -14, 0), hopRp) then return false end
+		T.hopAt = now
+		T.hopCheck = {at = now + 1, rb = c:GetAttribute("_ServerMovementRebaseline")}
+		T.hops = (T.hops or 0) + 1
+		stopMove()
+		c:PivotTo(CFrame.lookAt(dest, Vector3.new(tp.X, dest.Y, tp.Z)))
+		return true
+	end
 	-- main-loop hook. true = the tower has the character this tick
 	st.towerLobby = function()
 		if not e.towerAuto then st.towerTrip = nil return false end
@@ -4738,6 +4774,7 @@ end)()
 		Callback = function(v) e.towerTries = v; sv() end}, "PLTowerTries")
 	TL:Slider({Name = "└ กลับเมืองแล้วพักกี่นาทีก่อนลองใหม่", Default = e.towerRest, Minimum = 5, Maximum = 240, DisplayMethod = "Round", Precision = 0,
 		Callback = function(v) e.towerRest = v; sv() end}, "PLTowerRest")
+	TL:Toggle({Name = "└ วาร์ปสั้นเข้าหามอน (≤ 45 stud · เฉพาะในหอคอย)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLTowerTp")
 	TL:Toggle({Name = "└ รับรางวัล Tower Pass (ช่องฟรี) อัตโนมัติ", Default = e.towerClaim, Callback = function(v) e.towerClaim = v; sv() end}, "PLTowerClaim")
 	TL:Label({Text = "เปิดแล้ว Tower มาก่อน Farm/Boss: ระหว่างพัก (แพ้ติด) บอทกลับไปฟาร์ม/ตีบอสตามที่ตั้งไว้\nในหอคอยใช้ระบบตี/หลบ/กินยาเดียวกับ Farm แต่ไม่ถอยพักเลือด (ชั้นละ 180 วิ)\nชั้นที่ผ่านแล้วเล่นซ้ำไม่ได้ของ → เริ่มที่ชั้นสูงสุด + 1 เสมอ"})
 	local TRs = TwTab:Section({Side = "Right"})
@@ -4759,6 +4796,7 @@ end)()
 				if s then
 					lines[#lines + 1] = ("ชั้นสูงสุด %d (ซีซั่นนี้) · เคยถึง %d · %s"):format(tonumber(s.best) or 0, tonumber(s.bestEver) or 0, tostring(s.seasonName or ""))
 				end
+				if (T.hops or 0) > 0 then lines[#lines + 1] = ("วาร์ปเข้าหามอนไป %d ครั้ง%s"):format(T.hops, st.tw and T.hopOff == st.tw.run and " (ชั้นนี้ปิด: โดนดึงกลับ)" or "") end
 				local f = e.towerFail
 				if type(f) == "table" then lines[#lines + 1] = ("แพ้ชั้น %d ติดกัน %d/%d ครั้ง"):format(f.floor or 0, f.n or 0, e.towerTries) end
 				twLbl:UpdateName(table.concat(lines, "\n"))
