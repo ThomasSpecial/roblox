@@ -6005,6 +6005,27 @@ end)()
 		return pos
 	end
 	F.offTrader = offTrader
+	local RewardScr
+	pcall(function() RewardScr = require(game:GetService("ReplicatedStorage").Reward_Engine.Modules.RewardScreen) end)
+	local function closeRewards()
+		local ok, active = pcall(function() return RewardScr and RewardScr.IsActive() end)
+		if not (ok and active) then return false end
+		if os.clock() - (F.rwAt or 0) >= 0.6 then
+			F.rwAt = os.clock()
+			local scr = plr.PlayerGui:FindFirstChild("RewardScreen")
+			local hit = scr and scr:FindFirstChild("Hit")
+			local tap = {UserInputType = Enum.UserInputType.Touch, Position = Vector3.new(8, 8, 0), KeyCode = Enum.KeyCode.Unknown}
+			if hit and getconnections then
+				for _, cn in ipairs(getconnections(hit.InputBegan)) do
+					if cn.Function then pcall(cn.Function, tap) else pcall(function() cn:Fire(tap) end) end
+				end
+			end
+		end
+		F.status = "ปิดหน้ารางวัล (NEW LOOT)"
+		st.extStatus = "Auto Fishing: " .. F.status
+		return true
+	end
+	F.closeRewards = closeRewards
 	local FC
 	pcall(function() FC = require(FE.FishCatalog) end)
 	local POOL_TH = {Grasslands = "Grasslands", Cave = "ถ้ำ (Cave)", Jungle = "ป่า (Jungle)", DarkForest = "Dark Forest", Beach = "ชายหาด (Beach)",
@@ -6246,6 +6267,7 @@ end)()
 			return
 		end
 		local c, hrp = char()
+		if closeRewards() then return end
 		if bossBreak(hrp) then return end
 		if defendBreak(hrp) then return end
 		st.extBusy = "fish"
