@@ -5133,6 +5133,10 @@ end)()
 		if state == "fight" and T.waveSpot and T.waveRoom == room then return T.waveSpot end
 		-- a Greed stand woke up after the clear: take it before moving on
 		local g = T.greed
+		if g and (g.room ~= room or os.clock() - (g.since or 0) > 25) then
+			if g.room == room then log("Dungeon: ไปแท่นความโลภไม่ถึงใน 25 วิ → ข้าม") end
+			T.greed, g = nil, nil
+		end
 		local safe = not e.dungeonGreedSafe or ((T.lastRoomMin or 100) >= 50 and (st.deaths or 0) == (T.runDeaths0 or 0))
 		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 and (tonumber(plr:GetAttribute("VDGreed")) or 0) < e.dungeonGreedMax and safe then
 			if flat(g.at - hrp.Position).Magnitude <= 9 then
@@ -5173,7 +5177,9 @@ end)()
 			if (kind == "cleared" or kind == "stand") and d.stand ~= false and not d.taken and (d.at or d.model) then
 				local at = typeof(d.at) == "Vector3" and d.at or (typeof(d.at) == "CFrame" and d.at.Position)
 				if not at and typeof(d.model) == "Instance" then pcall(function() at = d.model:GetPivot().Position end) end
-				if at and (kind == "stand" or d.stand) then T.greed = {at = at, room = tonumber(d.room), tries = 0, tryAt = 0} end
+				if at and (kind == "stand" or d.stand) then
+					T.greed = {at = at, room = tonumber(d.room) or tonumber(plr:GetAttribute("DungeonRoom")), tries = 0, tryAt = 0, since = os.clock()}
+				end
 			elseif kind == "stand" and d.taken then
 				T.greed = nil
 			elseif kind == "greed" then
