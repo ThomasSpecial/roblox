@@ -5750,10 +5750,28 @@ end)()
 			pcall(function() FR.Request:FireServer("Bait", e.fishBait) end)
 		end
 		if e.fishCharm and fd and (tonumber(fd.LuckUntil) or 0) < workspace:GetServerTimeNow() and owned("LuckyCharm") > 0
-			and os.clock() - (F.charmAt or 0) > 15 then
+			and os.clock() - (F.charmAt or 0) > 30 then
 			F.charmAt = os.clock()
-			pcall(function() FR.Request:FireServer("Charm") end)
-			log("Fishing: ใช้ Lucky Charm")
+			local cs
+			for sr, it in pairs((invData() or {}).Inventory and invData().Inventory.Materials or {}) do if it.Id == "LuckyCharm" then cs = sr end end
+			if cs then
+				F.status = "ใช้ Lucky Charm"
+				pcall(function() InvRemotes.EquipRequest:FireServer(cs) end)
+				local t0 = os.clock()
+				while os.clock() - t0 < 2 do
+					local held = c:FindFirstChildOfClass("Tool")
+					if held and not held:GetAttribute("FishingRod") then break end
+					task.wait(0.1)
+				end
+				pcall(function() FR.Request:FireServer("Charm") end)
+				task.wait(0.8)
+				pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
+				task.wait(0.8)
+				local fd2 = fishData()
+				log((fd2 and (tonumber(fd2.LuckUntil) or 0) > workspace:GetServerTimeNow()) and "Fishing: ใช้ Lucky Charm (ดวง x1.5 · 10 นาที)"
+					or "Fishing: ใช้ Lucky Charm ไม่ผ่าน")
+				return
+			end
 		end
 		-- cast
 		local tip = tool:FindFirstChild("RodTip", true)
@@ -5779,9 +5797,22 @@ end)()
 	local FiTab = TG:Tab({Name = "Fishing", Image = "rbxassetid://10723346959"})
 	local FL = FiTab:Section({Side = "Left"})
 	FL:Header({Text = "ตกปลาอัตโนมัติ"})
-	FL:Toggle({Name = "Auto Fishing (โยน · เกี่ยว · ดึงแบบ Perfect)", Default = e.fishAuto, Callback = function(v)
+	FL:Toggle({Name = "Auto Fishing (โยน · เกี่ยว · ดึงแบบ Perfect · ตกตรงที่ยืนถ้ามีน้ำ)", Default = e.fishAuto, Callback = function(v)
 		e.fishAuto = v
 		if not v then F.state = "idle" end
+		if v then
+			local _, hrp = char()
+			local _, rodId = rodSerial()
+			if hrp and rodId then
+				local dir = castDir(hrp, hrp.Position + Vector3.new(0, 4.5, 0) + flat(hrp.CFrame.LookVector) * 2, rodId)
+				if dir then
+					e.fishSpot = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dir.X, dir.Z}
+					log("Fishing: ตกตรงที่ยืน (มีน้ำในระยะโยน)")
+				elseif type(e.fishSpot) == "table" then
+					log("Fishing: ตรงนี้ไม่มีน้ำในระยะโยน → ไปจุดตกปลาที่ตั้งไว้")
+				end
+			end
+		end
 		sv()
 	end}, "PLFishAuto")
 	FL:Button({Name = "ตั้งจุดตกปลา = ตรงที่ยืน (ยืนริมน้ำ หันหน้าเข้าหาน้ำ)", Callback = function()
