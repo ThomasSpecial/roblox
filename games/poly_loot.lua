@@ -5980,7 +5980,8 @@ end)()
 		for i = 0, 15 do
 			local a = start + (i % 2 == 0 and 1 or -1) * math.ceil(i / 2) * math.pi / 8
 			local dir = Vector3.new(math.cos(a), 0, math.sin(a))
-			local ok, land = pcall(Wt.FindLanding, origin, dir, D, FCfg.Cast, FCfg.Arc, maxCast, Arc, def)
+			local o = hrp.Position + Vector3.new(-dir.Z, 0, dir.X) * 2.5 - dir * 0.9 + Vector3.new(0, 4.5, 0)
+			local ok, land = pcall(Wt.FindLanding, o, dir, D, FCfg.Cast, FCfg.Arc, maxCast, Arc, def)
 			if ok and land and (not wantPool or poolOf(land) == wantPool) then return dir end
 		end
 	end
@@ -6394,7 +6395,9 @@ end)()
 		if flat(spot - hrp.Position).Magnitude > 5 then
 			F.status = F.pool and ("เดินไปริมน้ำ " .. (POOL_TH[F.pool] or F.pool)) or "เดินไปจุดตกปลา"
 			st.extStatus = "Auto Fishing: " .. F.status
-			if not travel(spot, 4, 60) and F.pool and spotT == e.fishPoolSpots[F.pool] then
+			local _, hNow = char()
+			if not travel(spot, 4, 60) and F.pool and spotT == e.fishPoolSpots[F.pool] and hNow
+				and flat(spot - (select(2, char()) or hNow).Position).Magnitude < 120 then
 				-- a shore spot we never reach: forget it, find another next time
 				F.miss = (F.miss or 0) + 1
 				if F.miss >= 3 then
