@@ -5016,19 +5016,24 @@ end)()
 			dest = hrp.Position + flat(dest - hrp.Position).Unit * 28
 			d = 28
 		end
-		if urgent and d > 20 and now - (T.longHopAt or 0) < 1.0 then
-			dest = hrp.Position + flat(dest - hrp.Position).Unit * 20
-			d = 20
+		T.recent = T.recent or {}
+		local used = 0
+		for i = #T.recent, 1, -1 do
+			if now - T.recent[i].t > 1.0 then table.remove(T.recent, i) else used += T.recent[i].d end
 		end
-		if now - (T.hopAt or 0) < (urgent and 0.25 or 0.7) or (d > 20 and now - (T.longHopAt or 0) < 1.0)
-			or T.budget - d < (urgent and -15 or 0) then return false end
+		local left = 30 - used
+		if urgent and d > left and left >= 8 then
+			dest = hrp.Position + flat(dest - hrp.Position).Unit * left
+			d = left
+		end
+		if d > left or now - (T.hopAt or 0) < (urgent and 0.25 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
 		hopRp.FilterDescendantsInstances = {c, AnimalLive}
 		local hit = workspace:Raycast(Vector3.new(dest.X, hrp.Position.Y + 4, dest.Z), Vector3.new(0, -16, 0), hopRp)
 		if not hit then return false end
 		local land = Vector3.new(dest.X, hit.Position.Y + 3, dest.Z)
 		T.budget -= d
 		T.hopAt = now
-		if d > 20 then T.longHopAt = now end
+		table.insert(T.recent, {t = now, d = d})
 		T.hopCheck = {at = now + 1, rb = c:GetAttribute("_ServerMovementRebaseline")}
 		T.hops = (T.hops or 0) + 1
 		stopMove()
