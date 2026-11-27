@@ -4942,7 +4942,7 @@ end)()
 				return false
 			end
 		end
-		if dist < e.reach - 0.5 or dist > 62 or math.abs(tp.Y - hrp.Position.Y) > 14 then return false end
+		if dist < e.reach - 0.5 or dist > 120 or math.abs(tp.Y - hrp.Position.Y) > 14 then return false end
 		local dir = flat(hrp.Position - tp)
 		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
 		do
@@ -4974,7 +4974,7 @@ end)()
 		local c, hrp = char()
 		if not hrp then return false end
 		local now = os.clock()
-		T.budget = math.min(T.budMax or 60, (T.budget or 60) + (now - (T.budAt or now)) * (T.budRate or 16))
+		T.budget = math.min(T.budMax or 72, (T.budget or 72) + (now - (T.budAt or now)) * (T.budRate or 30))
 		T.budAt = now
 		local d = flat(dest - hrp.Position).Magnitude
 		if d > 36 then
