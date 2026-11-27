@@ -2668,7 +2668,7 @@ task.spawn(function()
 				st.kills += 1
 				log(("ฆ่า %s (รวม %d)"):format(tostring(t:GetAttribute("Animal")), st.kills))
 				-- a boss drops its loot only after its death animation: stay and pick it all up before warping off
-				if t:GetAttribute("Tier") == "Boss" then
+				if t:GetAttribute("Tier") == "Boss" and not st.tw then
 					local dd = 3
 					pcall(function() dd = tonumber(AnimalCfg.BOSS_DEATH_DURATION) or 3 end)
 					local okP, p = pcall(mobPos, t)
@@ -2781,6 +2781,19 @@ task.spawn(function()
 			if not t then
 				endCombo(); lookAt = nil
 				if not farmOn then stopMove(); return end
+				if st.tw then
+					if not aura(c, hrp) then endCombo() end
+					if (tonumber(plr:GetAttribute("TowerEnemies")) or 0) == 0 and lootStep(hrp) then return end
+					local ws = st.towerWaitSpot and st.towerWaitSpot(hrp)
+					if ws and flat(ws - hrp.Position).Magnitude > 8 then
+						moveTo(ws)
+						st.status = "Tower: ไปรอตรงจุดเกิดมอน (wave ถัดไป)"
+					else
+						stopMove()
+						st.status = "Tower: รอ wave ถัดไป"
+					end
+					return
+				end
 				if anchor and flat(anchor - hrp.Position).Magnitude > 12 then
 					-- nothing to hit near the farm spot from here (e.g. just respawned in town): walk back
 					if not aura(c, hrp) then endCombo() end
@@ -2987,7 +3000,7 @@ task.spawn(function()
 				return
 			end
 			local dp = e.dodge and not burst and dodgePoint(hrp, hum)
-			if not dp and lootStep(hrp) then
+			if not dp and not st.tw and lootStep(hrp) then
 				lookAt = nil
 				if not aura(c, hrp) then endCombo() end
 				return
@@ -4573,7 +4586,7 @@ end)()
 						log(("Tower: เริ่มชั้น %d"):format(st.tw.floor))
 					end
 					-- skip the 10 s countdown once the script is up in the new run
-					if ts == "intro" and T.readyRun ~= run and os.clock() - st.tw.at > 1 then
+					if ts == "intro" and T.readyRun ~= run and os.clock() - st.tw.at > 0.3 then
 						T.readyRun = run
 						task.spawn(ask, "ready")
 					end
@@ -4590,7 +4603,8 @@ end)()
 				T.endedAt = T.endedAt or os.clock()
 				local r = T.res
 				if r then
-					if os.clock() - r.at < 2 then return end
+					if os.clock() - r.at < 0.4 then return end
+					if os.clock() - (T.lootAt or -1e9) < 0.8 and os.clock() - r.at < 8 then return end
 					local sent = T.sent[r.session]
 					if sent and os.clock() - sent.at < 6 then return end
 					local choice = sent and sent.choice or decide(r)
@@ -4633,6 +4647,29 @@ end)()
 			end)
 		end
 	end)
+	-- where the next wave appears: centre of the Mob<n> spawn parts of the arena we're in (Long Hall: 90 studs from the
+	-- entrance, walking there after every wave started cost ~5 s a wave)
+	st.towerWaitSpot = function(hrp)
+		local run = st.tw and st.tw.run
+		if not run then return nil end
+		if T.spotRun == run then return T.spot end
+		if os.clock() - (T.spotAt or 0) < 1 then return nil end
+		T.spotAt = os.clock()
+		local best, bd
+		local folder = workspace:FindFirstChild("TowerRuns")
+		for _, a in ipairs(folder and folder:GetChildren() or {}) do
+			local ok, p = pcall(function() return a:GetPivot().Position end)
+			if ok and (not bd or (p - hrp.Position).Magnitude < bd) then best, bd = a, (p - hrp.Position).Magnitude end
+		end
+		if best and bd < 400 then
+			local sum, n = Vector3.zero, 0
+			for _, d in ipairs(best:GetDescendants()) do
+				if d:IsA("BasePart") and d.Name:match("^Mob%d+$") then sum += d.Position; n += 1 end
+			end
+			if n > 0 then T.spotRun, T.spot = run, sum / n end
+		end
+		return T.spot
+	end
 	-- main-loop hook. true = the tower has the character this tick
 	st.towerLobby = function()
 		if not e.towerAuto then st.towerTrip = nil return false end
@@ -4640,11 +4677,12 @@ end)()
 		st.towerSrv = srvNow() or nil
 		if st.towerSrv then
 			if st.tw then return false end   -- a floor is on: the farm loop fights it
-			-- between floors / waiting for the teleport home: stand still
 			st.target, lookAt = nil, nil
 			endCombo()
-			stopMove()
 			local r = T.res
+			-- the last wave's drops stay in this arena: pick them up before the next floor moves us
+			if r and r.outcome == "victory" and hrp and lootStep(hrp) then T.lootAt = os.clock() return true end
+			stopMove()
 			st.status = r and ("Auto Tower: ชั้น %d %s · กำลังไปต่อ"):format(r.floor, r.outcome == "victory" and "ผ่าน" or "ไม่ผ่าน")
 				or "Auto Tower: รอเริ่มชั้นถัดไป"
 			return true
