@@ -4957,7 +4957,11 @@ end)()
 		T.budget = math.min(T.budMax or 60, (T.budget or 60) + (now - (T.budAt or now)) * (T.budRate or 16))
 		T.budAt = now
 		local d = flat(dest - hrp.Position).Magnitude
-		if d > 62 or now - (T.hopAt or 0) < (urgent and 0.35 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
+		if d > 36 then
+			dest = hrp.Position + flat(dest - hrp.Position).Unit * 36
+			d = 36
+		end
+		if now - (T.hopAt or 0) < (urgent and 0.35 or 0.7) or T.budget - d < (urgent and -15 or 0) then return false end
 		hopRp.FilterDescendantsInstances = {c, AnimalLive}
 		local hit = workspace:Raycast(Vector3.new(dest.X, hrp.Position.Y + 4, dest.Z), Vector3.new(0, -16, 0), hopRp)
 		if not hit then return false end
