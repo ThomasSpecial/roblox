@@ -4569,6 +4569,7 @@ end)()
 	if e.dungeonAgain == nil then e.dungeonAgain = true end
 	if e.tpDodge == nil then e.tpDodge = true end
 	if e.dungeonGreed == nil then e.dungeonGreed = true end
+	if type(e.dungeonGreedMax) ~= "number" then e.dungeonGreedMax = 2 end
 	if e.dungeonHarpoon == nil then e.dungeonHarpoon = true end
 	-- where the player stood when "start" worked (the prompt itself sits 7 studs further in, at 1314, 192.75, -84)
 	local DOOR = Vector3.new(1307.5, 186.3, -85)
@@ -4792,7 +4793,16 @@ end)()
 		local dir = flat(hrp.Position - tp)
 		dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
 		local dest = Vector3.new(tp.X, hrp.Position.Y, tp.Z) + dir * 4
-		if st.dangerAt and st.dangerAt(dest) then return false end
+		if st.dangerAt and st.dangerAt(dest) then
+			local base = math.atan2(dir.Z, dir.X)
+			for _, off in ipairs({180, 90, -90, 135, -135, 45, -45}) do
+				local a = base + math.rad(off)
+				local sp = Vector3.new(tp.X + math.cos(a) * 4, hrp.Position.Y, tp.Z + math.sin(a) * 4)
+				if not st.dangerAt(sp) then dest = sp break end
+			end
+			-- the boss is mid-attack and every side is in it: wait for it to land (zone hold in the farm loop)
+			if st.dragonDanger and st.dragonDanger(dest) then return false end
+		end
 		return st.hopTo(dest, tp, false)
 	end
 	-- one teleport, paid from the hop budget (dodges may overdraw a little). Floor must be under the spot.
@@ -4909,7 +4919,7 @@ end)()
 		if state == "fight" and T.waveSpot and T.waveRoom == room then return T.waveSpot end
 		-- a Greed stand woke up after the clear: take it before moving on
 		local g = T.greed
-		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 then
+		if e.dungeonGreed and g and state ~= "fight" and g.tries < 4 and (tonumber(plr:GetAttribute("VDGreed")) or 0) < e.dungeonGreedMax then
 			if flat(g.at - hrp.Position).Magnitude <= 9 then
 				if os.clock() - g.tryAt > 2.5 then
 					g.tryAt, g.tries = os.clock(), g.tries + 1
@@ -5232,6 +5242,8 @@ end)()
 	DL:Toggle({Name = "Auto Dungeon (ไปยืนแท่นประตูเอง · ตีทุกห้อง + บอส)", Default = e.dungeonAuto, Callback = function(v) e.dungeonAuto = v; sv() end}, "PLDungeonAuto")
 	DL:Toggle({Name = "└ จบรอบแล้วลงรอบใหม่ต่อเลย (ปิด = กลับโลกปกติ)", Default = e.dungeonAgain, Callback = function(v) e.dungeonAgain = v; sv() end}, "PLDungeonAgain")
 	DL:Toggle({Name = "└ เก็บความโลภ (Greed) ที่แท่นหลังเคลียร์ห้อง (+25% ดวง · มอนแรงขึ้น)", Default = e.dungeonGreed, Callback = function(v) e.dungeonGreed = v; sv() end}, "PLDungeonGreed")
+	DL:Slider({Name = "└ เก็บความโลภไม่เกิน (ชั้น) · แต่ละชั้นเกราะเราเหลือ 10%", Default = e.dungeonGreedMax, Minimum = 1, Maximum = 4, DisplayMethod = "Round", Precision = 0,
+		Callback = function(v) e.dungeonGreedMax = v; sv() end}, "PLDungeonGreedMax")
 	DL:Toggle({Name = "└ บอสมังกรบิน → ไปขึ้นป้อมยิงฉมวกเอง (ยิงลงมาแล้วตีฟรี)", Default = e.dungeonHarpoon, Callback = function(v) e.dungeonHarpoon = v; sv() end}, "PLDungeonHarpoon")
 	DL:Toggle({Name = "วาร์ปหลบท่ามอน/บอส (ในหอคอย + ดันเจี้ยน)", Default = e.tpDodge, Callback = function(v) e.tpDodge = v; sv() end}, "PLTpDodge")
 	DL:Toggle({Name = "วาร์ปสั้นเข้าหามอน (ในหอคอย + ดันเจี้ยน)", Default = e.towerTp, Callback = function(v) e.towerTp = v; sv() end}, "PLDungeonTp")
