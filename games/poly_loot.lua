@@ -570,7 +570,7 @@ do
 			local h = m.hts[l][k]
 			if not h then break end
 			local dh = h - y
-			if dh <= up and dh >= -DROP and (not bd or math.abs(dh) < bd) then best, bd = l, math.abs(dh) end
+			if dh <= up and dh >= -(m.relax or DROP) and (not bd or math.abs(dh) < bd) then best, bd = l, math.abs(dh) end
 		end
 		return best
 	end
@@ -610,7 +610,8 @@ do
 		if not l2 then return nil end
 		if hazardAt(m, k2, l2, ni, nj) then return nil end
 		local n = DIRN[di * 3 + dj]
-		if bit32.band(m.wall[l][k] or 0, bit32.lshift(1, n - 1)) ~= 0 then return nil end
+		local farDrop = m.relax and m.hts[l2][k2] - y < -DROP
+		if not farDrop and bit32.band(m.wall[l][k] or 0, bit32.lshift(1, n - 1)) ~= 0 then return nil end
 		local bt = m.bad[((k - 1) * MAXL + l - 1) * 8 + n]
 		if bt and (bt == true or os.clock() - bt < 300) then return nil end   -- "bad" marks expire after 5 min
 		local dh = m.hts[l2][k2] - y
@@ -622,7 +623,7 @@ do
 			local lb = step(m, i, j, l, 0, dj, true)
 			if not lb or not step(m, i, j + dj, lb, di, 0, true) then return nil end
 		end
-		return l2, dh > WALK_UP
+		return l2, dh > WALK_UP, dh < -DROP and -dh or nil
 	end
 	Nav.step = step
 
@@ -740,13 +741,14 @@ do
 				if hc < bestH then bestN, bestH = cur, hc end
 				for n = 1, 8 do
 					local d = DIRS[n]
-					local l2, jump = step(m, ci, cj, cl, d[1], d[2])
+					local l2, jump, fall = step(m, ci, cj, cl, d[1], d[2])
 					if l2 then
 						local ni, nj = ci + d[1], cj + d[2]
 						local nb = id(ni, nj, l2)
 						if not closed[nb] then
 							local cost = n > 4 and 1.414 or 1
 							if jump then cost += 3 end
+							if fall then cost += 2 + fall / 3 end
 							if isEdge(m, ni, nj, l2) then cost += 1.5 end
 							local ng = g[cur] + cost
 							if not g[nb] or ng < g[nb] then
@@ -1421,6 +1423,22 @@ local function computePath(hrp, goal)
 		if ok and not pts and why == "no-path" and Nav.clearBad and Nav.clearBad(m) then
 			log("NavMap: หาทางไม่เจอ → ล้างทางที่จำว่าตันแล้วหาใหม่")
 			ok, pts, why = pcall(Nav.plan, m, hrp.Position, navGoal, true, function() task.wait() end)
+		end
+		-- stranded: the route ends about as far from the goal as we already are (a ledge / hilltop whose every way down
+		-- is a little over DROP) -> once per 20 s, plan again letting us drop down up to 30 studs
+		if ok and pts and why == "partial" and #pts >= 1 and os.clock() - (m.relaxAt or 0) > 20 then
+			local dNow = flat(navGoal - hrp.Position).Magnitude
+			local dEnd = flat(navGoal - pts[#pts].pos).Magnitude
+			if dEnd > 60 and dNow - dEnd < math.max(40, dNow * 0.25) then
+				m.relaxAt = os.clock()
+				m.relax, m.edge = 30, {}
+				local ok2, pts2, why2 = pcall(Nav.plan, m, hrp.Position, navGoal, true, function() task.wait() end)
+				m.relax, m.edge = nil, {}
+				if ok2 and pts2 and #pts2 >= 2 and dNow - flat(navGoal - pts2[#pts2].pos).Magnitude > dNow - dEnd + 40 then
+					log(("NavMap: ติดอยู่บนเนิน/ขอบสูง (ทางลงสูงเกิน %d stud ทุกทาง) → ยอมกระโดดลงสูงสุด 30 stud"):format(12))
+					pts, why = pts2, why2 or "drop"
+				end
+			end
 		end
 		if ok and pts and #pts >= 2 then
 			local wps = {}
