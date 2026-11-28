@@ -6345,7 +6345,18 @@ end)()
 	-- no spot set in the tab: the quests pick the water (none needs one = the beach); water of that kind in reach
 	-- right here = fish here. Returns the spot table, or nil when this tick was spent travelling / scanning.
 	local function questSpot(hrp)
-		local pool = questPool(hrp) or "Beach"
+		local pool = questPool(hrp)
+		if not pool then
+			local bd
+			for pl, sp in pairs(e.fishPoolSpots) do
+				local dd = type(sp) == "table" and flat(Vector3.new(sp[1], 0, sp[3]) - hrp.Position).Magnitude
+				if dd and dd < 150 and (not bd or dd < bd) and POOL_TH[pl] and os.clock() > (F.badPool[pl] or 0)
+					and (pl ~= "Volcano" or rodSerial(true) ~= nil) then
+					pool, bd = pl, dd
+				end
+			end
+			pool = pool or "Beach"
+		end
 		F.pool = pool
 		local _, rid = rodSerial(pool == "Volcano")
 		if not rid then F.status = "ไม่มีคันเบ็ดสำหรับ " .. (POOL_TH[pool] or pool) return nil end
