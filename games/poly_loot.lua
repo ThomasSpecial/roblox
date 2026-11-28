@@ -6199,6 +6199,23 @@ end)()
 		end
 		return best
 	end
+	-- can this open quest move while we fish this water?
+	local function questHere(id, pool)
+		local okD, def = pcall(QB.Def, id)
+		if not (okD and type(def) == "table") then return false end
+		local k = def.Kind
+		if k == "Catch" then return def.Pool == nil or def.Pool == pool end
+		if k == "Species" then return def.Pool == pool end
+		if k == "Rarity" or k == "Perfect" or k == "Giant" or k == "Treasure" then return true end
+		if k == "New" and FC then
+			local fd = fishData()
+			local journal = fd and type(fd.Journal) == "table" and fd.Journal or {}
+			for _, r in ipairs(FC.Pool(pool) or {}) do
+				if r.id and not journal[r.id] then return true end
+			end
+		end
+		return false
+	end
 	-- where aggressive mobs are / come back to: live ones in Animal_Live.Aggressors + Animal_SpawnPoints of their kinds
 	local SAFE = 70
 	local function dangerPts()
@@ -6415,18 +6432,37 @@ end)()
 		local fd = fishData()
 		-- finished quests -> the fishing post
 		if e.fishClaim and fd and fd.Quests and type(fd.Quests.Slots) == "table" then
+			F.doneSince = F.doneSince or {}
+			local done, ids, busyHere, oldest = {}, {}, false, math.huge
 			for i, q in pairs(fd.Quests.Slots) do
-				if type(q) == "table" and (tonumber(q.Have) or 0) >= (tonumber(q.Need) or math.huge) and os.clock() - (F.claimAt[i] or 0) > 20 then
-					F.claimAt[i] = os.clock()
-					F.status = ("เควสเสร็จ (%s) → ไปเคลมที่ร้าน"):format(tostring(q.Id))
-					st.extStatus = "Auto Fishing: " .. F.status
-					if travel(post(), 7, 90) then
-						pcall(function() FR.QuestClaim:FireServer(i) end)
-						task.wait(1.5)
-						log(("Fishing: เคลมเควส %s"):format(tostring(q.Id)))
+				if type(q) == "table" then
+					if (tonumber(q.Have) or 0) >= (tonumber(q.Need) or math.huge) then
+						F.doneSince[q.Id] = F.doneSince[q.Id] or os.clock()
+						oldest = math.min(oldest, F.doneSince[q.Id])
+						if os.clock() - (F.claimAt[i] or 0) > 20 then done[#done + 1] = {i = i, id = q.Id}; ids[#ids + 1] = tostring(q.Id) end
+					elseif F.pool and questHere(q.Id, F.pool) then
+						busyHere = true
 					end
-					return
 				end
+			end
+			local quest = type(e.fishSpot) ~= "table" and F.pool
+			local nearPost = hrp and flat(post() - hrp.Position).Magnitude < 250
+			if #done > 0 and (not quest or nearPost or #done >= 2 or not busyHere or os.clock() - oldest > 480) then
+				for _, dn in ipairs(done) do F.claimAt[dn.i] = os.clock() end
+				F.status = ("เควสเสร็จ (%s) → ไปเคลมที่ร้าน"):format(table.concat(ids, ", "))
+				st.extStatus = "Auto Fishing: " .. F.status
+				if travel(post(), 7, 90) then
+					for _, dn in ipairs(done) do
+						pcall(function() FR.QuestClaim:FireServer(dn.i) end)
+						task.wait(1.5)
+						F.doneSince[dn.id] = nil
+						log(("Fishing: เคลมเควส %s"):format(tostring(dn.id)))
+					end
+				end
+				return
+			elseif #done > 0 and F.heldNote ~= ids[1] then
+				F.heldNote = ids[1]
+				log(("Fishing: เควส %s เสร็จ → ยังทำเควสอื่นที่ %s ได้ เก็บไว้เคลมทีเดียว (ไม่เดินไปร้านทุกเควส)"):format(ids[1], POOL_TH[F.pool] or F.pool))
 			end
 		end
 		-- sell quests (QuestBoard kinds Sell = fish count, SellCoins = coins from fish): sell the cheapest fish until the
