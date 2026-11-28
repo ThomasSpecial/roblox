@@ -5863,12 +5863,23 @@ end)()
 	end
 	-- far away: map warp toward it first (30 s cooldown, only when it saves the walk), then walk
 	local function travel(pos, near, timeout)
-		local _, hrp = char()
-		if hrp and flat(pos - hrp.Position).Magnitude > (e.warpMin or 500) and st.tryWarp and os.clock() - (F.warpAt or 0) > 10 then
-			F.warpAt = os.clock()
-			if st.tryWarp(pos) then task.wait(2.5) end
+		local t0, limit = os.clock(), timeout or 60
+		while alive() and e.fishAuto and os.clock() - t0 < limit do
+			local _, hrp = char()
+			if not hrp then return false end
+			local d = flat(pos - hrp.Position).Magnitude
+			if d <= near then return true end
+			local far = d > (e.warpMin or 500)
+			if far and st.tryWarp and os.clock() - (F.warpAt or 0) > 4 then
+				F.warpAt = os.clock()
+				if st.tryWarp(pos) then task.wait(2.5) end
+			end
+			if goTo(pos, near, far and 10 or math.max(1, limit - (os.clock() - t0))) then return true end
+			local _, h2 = char()
+			-- goTo gave up for a boss / a mob on us: hand back to the step (it fights / goes to the boss)
+			if not h2 or (F.bossCheck and F.bossCheck(h2)) or (F.threatNear and F.threatNear(h2)) then return false end
 		end
-		return goTo(pos, near, timeout)
+		return false
 	end
 	-- the module's original Step, kept across reloads (each copy of the script wraps it once)
 	local rawStep = getgenv().__PLMGStep or MG.Step
