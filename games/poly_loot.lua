@@ -6043,6 +6043,46 @@ end)()
 		return true
 	end
 	F.closeRewards = closeRewards
+	local UWC, BUI
+	pcall(function()
+		local mods = game:GetService("ReplicatedStorage").UI_Engine.Modules
+		UWC = require(mods.UIWorldClear)
+		BUI = require(mods.BlockingUI)
+	end)
+	F.lastInput = 0
+	pcall(function()
+		game:GetService("UserInputService").InputBegan:Connect(function(io)
+			local t = io.UserInputType
+			if t == Enum.UserInputType.Keyboard or t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseButton2
+				or t == Enum.UserInputType.Touch then F.lastInput = os.clock() end
+		end)
+	end)
+	local function closeMenus()
+		if not (UWC and BUI) then return false end
+		local ok, open = pcall(BUI.IsPanelOpen)
+		if not (ok and open) then F.panelAt = nil return false end
+		F.panelAt = F.panelAt or os.clock()
+		if os.clock() - F.panelAt < 4 or os.clock() - F.lastInput < 20 then
+			F.status = "มีหน้าต่างเมนูเปิดอยู่ (เกมไม่ให้โยนเบ็ด) → รอปิด"
+			return true
+		end
+		pcall(UWC.ClosePanels)
+		task.wait(0.4)
+		local ok2, still = pcall(BUI.IsPanelOpen)
+		if ok2 and still then
+			for _, name in ipairs({"Settings", "Quests", "Inventory", "Index", "Rewards", "UpgradesStats", "PickAStat", "Shop",
+				"Anime Egg Shop", "CraftingUI", "UpgradeEquipment", "Merchant", "GoldMine", "Store", "AbilitiesMenu", "Enchanting",
+				"Bank", "Trader", "HalloweenMerchant", "HalloweeenQuests", "HalloweenDaily", "CandyMerchant", "BakingUI", "Profile",
+				"InventoryInspect", "Updates&Inbox", "WeeklySpentReward", "ClanSeasonReward", "Combine", "QuickSwitch", "EmoteWheel",
+				"PartyMenu", "Clans", "Challenges", "WorldMap", "FishIndex", "RodShop", "TackleShop", "Tower"}) do
+				local g = plr.PlayerGui:FindFirstChild(name)
+				if g and g:IsA("ScreenGui") and g.Enabled then g.Enabled = false end
+			end
+		end
+		F.panelAt = nil
+		log("Fishing: ปิดหน้าต่างเมนูที่ค้างอยู่ (เปิดไว้แล้วโยนเบ็ดไม่ได้)")
+		return true
+	end
 	local FC
 	pcall(function() FC = require(FE.FishCatalog) end)
 	local POOL_TH = {Grasslands = "Grasslands", Cave = "ถ้ำ (Cave)", Jungle = "ป่า (Jungle)", DarkForest = "Dark Forest", Beach = "ชายหาด (Beach)",
@@ -6478,6 +6518,7 @@ end)()
 				return
 			end
 		end
+		if closeMenus() then return end
 		-- cast like a player: press, hold until the power bar is full (the perfect window), aim at the water, release
 		local tip = tool:FindFirstChild("RodTip", true)
 		local origin = tip and (tip:IsA("Attachment") and tip.WorldPosition or tip.Position) or (hrp.Position + Vector3.new(0, 4.5, 0))
