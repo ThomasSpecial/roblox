@@ -5586,6 +5586,30 @@ end)()
 		if ps then return ps, pick end
 		return bs, best
 	end
+	local function rodOnBar(serial)
+		local d = invData()
+		local hb = d and d.Hotbar
+		if type(hb) ~= "table" then return end
+		local mats = d.Inventory and d.Inventory.Materials or {}
+		local rodSlot, free
+		for i = 1, 9 do
+			local sr = hb[i] or hb[tostring(i)]
+			if sr == serial then return end
+			if sr == nil or sr == "" then
+				free = free or i
+			else
+				local it = mats[sr]
+				local ok, def = pcall(Rods.Get, it and it.Id)
+				if it and ok and type(def) == "table" then rodSlot = rodSlot or i end
+			end
+		end
+		local slot = rodSlot or free
+		if not slot then return end
+		pcall(function() InvRemotes.HotbarBindSlotRequest:FireServer(serial, slot) end)
+		local it = mats[serial]
+		log(("Fishing: ใส่ %s ลงช่อง %d ของ Hotbar (ช่องเต็ม หยิบคันที่ไม่อยู่ใน Hotbar ไม่ได้)"):format(tostring(it and it.Id or serial), slot))
+		task.wait(0.6)
+	end
 	-- the picked bait while we have it, else the luckiest bait we own
 	local function baitToUse()
 		if e.fishBait ~= "" and owned(e.fishBait) > 0 then return e.fishBait end
@@ -6103,6 +6127,16 @@ end)()
 			end
 		end)
 		pcall(function()
+			local lava = workspace:FindFirstChild("Volcano") and workspace.Volcano:FindFirstChild("Lava")
+			local pts = {}
+			for _, m in ipairs(lava and lava:GetChildren() or {}) do
+				for _, j in ipairs(m:GetChildren()) do
+					if j.Name == "Vert.008" and j:IsA("BasePart") then pts[#pts + 1] = j.Position end
+				end
+			end
+			a.Volcano = #pts > 0 and pts or {Vector3.new(240, 149, -3160)}
+		end)
+		pcall(function()
 			local AC = require(RS.Area_Engine.AreaConfig)
 			local az = workspace:FindFirstChild("AudioZones")
 			for area, pool in pairs({DarkForest = "DarkForest", Volcano = "Volcano"}) do
@@ -6190,6 +6224,15 @@ end)()
 		return best
 	end
 	F.clearance = function(pos) return clearance(pos, dangerPts()) end
+	local function onLava(g, inst)
+		local lv = workspace:FindFirstChild("Volcano") and workspace.Volcano:FindFirstChild("Lava")
+		if inst and lv and inst:IsDescendantOf(lv) then return true end
+		for _, off in ipairs({Vector3.zero, Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2)}) do
+			local ok, hit = pcall(Wt.LavaAt, g + off, 2.5)
+			if ok and hit == true then return true end
+		end
+		return false
+	end
 	-- a shore spot on that water near the anchor (it has to be streamed in): water points ring by ring, then dry
 	-- ground 8-28 studs off them from where a cast lands in the same water; 70+ studs from aggressive mobs / their
 	-- spawns first, then 40+, then the farthest there is
@@ -6197,6 +6240,7 @@ end)()
 		local _, hrp = char()
 		if not hrp then return nil end
 		local minD = tonumber(FCfg.Cast and FCfg.Cast.MIN_DEPTH) or 1
+		pcall(function() plr:RequestStreamAroundAsync(around, 5) end)
 		local waters = {}
 		for r = 0, 200, 9 do
 			local n = math.max(1, math.floor(2 * math.pi * r / 9))
@@ -6221,9 +6265,9 @@ end)()
 					local a = i * math.pi / 6
 					local x, z = wp.X + math.cos(a) * dd, wp.Z + math.sin(a) * dd
 					local top = Vector3.new(x, wp.Y + 30, z)
-					local okG, g = pcall(Wt.SolidRay, top, Vector3.new(0, -60, 0))
+					local okG, g, gInst = pcall(Wt.SolidRay, top, Vector3.new(0, -60, 0))
 					local okW, wHit = pcall(Wt.WaterRay, top, Vector3.new(0, -60, 0))
-					local dry = okG and g and not (okW and wHit and wHit.Y > g.Y - 0.5)
+					local dry = okG and g and not (okW and wHit and wHit.Y > g.Y - 0.5) and not (pool == "Volcano" and onLava(g, gInst))
 					local bad = false
 					for _, b in ipairs(F.avoid or {}) do if dry and flat(b.p - g).Magnitude < b.r then bad = true end end
 					if dry and not bad and g.Y > wp.Y - 2 and g.Y < wp.Y + 25 then
@@ -6266,6 +6310,18 @@ end)()
 		local _, rid = rodSerial(pool == "Volcano")
 		if not rid then F.status = "ไม่มีคันเบ็ดสำหรับ " .. (POOL_TH[pool] or pool) return nil end
 		local known = e.fishPoolSpots[pool]
+		if type(known) == "table" and pool == "Volcano" and F.lavaOk ~= known then
+			local top = Vector3.new(known[1], known[2] + 10, known[3])
+			local okG, g, gInst = pcall(Wt.SolidRay, top, Vector3.new(0, -30, 0))
+			if okG and g and onLava(g, gInst) then
+				e.fishPoolSpots[pool] = nil
+				sv()
+				log("Fishing: จุดตกลาวาที่จำไว้ยืนบนลาวา (โดนไฟ) → ลืมแล้วหาจุดใหม่")
+				known = nil
+			elseif okG and g then
+				F.lavaOk = known
+			end
+		end
 		if type(known) == "table" then return known end
 		local held = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Tool")
 		local tipNow = held and held:GetAttribute("FishingRod") and held:FindFirstChild("RodTip", true)
@@ -6483,6 +6539,7 @@ end)()
 		if not serial then F.status = "ไม่มีคันเบ็ด" return end
 		local tool = c:FindFirstChildOfClass("Tool")
 		if not (tool and tool:GetAttribute("FishingRod") == rodId) then
+			rodOnBar(serial)
 			pcall(function() InvRemotes.EquipRequest:FireServer(serial) end)
 			F.status = "หยิบคันเบ็ด " .. rodId
 			task.wait(1)
