@@ -6239,6 +6239,58 @@ end)()
 		end
 		return false
 	end
+	local function autoBait()
+		local fd = fishData()
+		local slots = fd and fd.Quests and fd.Quests.Slots
+		local wantRare, wantCommon
+		if QB and type(slots) == "table" then
+			local journal = type(fd.Journal) == "table" and fd.Journal or {}
+			for _, q in pairs(slots) do
+				if type(q) == "table" and (tonumber(q.Have) or 0) < (tonumber(q.Need) or 0) and (not F.pool or questHere(q.Id, F.pool)) then
+					local okD, def = pcall(QB.Def, q.Id)
+					if okD and type(def) == "table" then
+						if def.Kind == "Rarity" then
+							wantRare = wantRare or q.Id
+						elseif def.Kind == "Species" and FC and FC.Fish[def.Filter] then
+							if FC.Fish[def.Filter].Rarity == "Common" then wantCommon = wantCommon or q.Id else wantRare = wantRare or q.Id end
+						elseif def.Kind == "New" and FC and F.pool then
+							local anyC, anyR = false, false
+							for _, r in ipairs(FC.Pool(F.pool) or {}) do
+								if r.id and not journal[r.id] then if r.rarity == "Common" then anyC = true else anyR = true end end
+							end
+							if anyC then wantCommon = wantCommon or q.Id elseif anyR then wantRare = wantRare or q.Id end
+						end
+					end
+				end
+			end
+		end
+		local list = {}
+		pcall(function()
+			for _, id in ipairs(Sup.BaitIds()) do
+				if owned(id) > 0 then
+					local it = Sup.Items[id] or {}
+					list[#list + 1] = {id = id, luck = tonumber(it.Luck) or 1, lure = tonumber(it.Lure) or 1}
+				end
+			end
+		end)
+		if #list == 0 then return nil end
+		table.sort(list, function(a, b) return a.luck == b.luck and a.lure < b.lure or a.luck < b.luck end)
+		local pick, why
+		if wantCommon and wantRare then
+			pick, why = list[math.max(1, math.ceil(#list / 2))], ("%s ต้องปลาธรรมดา + %s ต้องปลาหายาก → เหยื่อกลาง"):format(wantCommon, wantRare)
+		elseif wantCommon then
+			pick, why = list[1], ("%s ต้องปลาธรรมดา (เหยื่อดวงสูงทำให้ปลาธรรมดาขึ้นน้อยลง)"):format(wantCommon)
+		elseif wantRare then
+			pick, why = list[#list], ("%s ต้องปลาหายาก"):format(wantRare)
+		else
+			pick, why = list[#list], "ไม่มีเควสต้องการความหายากเฉพาะ → ดวงสูงสุด (EXP มากกว่า)"
+		end
+		if F.autoBaitId ~= pick.id then
+			F.autoBaitId = pick.id
+			log(("Fishing: เปลี่ยนเหยื่อ → %s (%s)"):format(tostring((Sup.Items[pick.id] or {}).Display or pick.id), why))
+		end
+		return pick.id
+	end
 	-- where aggressive mobs are / come back to: live ones in Animal_Live.Aggressors + Animal_SpawnPoints of their kinds
 	local SAFE = 70
 	local function dangerPts()
@@ -6621,7 +6673,7 @@ end)()
 			return
 		end
 		-- bait / charm
-		local bait = baitToUse()
+		local bait = (e.fishBait == "" and autoBait()) or baitToUse()
 		if bait and fd and fd.Bait ~= bait and os.clock() - (F.baitAt or 0) > 5 then
 			F.baitAt = os.clock()
 			pcall(function() FR.Request:FireServer("Bait", bait) end)
@@ -6722,7 +6774,7 @@ end)()
 		sv()
 		log("Fishing: ล้างจุดตกปลาแล้ว → ตกตามเควส")
 	end})
-	local baitOpts, baitKey = {"ดีที่สุดที่มี (อัตโนมัติ)"}, {}
+	local baitOpts, baitKey = {"อัตโนมัติ ตามเควส (ต้องปลาหายาก → ดวงสูง · ต้องปลาธรรมดา → Worm)"}, {}
 	pcall(function()
 		for _, id in ipairs(Sup.BaitIds()) do
 			local it = Sup.Items[id] or {}
