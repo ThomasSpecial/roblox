@@ -6329,7 +6329,12 @@ end)()
 		local dirHere = castDir(hrp, originNow, rid, pool)
 		local inAvoid = false
 		for _, b in ipairs(F.avoid or {}) do if flat(b.p - hrp.Position).Magnitude < b.r then inAvoid = true end end
-		if dirHere and not inAvoid and clearance(hrp.Position, dangerPts()) >= SAFE then
+		local hereLava = false
+		if pool == "Volcano" then
+			local okG, g, gInst = pcall(Wt.SolidRay, hrp.Position + Vector3.new(0, 2, 0), Vector3.new(0, -14, 0))
+			hereLava = okG and g ~= nil and onLava(g, gInst)
+		end
+		if dirHere and not inAvoid and not hereLava and clearance(hrp.Position, dangerPts()) >= SAFE then
 			local here = {hrp.Position.X, hrp.Position.Y, hrp.Position.Z, dirHere.X, dirHere.Z}
 			e.fishPoolSpots[pool] = here
 			sv()
