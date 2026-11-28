@@ -6251,8 +6251,11 @@ end)()
 			if not found then found, safe = scanShore(pool, hrp.Position, rid) end
 		end
 		if not found then
-			F.badPool[pool] = os.clock() + 600
-			log(("Fishing: หาริมน้ำ %s ที่โยนลงได้ไม่เจอ → ข้ามน้ำนี้ 10 นาที"):format(POOL_TH[pool] or pool))
+			F.badN = F.badN or {}
+			F.badN[pool] = (F.badN[pool] or 0) + 1
+			local mins = math.min(180, 10 * 2 ^ (F.badN[pool] - 1))
+			F.badPool[pool] = os.clock() + mins * 60
+			log(("Fishing: หาริมน้ำ %s ที่โยนลงได้ไม่เจอ → ข้ามน้ำนี้ %d นาที"):format(POOL_TH[pool] or pool, mins))
 			return nil
 		end
 		e.fishPoolSpots[pool] = found
@@ -6403,10 +6406,21 @@ end)()
 				if F.miss >= 3 then
 					F.miss = 0
 					F.avoid = F.avoid or {}
-					table.insert(F.avoid, {p = spot, r = 10})
+					table.insert(F.avoid, {p = spot, r = 40})
 					e.fishPoolSpots[F.pool] = nil
 					sv()
-					log("Fishing: เดินไปริมน้ำนี้ไม่ถึง → หาจุดใหม่")
+					F.unreach = F.unreach or {}
+					F.unreach[F.pool] = (F.unreach[F.pool] or 0) + 1
+					if F.unreach[F.pool] >= 2 then
+						F.unreach[F.pool] = 0
+						F.badN = F.badN or {}
+						F.badN[F.pool] = (F.badN[F.pool] or 0) + 1
+						local mins = math.min(180, 10 * 2 ^ (F.badN[F.pool] - 1))
+						F.badPool[F.pool] = os.clock() + mins * 60
+						log(("Fishing: เดินไปริมน้ำ %s ไม่ถึง 2 จุดแล้ว → ข้ามน้ำนี้ %d นาที"):format(POOL_TH[F.pool] or F.pool, mins))
+					else
+						log("Fishing: เดินไปริมน้ำนี้ไม่ถึง → หาจุดใหม่")
+					end
 				end
 			end
 			return
