@@ -6062,7 +6062,7 @@ end)()
 		local ok, open = pcall(BUI.IsPanelOpen)
 		if not (ok and open) then F.panelAt = nil return false end
 		F.panelAt = F.panelAt or os.clock()
-		if os.clock() - F.panelAt < 4 or os.clock() - F.lastInput < 20 then
+		if os.clock() - F.panelAt < 4 or os.clock() - F.lastInput < 45 then
 			F.status = "มีหน้าต่างเมนูเปิดอยู่ (เกมไม่ให้โยนเบ็ด) → รอปิด"
 			return true
 		end
