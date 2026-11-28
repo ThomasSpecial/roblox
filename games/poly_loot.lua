@@ -588,8 +588,13 @@ do
 			v = false
 			local p = Vector3.new(m.x0 + ni * CELL, m.hts[l2][k2], m.z0 + nj * CELL)
 			for _, h in ipairs(Nav.hazards) do
-				local lp = h.cf:PointToObjectSpace(p)
-				if math.abs(lp.X) <= h.half.X and math.abs(lp.Z) <= h.half.Z and math.abs(lp.Y) <= h.half.Y then v = true break end
+				if h.r then
+					local c = h.cf.Position
+					if Vector2.new(p.X - c.X, p.Z - c.Z).Magnitude <= h.r and math.abs(p.Y - c.Y) <= h.half.Y then v = true break end
+				else
+					local lp = h.cf:PointToObjectSpace(p)
+					if math.abs(lp.X) <= h.half.X and math.abs(lp.Z) <= h.half.Z and math.abs(lp.Y) <= h.half.Y then v = true break end
+				end
 			end
 			m.hz[key] = v
 		end
@@ -2868,7 +2873,7 @@ task.spawn(function()
 			-- inside / next to Ignarok's Rift: step out before its 5 s join timer pulls us into the Demon Lord arena
 			if st.rift then
 				local v = flat(hrp.Position - st.rift)
-				if v.Magnitude < 38 then
+				if v.Magnitude < 29 then
 					local dir = v.Magnitude > 1 and v.Unit or Vector3.new(1, 0, 0)
 					endCombo(); lookAt = nil
 					moveTo(st.rift + dir * 60)
@@ -6841,7 +6846,7 @@ end)()
 			if key ~= lastKey then
 				lastKey = key
 				for i = #Nav.hazards, 1, -1 do if Nav.hazards[i].rift then table.remove(Nav.hazards, i) end end
-				if p then table.insert(Nav.hazards, {cf = CFrame.new(p), half = Vector3.new(36, 80, 36), rift = true}) end
+				if p then table.insert(Nav.hazards, {cf = CFrame.new(p), half = Vector3.new(30, 80, 30), r = 30, rift = true}) end
 				for _, m in pairs(Nav.maps) do m.hz = nil end
 				path.wps = nil
 				if p then log(("ประตู Ignarok's Rift เปิดที่ %.0f, %.0f → ไม่เข้าใกล้"):format(p.X, p.Z)) end
